@@ -122,6 +122,9 @@ type Scheduler struct {
 	registeredHandlers []cache.ResourceEventHandlerRegistration
 
 	nominatedNodeNameForExpectationEnabled bool
+
+	cachedPod   *v1.Pod
+	cachedHosts []string
 }
 
 func (sched *Scheduler) applyDefaultHandlers() {
@@ -161,6 +164,8 @@ type ScheduleResult struct {
 	FeasibleNodes int
 	// The nominating info for scheduling cycle.
 	nominatingInfo *framework.NominatingInfo
+	// Feasible nodes that we did not select this time
+	unusedFeasibleNodes []framework.NodePluginScores
 }
 
 // WithComponentConfigVersion sets the component config version to the

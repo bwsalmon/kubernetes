@@ -59,7 +59,7 @@ const (
 	minFeasibleNodesPercentageToFind = 5
 	// numberOfHighestScoredNodesToReport is the number of node scores
 	// to be included in ScheduleResult.
-	numberOfHighestScoredNodesToReport = 3
+	numberOfHighestScoredNodesToReport = 5
 )
 
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
@@ -146,6 +146,31 @@ func (sched *Scheduler) newFailureNominatingInfo() *framework.NominatingInfo {
 	return &framework.NominatingInfo{NominatingMode: framework.ModeOverride, NominatedNodeName: ""}
 }
 
+func (sched *Scheduler) podsMatch(a *v1.Pod, b *v1.Pod) bool {
+	// XXX fill me
+	return false
+}
+
+func (sched *Scheduler) getCachedResult(pod *v1.Pod) (ScheduleResult, bool) {
+	// If this new pod matches our cached pod and we have hosts left, then return it.
+	if sched.podsMatch(pod, sched.cachedPod) && len(sched.cachedHosts) > 0 {
+		feasibleHosts := len(sched.cachedHosts)
+		suggestedHost := sched.cachedHosts[0]
+		sched.cachedHosts = sched.cachedHosts[1:]
+		return ScheduleResult{SuggestedHost: suggestedHost, EvaluatedNodes: feasibleHosts, FeasibleNodes: feasibleHosts}, true
+	}
+	return ScheduleResult{}, false
+}
+
+func (sched *Scheduler) setCachedResult(pod *v1.Pod, result ScheduleResult) {
+	// Cached the hosts we didn't use this round and the pod definition for next time.
+	sched.cachedPod = pod.DeepCopy()
+	sched.cachedHosts = make([]string, len(result.unusedFeasibleNodes))
+	for i, node := range result.unusedFeasibleNodes {
+		sched.cachedHosts[i] = node.Name
+	}
+}
+
 // schedulingCycle tries to schedule a single Pod.
 func (sched *Scheduler) schedulingCycle(
 	ctx context.Context,
@@ -157,47 +182,53 @@ func (sched *Scheduler) schedulingCycle(
 ) (ScheduleResult, *framework.QueuedPodInfo, *fwk.Status) {
 	logger := klog.FromContext(ctx)
 	pod := podInfo.Pod
-	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod)
-	if err != nil {
-		defer func() {
-			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
-		}()
-		if err == ErrNoNodesAvailable {
-			status := fwk.NewStatus(fwk.UnschedulableAndUnresolvable).WithError(err)
-			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, podInfo, status
+	var err error
+	scheduleResult, found := sched.getCachedResult(pod)
+	if !found {
+		scheduleResult, err = sched.SchedulePod(ctx, schedFramework, state, pod)
+		if err != nil {
+			defer func() {
+				metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
+			}()
+			if err == ErrNoNodesAvailable {
+				status := fwk.NewStatus(fwk.UnschedulableAndUnresolvable).WithError(err)
+				return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, podInfo, status
+			}
+
+			fitError, ok := err.(*framework.FitError)
+			if !ok {
+				logger.Error(err, "Error selecting node for pod", "pod", klog.KObj(pod))
+				return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, podInfo, fwk.AsStatus(err)
+			}
+
+			// SchedulePod() may have failed because the pod would not fit on any host, so we try to
+			// preempt, with the expectation that the next time the pod is tried for scheduling it
+			// will fit due to the preemption. It is also possible that a different pod will schedule
+			// into the resources that were preempted, but this is harmless.
+
+			if !schedFramework.HasPostFilterPlugins() {
+				logger.V(3).Info("No PostFilter plugins are registered, so no preemption will be performed")
+				return ScheduleResult{}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
+			}
+
+			// Run PostFilter plugins to attempt to make the pod schedulable in a future scheduling cycle.
+			result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus)
+			msg := status.Message()
+			fitError.Diagnosis.PostFilterMsg = msg
+			if status.Code() == fwk.Error {
+				utilruntime.HandleErrorWithContext(ctx, nil, "Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+			} else {
+				logger.V(5).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+			}
+
+			var nominatingInfo *framework.NominatingInfo
+			if result != nil {
+				nominatingInfo = result.NominatingInfo
+			}
+			return ScheduleResult{nominatingInfo: nominatingInfo}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
 		}
 
-		fitError, ok := err.(*framework.FitError)
-		if !ok {
-			logger.Error(err, "Error selecting node for pod", "pod", klog.KObj(pod))
-			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, podInfo, fwk.AsStatus(err)
-		}
-
-		// SchedulePod() may have failed because the pod would not fit on any host, so we try to
-		// preempt, with the expectation that the next time the pod is tried for scheduling it
-		// will fit due to the preemption. It is also possible that a different pod will schedule
-		// into the resources that were preempted, but this is harmless.
-
-		if !schedFramework.HasPostFilterPlugins() {
-			logger.V(3).Info("No PostFilter plugins are registered, so no preemption will be performed")
-			return ScheduleResult{}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
-		}
-
-		// Run PostFilter plugins to attempt to make the pod schedulable in a future scheduling cycle.
-		result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus)
-		msg := status.Message()
-		fitError.Diagnosis.PostFilterMsg = msg
-		if status.Code() == fwk.Error {
-			utilruntime.HandleErrorWithContext(ctx, nil, "Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
-		} else {
-			logger.V(5).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
-		}
-
-		var nominatingInfo *framework.NominatingInfo
-		if result != nil {
-			nominatingInfo = result.NominatingInfo
-		}
-		return ScheduleResult{nominatingInfo: nominatingInfo}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
+		sched.setCachedResult(pod, scheduleResult)
 	}
 
 	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
@@ -467,13 +498,14 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, err
 	}
 
-	host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
+	host, unusedFeasibleNodes, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
 	trace.Step("Prioritizing done")
 
 	return ScheduleResult{
-		SuggestedHost:  host,
-		EvaluatedNodes: len(feasibleNodes) + diagnosis.NodeToStatus.Len(),
-		FeasibleNodes:  len(feasibleNodes),
+		SuggestedHost:       host,
+		EvaluatedNodes:      len(feasibleNodes) + diagnosis.NodeToStatus.Len(),
+		FeasibleNodes:       len(feasibleNodes),
+		unusedFeasibleNodes: unusedFeasibleNodes,
 	}, err
 }
 
