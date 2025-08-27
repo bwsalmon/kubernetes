@@ -98,6 +98,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	}
 
 	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
+	podBatch := sched.getPodBatch(podInfo)
 
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
@@ -114,26 +115,46 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
+	// First attempt to schedule all pods in the batch. This will return failure if the current pod cannot be scheduled,
+	// or success if at least the current pod can be scheduled.
+	batchScheduleResult, status := sched.scheduleBatch(schedulingCycleCtx, state, fwk, podInfo, start, len(podBatch))
 	if !status.IsSuccess() {
-		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+		sched.FailureHandler(schedulingCycleCtx, fwk, podInfo, status, batchScheduleResult.nominatingInfo, start)
 		return
 	}
 
-	// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
-	go func() {
-		bindingCycleCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		metrics.Goroutines.WithLabelValues(metrics.Binding).Inc()
-		defer metrics.Goroutines.WithLabelValues(metrics.Binding).Dec()
-
-		status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
-		if !status.IsSuccess() {
-			sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
+	// Try each pod in the batch.
+	for i, podInfo := range podBatch {
+		// If we have run out of feasible nodes, then just return.
+		if i >= batchScheduleResult.FeasibleNodes {
 			return
 		}
-	}()
+
+		// Grab the next suggested host for this pod.
+		suggestedHost := batchScheduleResult.SuggestedHosts[i]
+
+		scheduleResult, assumedPodInfo, status := sched.schedulingCycle(
+			schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate, suggestedHost, batchScheduleResult)
+		if !status.IsSuccess() {
+			sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+			return
+		}
+
+		// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
+		go func() {
+			bindingCycleCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			metrics.Goroutines.WithLabelValues(metrics.Binding).Inc()
+			defer metrics.Goroutines.WithLabelValues(metrics.Binding).Dec()
+
+			status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
+			if !status.IsSuccess() {
+				sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
+				return
+			}
+		}()
+	}
 }
 
 // newFailureNominatingInfo returns the appropriate NominatingInfo for scheduling failures.
@@ -146,31 +167,30 @@ func (sched *Scheduler) newFailureNominatingInfo() *framework.NominatingInfo {
 	return &framework.NominatingInfo{NominatingMode: framework.ModeOverride, NominatedNodeName: ""}
 }
 
-// schedulingCycle tries to schedule a single Pod.
-func (sched *Scheduler) schedulingCycle(
+func (sched *Scheduler) scheduleBatch(
 	ctx context.Context,
 	state fwk.CycleState,
 	schedFramework framework.Framework,
 	podInfo *framework.QueuedPodInfo,
 	start time.Time,
-	podsToActivate *framework.PodsToActivate,
-) (ScheduleResult, *framework.QueuedPodInfo, *fwk.Status) {
+	podBatchSize int,
+) (ScheduleResult, *fwk.Status) {
 	logger := klog.FromContext(ctx)
 	pod := podInfo.Pod
-	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod)
+	scheduleResult, err := sched.SchedulePod(ctx, schedFramework, state, pod, podBatchSize)
 	if err != nil {
 		defer func() {
 			metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
 		}()
 		if err == ErrNoNodesAvailable {
 			status := fwk.NewStatus(fwk.UnschedulableAndUnresolvable).WithError(err)
-			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, podInfo, status
+			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, status
 		}
 
 		fitError, ok := err.(*framework.FitError)
 		if !ok {
 			logger.Error(err, "Error selecting node for pod", "pod", klog.KObj(pod))
-			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, podInfo, fwk.AsStatus(err)
+			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, fwk.AsStatus(err)
 		}
 
 		// SchedulePod() may have failed because the pod would not fit on any host, so we try to
@@ -180,7 +200,7 @@ func (sched *Scheduler) schedulingCycle(
 
 		if !schedFramework.HasPostFilterPlugins() {
 			logger.V(3).Info("No PostFilter plugins are registered, so no preemption will be performed")
-			return ScheduleResult{}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
+			return ScheduleResult{}, fwk.NewStatus(fwk.Unschedulable).WithError(err)
 		}
 
 		// Run PostFilter plugins to attempt to make the pod schedulable in a future scheduling cycle.
@@ -197,16 +217,32 @@ func (sched *Scheduler) schedulingCycle(
 		if result != nil {
 			nominatingInfo = result.NominatingInfo
 		}
-		return ScheduleResult{nominatingInfo: nominatingInfo}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
+		return ScheduleResult{nominatingInfo: nominatingInfo}, fwk.NewStatus(fwk.Unschedulable).WithError(err)
 	}
 
+	return scheduleResult, nil
+}
+
+// schedulingCycle tries to schedule a single Pod.
+func (sched *Scheduler) schedulingCycle(
+	ctx context.Context,
+	state fwk.CycleState,
+	schedFramework framework.Framework,
+	podInfo *framework.QueuedPodInfo,
+	start time.Time,
+	podsToActivate *framework.PodsToActivate,
+	suggestedHost string,
+	batchScheduleResult ScheduleResult,
+) (ScheduleResult, *framework.QueuedPodInfo, *fwk.Status) {
+	logger := klog.FromContext(ctx)
+	pod := podInfo.Pod
 	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
 	// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
 	// This allows us to keep scheduling without waiting on binding to occur.
 	assumedPodInfo := podInfo.DeepCopy()
 	assumedPod := assumedPodInfo.Pod
 	// assume modifies `assumedPod` by setting NodeName=scheduleResult.SuggestedHost
-	err = sched.assume(logger, assumedPod, scheduleResult.SuggestedHost)
+	err := sched.assume(logger, assumedPod, suggestedHost)
 	if err != nil {
 		// This is most probably result of a BUG in retrying logic.
 		// We report an error here so that pod scheduling can be retried.
@@ -217,9 +253,9 @@ func (sched *Scheduler) schedulingCycle(
 	}
 
 	// Run the Reserve method of reserve plugins.
-	if sts := schedFramework.RunReservePluginsReserve(ctx, state, assumedPod, scheduleResult.SuggestedHost); !sts.IsSuccess() {
+	if sts := schedFramework.RunReservePluginsReserve(ctx, state, assumedPod, suggestedHost); !sts.IsSuccess() {
 		// trigger un-reserve to clean up state associated with the reserved Pod
-		schedFramework.RunReservePluginsUnreserve(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+		schedFramework.RunReservePluginsUnreserve(ctx, state, assumedPod, suggestedHost)
 		if forgetErr := sched.Cache.ForgetPod(logger, assumedPod); forgetErr != nil {
 			utilruntime.HandleErrorWithContext(ctx, forgetErr, "Scheduler cache ForgetPod failed")
 		}
@@ -232,7 +268,7 @@ func (sched *Scheduler) schedulingCycle(
 					NodeToStatus: framework.NewDefaultNodeToStatus(),
 				},
 			}
-			fitErr.Diagnosis.NodeToStatus.Set(scheduleResult.SuggestedHost, sts)
+			fitErr.Diagnosis.NodeToStatus.Set(suggestedHost, sts)
 			fitErr.Diagnosis.AddPluginStatus(sts)
 			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, assumedPodInfo, fwk.NewStatus(sts.Code()).WithError(fitErr)
 		}
@@ -240,10 +276,10 @@ func (sched *Scheduler) schedulingCycle(
 	}
 
 	// Run "permit" plugins.
-	runPermitStatus := schedFramework.RunPermitPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+	runPermitStatus := schedFramework.RunPermitPlugins(ctx, state, assumedPod, suggestedHost)
 	if !runPermitStatus.IsWait() && !runPermitStatus.IsSuccess() {
 		// trigger un-reserve to clean up state associated with the reserved Pod
-		schedFramework.RunReservePluginsUnreserve(ctx, state, assumedPod, scheduleResult.SuggestedHost)
+		schedFramework.RunReservePluginsUnreserve(ctx, state, assumedPod, suggestedHost)
 		if forgetErr := sched.Cache.ForgetPod(logger, assumedPod); forgetErr != nil {
 			utilruntime.HandleErrorWithContext(ctx, forgetErr, "Scheduler cache ForgetPod failed")
 		}
@@ -256,7 +292,7 @@ func (sched *Scheduler) schedulingCycle(
 					NodeToStatus: framework.NewDefaultNodeToStatus(),
 				},
 			}
-			fitErr.Diagnosis.NodeToStatus.Set(scheduleResult.SuggestedHost, runPermitStatus)
+			fitErr.Diagnosis.NodeToStatus.Set(suggestedHost, runPermitStatus)
 			fitErr.Diagnosis.AddPluginStatus(runPermitStatus)
 			return ScheduleResult{nominatingInfo: sched.newFailureNominatingInfo()}, assumedPodInfo, fwk.NewStatus(runPermitStatus.Code()).WithError(fitErr)
 		}
@@ -271,7 +307,7 @@ func (sched *Scheduler) schedulingCycle(
 		podsToActivate.Map = make(map[string]*v1.Pod)
 	}
 
-	return scheduleResult, assumedPodInfo, nil
+	return batchScheduleResult, assumedPodInfo, nil
 }
 
 // bindingCycle tries to bind an assumed Pod.
@@ -424,10 +460,21 @@ func (sched *Scheduler) skipPodSchedule(ctx context.Context, fwk framework.Frame
 	return isAssumed
 }
 
+func nodesToBatchHostNames(nodes []fwk.NodeInfo, batchSize int) []string {
+	hostNames := make([]string, min(len(nodes), batchSize))
+	for i, node := range nodes {
+		if i == batchSize {
+			return hostNames
+		}
+		hostNames[i] = node.Node().Name
+	}
+	return hostNames
+}
+
 // schedulePod tries to schedule the given pod to one of the nodes in the node list.
 // If it succeeds, it will return the name of the node.
 // If it fails, it will return a FitError with reasons.
-func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod) (result ScheduleResult, err error) {
+func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework, state fwk.CycleState, pod *v1.Pod, podBatchSize int) (result ScheduleResult, err error) {
 	trace := utiltrace.New("Scheduling", utiltrace.Field{Key: "namespace", Value: pod.Namespace}, utiltrace.Field{Key: "name", Value: pod.Name})
 	defer trace.LogIfLong(100 * time.Millisecond)
 	if err := sched.Cache.UpdateSnapshot(klog.FromContext(ctx), sched.nodeInfoSnapshot); err != nil {
@@ -445,6 +492,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 	}
 	trace.Step("Computing predicates done")
 
+	// If we have no matches, return fit error.
 	if len(feasibleNodes) == 0 {
 		return result, &framework.FitError{
 			Pod:         pod,
@@ -453,12 +501,13 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		}
 	}
 
-	// When only one node after predicate, just use it.
-	if len(feasibleNodes) == 1 {
+	// If we have exactly enough (or less than enough) for our full batch, just return it.
+	if len(feasibleNodes) <= podBatchSize {
 		return ScheduleResult{
 			SuggestedHost:  feasibleNodes[0].Node().Name,
 			EvaluatedNodes: 1 + diagnosis.NodeToStatus.Len(),
-			FeasibleNodes:  1,
+			FeasibleNodes:  len(feasibleNodes),
+			BatchHosts:     nodesToBatchHostNames(feasibleNodes, podBatchSize),
 		}, nil
 	}
 
@@ -474,6 +523,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		SuggestedHost:  host,
 		EvaluatedNodes: len(feasibleNodes) + diagnosis.NodeToStatus.Len(),
 		FeasibleNodes:  len(feasibleNodes),
+		BatchHosts:     nodesToBatchHostNames(priorityList, podBatchSize),
 	}, err
 }
 
@@ -1167,4 +1217,8 @@ func updatePod(ctx context.Context, client clientset.Interface, apiCacher framew
 		podStatusCopy.NominatedNodeName = nominatingInfo.NominatedNodeName
 	}
 	return util.PatchPodStatus(ctx, client, pod.Name, pod.Namespace, &pod.Status, podStatusCopy)
+}
+
+func getPodBatchSize() int {
+	return 1
 }
