@@ -183,9 +183,10 @@ func TestSchedulerWithExtenders(t *testing.T) {
 			},
 			nodes: []string{"node1", "node2"},
 			expectedResult: ScheduleResult{
-				SuggestedHost:  "node2",
-				EvaluatedNodes: 2,
-				FeasibleNodes:  2,
+				SuggestedHost:       "node2",
+				EvaluatedNodes:      2,
+				FeasibleNodes:       2,
+				unusedFeasibleNodes: []string{"node1"},
 			},
 			name: "test 6",
 		},
@@ -206,9 +207,10 @@ func TestSchedulerWithExtenders(t *testing.T) {
 			},
 			nodes: []string{"node1", "node2"},
 			expectedResult: ScheduleResult{
-				SuggestedHost:  "node2",
-				EvaluatedNodes: 2,
-				FeasibleNodes:  2,
+				SuggestedHost:       "node2",
+				EvaluatedNodes:      2,
+				FeasibleNodes:       2,
+				unusedFeasibleNodes: []string{"node1"},
 			}, // node2 has higher score
 			name: "test 7",
 		},
@@ -237,9 +239,10 @@ func TestSchedulerWithExtenders(t *testing.T) {
 			nodes:      []string{"node1", "node2"},
 			expectsErr: false,
 			expectedResult: ScheduleResult{
-				SuggestedHost:  "node2",
-				EvaluatedNodes: 2,
-				FeasibleNodes:  2,
+				SuggestedHost:       "node2",
+				EvaluatedNodes:      2,
+				FeasibleNodes:       2,
+				unusedFeasibleNodes: []string{"node1"},
 			}, // node2 has higher score
 			name: "test 8",
 		},

@@ -165,10 +165,7 @@ func (sched *Scheduler) getCachedResult(pod *v1.Pod) (ScheduleResult, bool) {
 func (sched *Scheduler) setCachedResult(pod *v1.Pod, result ScheduleResult) {
 	// Cached the hosts we didn't use this round and the pod definition for next time.
 	sched.cachedPod = pod.DeepCopy()
-	sched.cachedHosts = make([]string, len(result.unusedFeasibleNodes))
-	for i, node := range result.unusedFeasibleNodes {
-		sched.cachedHosts[i] = node.Name
-	}
+	sched.cachedHosts = result.unusedFeasibleNodes
 }
 
 // schedulingCycle tries to schedule a single Pod.
@@ -498,14 +495,19 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, err
 	}
 
-	host, unusedFeasibleNodes, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
+	host, scoredFeasibleNodes, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
 	trace.Step("Prioritizing done")
+
+	unusedFeasibleNodes := make([]string, len(scoredFeasibleNodes))
+	for i, node := range scoredFeasibleNodes {
+		unusedFeasibleNodes[i] = node.Name
+	}
 
 	return ScheduleResult{
 		SuggestedHost:       host,
 		EvaluatedNodes:      len(feasibleNodes) + diagnosis.NodeToStatus.Len(),
 		FeasibleNodes:       len(feasibleNodes),
-		unusedFeasibleNodes: unusedFeasibleNodes,
+		unusedFeasibleNodes: unusedFeasibleNodes[1:],
 	}, err
 }
 

@@ -165,7 +165,7 @@ type ScheduleResult struct {
 	// The nominating info for scheduling cycle.
 	nominatingInfo *framework.NominatingInfo
 	// Feasible nodes that we did not select this time
-	unusedFeasibleNodes []framework.NodePluginScores
+	unusedFeasibleNodes []string
 }
 
 // WithComponentConfigVersion sets the component config version to the
