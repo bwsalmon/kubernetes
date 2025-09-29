@@ -1097,6 +1097,7 @@ func TestSchedulerScheduleOne(t *testing.T) {
 							Profiles:                               profile.Map{testSchedulerName: schedFramework},
 							APIDispatcher:                          apiDispatcher,
 							nominatedNodeNameForExpectationEnabled: nominatedNodeNameForExpectationEnabled,
+							podHostCache:                           NewPodHostCache(),
 						}
 						queue.Add(logger, item.sendPod)
 
@@ -1451,6 +1452,7 @@ func TestScheduleOneMarksPodAsProcessedBeforePreBind(t *testing.T) {
 						SchedulingQueue: queue,
 						Profiles:        profile.Map{testSchedulerName: schedFramework},
 						APIDispatcher:   apiDispatcher,
+						podHostCache:    NewPodHostCache(),
 					}
 					queue.Add(logger, item.sendPod)
 
@@ -2075,6 +2077,7 @@ func TestSchedulerBinding(t *testing.T) {
 					nodeInfoSnapshot:         nil,
 					percentageOfNodesToScore: 0,
 					APIDispatcher:            apiDispatcher,
+					podHostCache:             NewPodHostCache(),
 				}
 				status := sched.bind(ctx, fwk, pod, "node", state)
 				if !status.IsSuccess() {
@@ -3494,6 +3497,7 @@ func TestSchedulerSchedulePod(t *testing.T) {
 				nodeInfoSnapshot:         snapshot,
 				percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
 				Extenders:                extenders,
+				podHostCache:             NewPodHostCache(),
 			}
 			sched.applyDefaultHandlers()
 
@@ -3829,6 +3833,7 @@ func TestZeroRequest(t *testing.T) {
 			sched := &Scheduler{
 				nodeInfoSnapshot:         snapshot,
 				percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
+				podHostCache:             NewPodHostCache(),
 			}
 			sched.applyDefaultHandlers()
 
@@ -4322,6 +4327,7 @@ func TestNumFeasibleNodesToFind(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			sched := &Scheduler{
 				percentageOfNodesToScore: tt.globalPercentage,
+				podHostCache:             NewPodHostCache(),
 			}
 			if gotNumNodes := sched.numFeasibleNodesToFind(tt.profilePercentage, tt.numAllNodes); gotNumNodes != tt.wantNumNodes {
 				t.Errorf("Scheduler.numFeasibleNodesToFind() = %v, want %v", gotNumNodes, tt.wantNumNodes)
@@ -4445,6 +4451,7 @@ func TestPreferNominatedNodeFilterCallCounts(t *testing.T) {
 				Cache:                    cache,
 				nodeInfoSnapshot:         snapshot,
 				percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
+				podHostCache:             NewPodHostCache(),
 			}
 			sched.applyDefaultHandlers()
 
@@ -4503,6 +4510,7 @@ func makeScheduler(ctx context.Context, nodes []*v1.Node) *Scheduler {
 		Cache:                    cache,
 		nodeInfoSnapshot:         emptySnapshot,
 		percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
+		podHostCache:             NewPodHostCache(),
 	}
 	sched.applyDefaultHandlers()
 	cache.UpdateSnapshot(logger, sched.nodeInfoSnapshot)
@@ -4620,6 +4628,7 @@ func setupTestScheduler(ctx context.Context, t *testing.T, client clientset.Inte
 		SchedulingQueue: schedulingQueue,
 		APIDispatcher:   apiDispatcher,
 		Profiles:        profile.Map{testSchedulerName: schedFramework},
+		podHostCache:    NewPodHostCache(),
 	}
 
 	sched.SchedulePod = sched.schedulePod

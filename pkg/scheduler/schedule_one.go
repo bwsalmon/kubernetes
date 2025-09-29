@@ -59,13 +59,14 @@ const (
 	minFeasibleNodesPercentageToFind = 5
 	// numberOfHighestScoredNodesToReport is the number of node scores
 	// to be included in ScheduleResult.
-	numberOfHighestScoredNodesToReport = 3
+	numberOfHighestScoredNodesToReport = 10
 )
 
 // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	podInfo, err := sched.NextPod(logger)
+	logger.V(1).Info("schedone")
 	if err != nil {
 		utilruntime.HandleErrorWithContext(ctx, err, "Error while retrieving next pod from scheduling queue")
 		return
@@ -81,7 +82,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	ctx = klog.NewContext(ctx, logger)
-	logger.V(4).Info("About to try and schedule pod", "pod", klog.KObj(pod))
+	logger.V(1).Info("About to try and schedule pod", "pod", klog.KObj(pod))
 
 	fwk, err := sched.frameworkForPod(pod)
 	if err != nil {
@@ -97,7 +98,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		return
 	}
 
-	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
+	logger.V(1).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
 
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
@@ -114,9 +115,18 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	schedulingCycleCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	sched.podHostCache.Evict()
+
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+		return
+	}
+
+	err = sched.podHostCache.InvalidateHost(scheduleResult.SuggestedHost)
+	if err != nil {
+		// This should never happen.
+		utilruntime.HandleErrorWithContext(ctx, err, "Error while invalidating pod host cache")
 		return
 	}
 
@@ -179,7 +189,7 @@ func (sched *Scheduler) schedulingCycle(
 		// into the resources that were preempted, but this is harmless.
 
 		if !schedFramework.HasPostFilterPlugins() {
-			logger.V(3).Info("No PostFilter plugins are registered, so no preemption will be performed")
+			logger.V(1).Info("No PostFilter plugins are registered, so no preemption will be performed")
 			return ScheduleResult{}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
 		}
 
@@ -190,7 +200,7 @@ func (sched *Scheduler) schedulingCycle(
 		if status.Code() == fwk.Error {
 			utilruntime.HandleErrorWithContext(ctx, nil, "Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		} else {
-			logger.V(5).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+			logger.V(1).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		}
 
 		var nominatingInfo *framework.NominatingInfo
@@ -343,7 +353,7 @@ func (sched *Scheduler) bindingCycle(
 	}
 
 	// Calculating nodeResourceString can be heavy. Avoid it if klog verbosity is below 2.
-	logger.V(2).Info("Successfully bound pod to node", "pod", klog.KObj(assumedPod), "node", scheduleResult.SuggestedHost, "evaluatedNodes", scheduleResult.EvaluatedNodes, "feasibleNodes", scheduleResult.FeasibleNodes)
+	logger.V(1).Info("Successfully bound pod to node", "pod", klog.KObj(assumedPod), "node", scheduleResult.SuggestedHost, "evaluatedNodes", scheduleResult.EvaluatedNodes, "feasibleNodes", scheduleResult.FeasibleNodes)
 	metrics.PodScheduled(schedFramework.ProfileName(), metrics.SinceInSeconds(start))
 	metrics.PodSchedulingAttempts.Observe(float64(assumedPodInfo.Attempts))
 	if assumedPodInfo.InitialAttemptTimestamp != nil {
@@ -467,8 +477,10 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, err
 	}
 
-	host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
+	host, sortedHosts, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
 	trace.Step("Prioritizing done")
+
+	sched.podHostCache.AddPod(pod, sortedHosts[1:])
 
 	return ScheduleResult{
 		SuggestedHost:  host,
@@ -509,7 +521,7 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 
 	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
 	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
-	if len(pod.Status.NominatedNodeName) > 0 {
+	if len(pod.Status.NominatedNodeName) > 0 || sched.podHostCache.HostAvailable(pod) {
 		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, schedFramework, state, diagnosis)
 		if err != nil {
 			utilruntime.HandleErrorWithContext(ctx, err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
@@ -564,7 +576,16 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 }
 
 func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, schedFramework framework.Framework, state fwk.CycleState, diagnosis framework.Diagnosis) ([]fwk.NodeInfo, error) {
-	nnn := pod.Status.NominatedNodeName
+	var nnn string
+	var err error
+	if len(pod.Status.NominatedNodeName) > 0 {
+		nnn = pod.Status.NominatedNodeName
+	} else {
+		nnn, err = sched.podHostCache.SuggestedHost(pod)
+		if err != nil {
+			return nil, err
+		}
+	}
 	nodeInfo, err := sched.nodeInfoSnapshot.Get(nnn)
 	if err != nil {
 		return nil, err
