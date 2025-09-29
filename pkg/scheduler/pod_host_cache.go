@@ -43,20 +43,20 @@ type PodHostCache struct {
 
 type listCache struct {
 	entries      map[string]*listCacheEntry
-	evictionList *listEntry
+	evictionList *dlist
 }
 
 func newListCache() *listCache {
 	return &listCache{
 		entries:      map[string]*listCacheEntry{},
-		evictionList: newList(),
+		evictionList: newDlist(),
 	}
 }
 
 type listCacheEntry struct {
-	list         *listEntry
+	list         *dlist
 	timestamp    time.Time
-	evictionList listEntry
+	evictionList dlistEntry
 }
 
 // If a list exists in our cache with the given key, remove it.
@@ -68,15 +68,12 @@ func (m *listCache) removeListIfExists(key string) error {
 
 		// Keep removing the head of the list until it is empty.
 		for {
-			lent, err := l.list.head()
-			if err != nil {
-				return err
-			}
+			lent := l.list.head()
 			if lent == nil {
 				return nil
 			}
 			ent := lent.entry.(*entry)
-			err = ent.removeFromLists()
+			err := ent.removeFromLists()
 			if err != nil {
 				return err
 			}
@@ -88,11 +85,11 @@ func (m *listCache) removeListIfExists(key string) error {
 // Create a new list in our cache if it doesn't exist, add this entry to the tail of the list
 // if such a list already exists.
 
-func (m *listCache) addOrPushToList(lent *listEntry, key string, t time.Time) {
+func (m *listCache) addOrPushToList(lent *dlistEntry, key string, t time.Time) {
 	l, found := m.entries[key]
 	if !found {
 		l = &listCacheEntry{
-			list:      newList(),
+			list:      newDlist(),
 			timestamp: t,
 		}
 		l.evictionList.entry = l
@@ -107,14 +104,13 @@ func (m *listCache) addOrPushToList(lent *listEntry, key string, t time.Time) {
 
 func (m *listCache) evict(n time.Time) error {
 	for {
-		t, err := m.evictionList.head()
+		t := m.evictionList.head()
 		if t == nil {
 			return nil
 		}
-		if err != nil {
-			return err
-		}
 		if n.Sub(t.entry.(*listCacheEntry).timestamp) > expirationTime || len(m.entries) > maxCacheSize {
+			ent := t.entry.(*listCacheEntry).list.head()
+			m.removeListIfExists(ent.entry.(*entry).signature)
 			t.remove()
 		} else {
 			break
@@ -126,8 +122,8 @@ func (m *listCache) evict(n time.Time) error {
 type entry struct {
 	signature     string
 	hostname      string
-	signatureList listEntry
-	hostList      listEntry
+	signatureList dlistEntry
+	hostList      dlistEntry
 	cache         *PodHostCache
 }
 
@@ -143,7 +139,10 @@ func (c *PodHostCache) AddPod(pod *v1.Pod, sortedHosts []framework.NodePluginSco
 		return nil
 	}
 
-	sig := podSchedulingSignature(pod)
+	sig, err := podSchedulingSignature(pod)
+	if err != nil {
+		return err
+	}
 	sortedHostnames := make([]string, len(sortedHosts))
 	for i := range sortedHosts {
 		sortedHostnames[i] = sortedHosts[i].Name
@@ -165,7 +164,10 @@ func (c *PodHostCache) AddSignature(signature string, sortedHostnames []string, 
 
 func (c *PodHostCache) SuggestedHost(pod *v1.Pod) (string, error) {
 	if podCachingCandidate(pod) && cacheEnabled {
-		sig := podSchedulingSignature(pod)
+		sig, err := podSchedulingSignature(pod)
+		if err != nil {
+			return "", err
+		}
 		return c.SuggestedHostSig(sig)
 	}
 	return "", fmt.Errorf("pod not candidate for caching or cache disabled")
@@ -177,10 +179,7 @@ func (c *PodHostCache) SuggestedHostSig(signature string) (string, error) {
 		return "", fmt.Errorf("no signature list to use")
 	}
 
-	ent, err := l.list.head()
-	if err != nil {
-		return "", err
-	}
+	ent := l.list.head()
 	if ent == nil {
 		return "", fmt.Errorf("signature list is empty")
 	}
@@ -188,12 +187,15 @@ func (c *PodHostCache) SuggestedHostSig(signature string) (string, error) {
 	return ent.entry.(*entry).hostname, nil
 }
 
-func (c *PodHostCache) HostAvailable(pod *v1.Pod) bool {
+func (c *PodHostCache) HostAvailable(pod *v1.Pod) (bool, error) {
 	if podCachingCandidate(pod) && cacheEnabled {
-		sig := podSchedulingSignature(pod)
-		return c.HostAvailableSig(sig)
+		sig, err := podSchedulingSignature(pod)
+		if err != nil {
+			return false, err
+		}
+		return c.HostAvailableSig(sig), nil
 	}
-	return false
+	return false, nil
 }
 
 func (c *PodHostCache) HostAvailableSig(signature string) bool {
@@ -252,26 +254,48 @@ func (ent *entry) removeFromLists() error {
 	return nil
 }
 
-// An intrusive doubly linked list, implemented as a circular list with the first entry having "nil" as the entry value.
+// An intrusive doubly linked list, implemented as a circular list with the first entry a "dummy" entry.
 
-type listEntry struct {
-	entry any
-	prev  *listEntry
-	next  *listEntry
+type dlist struct {
+	startEntry dlistEntry
 }
 
-func newList() *listEntry {
-	n := &listEntry{}
-	n.prev = n
-	n.next = n
+type dlistEntry struct {
+	entry any // Points to the parent struct, or nil for the dummy entry.
+	prev  *dlistEntry
+	next  *dlistEntry
+}
+
+func newDlist() *dlist {
+	n := &dlist{}
+	n.startEntry.prev = &n.startEntry
+	n.startEntry.next = &n.startEntry
 	return n
 }
 
-func (l *listEntry) remove() (bool, error) {
-	if l.entry == nil {
-		return false, fmt.Errorf("entry is a list head and can't be removed")
-	}
+func (l *dlist) pushTail(ent *dlistEntry) {
+	ent.next = &l.startEntry
+	ent.prev = l.startEntry.prev
+	l.startEntry.prev.next = ent
+	l.startEntry.prev = ent
+}
 
+func (l *dlist) head() *dlistEntry {
+	// Empty list
+	if l.startEntry.next == &l.startEntry {
+		return nil
+	}
+	return l.startEntry.next
+}
+
+func (l *dlist) next(e *dlistEntry) *dlistEntry {
+	if e.next == &l.startEntry {
+		return nil
+	}
+	return e.next
+}
+
+func (l *dlistEntry) remove() (bool, error) {
 	l.prev.next = l.next
 	l.next.prev = l.prev
 
@@ -283,33 +307,7 @@ func (l *listEntry) remove() (bool, error) {
 	return emptyList, nil
 }
 
-func (l *listEntry) pushTail(ent *listEntry) error {
-	if l.entry != nil {
-		return fmt.Errorf("trying to push onto non list head")
-	}
-	if ent.entry == nil {
-		return fmt.Errorf("trying to push head entry onto list")
-	}
-
-	ent.next = l
-	ent.prev = l.prev
-	l.prev.next = ent
-	l.prev = ent
-
-	return nil
-}
-
-func (l *listEntry) head() (*listEntry, error) {
-	if l.entry != nil {
-		return nil, fmt.Errorf("trying to get head from non list")
-	}
-
-	// Empty list
-	if l.next == l {
-		return nil, nil
-	}
-	return l.next, nil
-}
+// Functions to determine if a pod is cacheable and generating a signature for those that are cacheable.
 
 // Check if a pod is a candidate for caching.
 
@@ -340,44 +338,92 @@ func onePodPerNode(p *v1.Pod) bool {
 
 // Compute a signature for a pod from its scheduling settings.
 
-func podSchedulingSignature(p *v1.Pod) string {
+func podSchedulingSignature(p *v1.Pod) (string, error) {
 	// Need to find something better than md5
 	h := md5.New()
 	enc := gob.NewEncoder(h)
 
-	enc.Encode(p.Namespace)
-	enc.Encode(p.Spec.SchedulerName)
+	err := enc.Encode(p.Namespace)
+	if err != nil {
+		return "", err
+	}
+
+	err = enc.Encode(p.Spec.SchedulerName)
+	if err != nil {
+		return "", err
+	}
+
 	if p.Spec.Priority != nil {
-		enc.Encode(*p.Spec.Priority)
-	}
-	enc.Encode(p.Spec.Tolerations)
-	if p.Spec.Affinity != nil && p.Spec.Affinity.NodeAffinity != nil {
-		enc.Encode(p.Spec.Affinity.NodeAffinity)
-	}
-	enc.Encode(p.Spec.NodeSelector)
-	if p.Spec.RuntimeClassName != nil {
-		enc.Encode(p.Spec.RuntimeClassName)
-	}
-
-	addContainersToHash(p.Spec.InitContainers, enc)
-	addContainersToHash(p.Spec.Containers, enc)
-
-	addVolumesToHash(p.Spec.Volumes, enc)
-
-	return hex.Dump(h.Sum(nil))
-}
-
-func addContainersToHash(containers []v1.Container, enc *gob.Encoder) {
-	for _, container := range containers {
-		enc.Encode(container.Ports)
-		enc.Encode(container.Resources)
-	}
-}
-
-func addVolumesToHash(volumes []v1.Volume, enc *gob.Encoder) {
-	for _, vol := range volumes {
-		if vol.ConfigMap == nil && vol.Secret == nil {
-			enc.Encode(vol)
+		err = enc.Encode(*p.Spec.Priority)
+		if err != nil {
+			return "", err
 		}
 	}
+
+	err = enc.Encode(p.Spec.Tolerations)
+	if err != nil {
+		return "", err
+	}
+
+	if p.Spec.Affinity != nil && p.Spec.Affinity.NodeAffinity != nil {
+		err = enc.Encode(p.Spec.Affinity.NodeAffinity)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	err = enc.Encode(p.Spec.NodeSelector)
+	if err != nil {
+		return "", err
+	}
+
+	if p.Spec.RuntimeClassName != nil {
+		err = enc.Encode(p.Spec.RuntimeClassName)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	err = addContainersToHash(p.Spec.InitContainers, enc)
+	if err != nil {
+		return "", err
+	}
+
+	err = addContainersToHash(p.Spec.Containers, enc)
+	if err != nil {
+		return "", err
+	}
+
+	err = addVolumesToHash(p.Spec.Volumes, enc)
+	if err != nil {
+		return "", err
+	}
+
+	return hex.Dump(h.Sum(nil)), nil
+}
+
+func addContainersToHash(containers []v1.Container, enc *gob.Encoder) error {
+	for _, container := range containers {
+		err := enc.Encode(container.Ports)
+		if err != nil {
+			return err
+		}
+		err = enc.Encode(container.Resources)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addVolumesToHash(volumes []v1.Volume, enc *gob.Encoder) error {
+	for _, vol := range volumes {
+		if vol.ConfigMap == nil && vol.Secret == nil {
+			err := enc.Encode(vol)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

@@ -521,7 +521,12 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 
 	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
 	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
-	if len(pod.Status.NominatedNodeName) > 0 || sched.podHostCache.HostAvailable(pod) {
+	cachedHostAvailable, err := sched.podHostCache.HostAvailable(pod)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+
+	if len(pod.Status.NominatedNodeName) > 0 || cachedHostAvailable {
 		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, schedFramework, state, diagnosis)
 		if err != nil {
 			utilruntime.HandleErrorWithContext(ctx, err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
