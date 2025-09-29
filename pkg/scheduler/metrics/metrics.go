@@ -80,6 +80,7 @@ const (
 	Reserve                     = "Reserve"
 	Unreserve                   = "Unreserve"
 	Permit                      = "Permit"
+	SignPod                     = "SignPod"
 )
 
 const (

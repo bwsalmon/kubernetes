@@ -72,6 +72,7 @@ type CSILimits struct {
 var _ fwk.PreFilterPlugin = &CSILimits{}
 var _ fwk.FilterPlugin = &CSILimits{}
 var _ fwk.EnqueueExtensions = &CSILimits{}
+var _ fwk.BatchablePlugin = &CSILimits{}
 
 // CSIName is the name of the plugin used in the plugin registry and configurations.
 const CSIName = names.NodeVolumeLimits
@@ -618,4 +619,10 @@ func (pl *CSILimits) getNodeVolumeAttachmentInfo(logger klog.Logger, nodeName st
 
 func getVolumeUniqueName(driverName, volumeHandle string) string {
 	return fmt.Sprintf("%s/%s", driverName, volumeHandle)
+}
+
+func (pl *CSILimits) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
+	return []fwk.SignFragment{
+		{Key: fwk.VolumesSignerName, Value: fwk.VolumesSigner(pod)},
+	}, fwk.NewStatus(fwk.Success)
 }
