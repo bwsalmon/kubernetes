@@ -42,6 +42,7 @@ var _ framework.FilterPlugin = &TaintToleration{}
 var _ framework.PreScorePlugin = &TaintToleration{}
 var _ framework.ScorePlugin = &TaintToleration{}
 var _ framework.EnqueueExtensions = &TaintToleration{}
+var _ framework.BatchablePlugin = &TaintToleration{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.
@@ -55,6 +56,14 @@ const (
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *TaintToleration) Name() string {
 	return Name
+}
+
+// Feasibility and scoring based on the pod's tolerations.
+func (pl *TaintToleration) SignPod(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Tolerations") {
+		return signature.AddElementFromObj("Tolerations", pod.Spec.Tolerations)
+	}
+	return nil
 }
 
 // EventsToRegister returns the possible events that may make a Pod

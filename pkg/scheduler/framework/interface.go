@@ -300,6 +300,31 @@ type PreFilterExtensions interface {
 	RemovePod(ctx context.Context, state fwk.CycleState, podToSchedule *v1.Pod, podInfoToRemove fwk.PodInfo, nodeInfo fwk.NodeInfo) *fwk.Status
 }
 
+type PodSignatureMaker interface {
+	Unsignable()
+	AddElement(elementName, sigString string)
+	AddElementFromObj(elementName string, obj any) error
+	HasElement(elementName string) bool
+}
+
+const Unsignable = ""
+
+// BatchablePlugin is an interface that should be implemented by plugins that either filter or score
+// pods to enable batching and gang scheduling optimizations. If an enabled plugin that does Scoring,
+// Prescoring, Filtering or Prefiltering does not implement this interface we will turn off batching for all pods.
+// For now we leave this optional, but in the future we may make it mandatory for all filtering and scoring plugins
+// to implement the interface (but of course plugins may choose to return "unsignable" and RescoreFailed.
+type BatchablePlugin interface {
+	Plugin
+	// This is called before PreFilter. The return value can be:
+	// - A string that represents the signature of this pod from this plugin's perspective. All pods with the same signature should see the same feasibility and
+	//   scoring for the same set of nodes in the same state, from the perspective of this plugin.
+	// - The assertion that this pod cannot be signed by this plugin; i.e. the scoring of this pod is dependent on more than the node and the pod. This
+	//   will disable batching and gang scheduling optimizations for the given pod, hurting performance.
+	// - An internal error condition passed back through the scheduling code.
+	SignPod(pod *v1.Pod, signature PodSignatureMaker) error
+}
+
 // PreFilterPlugin is an interface that must be implemented by "PreFilter" plugins.
 // These plugins are called at the beginning of the scheduling cycle.
 type PreFilterPlugin interface {
@@ -501,6 +526,12 @@ type Framework interface {
 
 	// QueueSortFunc returns the function to sort pods in scheduling queue
 	QueueSortFunc() LessFunc
+
+	// Create a scheduling signature for a given pod, if possible. Two pods with the same signature
+	// should get the same feasibility and scores for any given set of nodes. If some plugins
+	// are unable to create a signature, the pod may be "unsignable" which disables results caching
+	// and gang scheduling optimizations.
+	SignPod(ctx context.Context, pod *v1.Pod) (string, error)
 
 	// RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns
 	// *fwk.Status and its code is set to non-success if any of the plugins returns

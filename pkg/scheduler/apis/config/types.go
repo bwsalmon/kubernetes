@@ -114,6 +114,10 @@ type KubeSchedulerProfile struct {
 	// global PercentageOfNodesToScore will be used.
 	PercentageOfNodesToScore *int32
 
+	// If set, this enables batching in the scheduler. This improves performance
+	// for workload with many pods that are similar.
+	EnableBatching bool
+
 	// Plugins specify the set of plugins that should be enabled or disabled.
 	// Enabled plugins are the ones that should be enabled in addition to the
 	// default plugins. Disabled plugins are any of the default plugins that
@@ -176,6 +180,9 @@ type Plugins struct {
 
 	// MultiPoint is a simplified config field for enabling plugins for all valid extension points
 	MultiPoint PluginSet
+
+	// Plugins that can be batched.
+	Batchable PluginSet
 }
 
 // PluginSet specifies enabled and disabled plugins for an extension point.

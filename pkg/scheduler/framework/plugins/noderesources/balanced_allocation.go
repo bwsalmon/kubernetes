@@ -40,6 +40,7 @@ type BalancedAllocation struct {
 
 var _ framework.PreScorePlugin = &BalancedAllocation{}
 var _ framework.ScorePlugin = &BalancedAllocation{}
+var _ framework.BatchablePlugin = &BalancedAllocation{}
 
 // BalancedAllocationName is the name of the plugin used in the plugin registry and configurations.
 const (
@@ -94,6 +95,12 @@ func getBalancedAllocationPreScoreState(cycleState fwk.CycleState) (*balancedAll
 // Name returns name of the plugin. It is used in logs, etc.
 func (ba *BalancedAllocation) Name() string {
 	return BalancedAllocationName
+}
+
+// Feasibilty and scoring are based on a set of resources considered by BA. We
+// reuse the internal function used to determine the relevant resources.
+func (ba *BalancedAllocation) SignPod(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	return signature.AddElementFromObj(ba.Name(), ba.calculatePodResourceRequestList(pod, ba.resources))
 }
 
 // Score invoked at the score extension point.

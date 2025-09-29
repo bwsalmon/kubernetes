@@ -38,6 +38,7 @@ type NodeUnschedulable struct {
 
 var _ framework.FilterPlugin = &NodeUnschedulable{}
 var _ framework.EnqueueExtensions = &NodeUnschedulable{}
+var _ framework.BatchablePlugin = &NodeUnschedulable{}
 
 // Name is the name of the plugin used in the plugin registry and configurations.
 const Name = names.NodeUnschedulable
@@ -127,6 +128,14 @@ func (pl *NodeUnschedulable) isSchedulableAfterNodeChange(logger klog.Logger, po
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *NodeUnschedulable) Name() string {
 	return Name
+}
+
+// Feasibility and scoring based on the pod's tolerations.
+func (pl *NodeUnschedulable) SignPod(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Tolerations") {
+		return signature.AddElementFromObj("Tolerations", pod.Spec.Tolerations)
+	}
+	return nil
 }
 
 // Filter invoked at the filter extension point.

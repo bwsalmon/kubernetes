@@ -157,10 +157,11 @@ type ScheduleResult struct {
 	// The number of nodes the scheduler evaluated the pod against in the filtering
 	// phase and beyond.
 	EvaluatedNodes int
-	// The number of nodes out of the evaluated ones that fit the pod.
+	// The nodes out of the evaluated ones that fit the pod.
 	FeasibleNodes int
 	// The nominating info for scheduling cycle.
 	nominatingInfo *framework.NominatingInfo
+	FeasibleScores []framework.NodePluginScores
 }
 
 // WithComponentConfigVersion sets the component config version to the

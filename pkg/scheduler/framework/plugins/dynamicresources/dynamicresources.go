@@ -231,10 +231,20 @@ var _ framework.PostFilterPlugin = &DynamicResources{}
 var _ framework.ReservePlugin = &DynamicResources{}
 var _ framework.EnqueueExtensions = &DynamicResources{}
 var _ framework.PreBindPlugin = &DynamicResources{}
+var _ framework.BatchablePlugin = &DynamicResources{}
 
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *DynamicResources) Name() string {
 	return Name
+}
+
+// Because it isn't simple to determine if DRA claims are single host or more complex,
+// we exclude any pod with a DRA claim from signatures. We should improve this.
+func (pl *DynamicResources) SignPod(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if len(pod.Spec.ResourceClaims) > 0 {
+		signature.Unsignable()
+	}
+	return nil
 }
 
 // EventsToRegister returns the possible events that may make a Pod
