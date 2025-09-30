@@ -293,6 +293,7 @@ func podCachingCandidate(p *v1.Pod) bool {
 		len(p.Spec.TopologySpreadConstraints) == 0 &&
 
 		// For now ignore pods with resource claims
+		// XXX do we also need to check the claims in the container resources?
 		p.Spec.ResourceClaims == nil &&
 
 		// Pods with pod affinity or anti-affinity are not cacheable.
@@ -326,7 +327,6 @@ func encode(out *[]byte, obj any) error {
 }
 
 func podSchedulingSignature(p *v1.Pod) (string, error) {
-	// Need to find something better than md5
 	out := []byte{}
 
 	err := encode(&out, p.Namespace)
