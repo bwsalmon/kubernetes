@@ -87,16 +87,16 @@ func (c *PodHostCache) AddSignature(signature string, sortedHostnames []string, 
 }
 
 func (c *PodHostCache) SuggestedHost(pod *v1.Pod) (string, error) {
-	if podCachingCandidate(pod) && cacheEnabled {
-		sig, err := podSchedulingSignature(pod)
-		if err != nil {
-			return "", err
-		}
-
-		return c.SuggestedHostSig(sig)
+	if !podCachingCandidate(pod) || !cacheEnabled {
+		return "", fmt.Errorf("pod not candidate for caching or cache disabled")
 	}
 
-	return "", fmt.Errorf("pod not candidate for caching or cache disabled")
+	sig, err := podSchedulingSignature(pod)
+	if err != nil {
+		return "", err
+	}
+
+	return c.SuggestedHostSig(sig)
 }
 
 func (c *PodHostCache) SuggestedHostSig(signature string) (string, error) {
@@ -225,6 +225,8 @@ func (m *listCache) Add(key string, value any, t time.Time, outItem *listCacheIt
 		elem:  l.list.PushBack(outItem),
 	}
 }
+
+// Remove item from the list in which it resides, or a no-op if it isn't in a list.
 
 func (m *listCache) Remove(elem *listCacheItem) {
 	if elem.list != nil {
