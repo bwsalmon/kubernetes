@@ -23,6 +23,8 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+
+	"container/list"
 )
 
 const (
@@ -44,15 +46,15 @@ type PodHostCache struct {
 type entry struct {
 	signature     string
 	hostname      string
-	signatureList dlistEntry
-	hostList      dlistEntry
+	signatureList listCacheItem
+	hostList      listCacheItem
 	cache         *PodHostCache
 }
 
 func NewPodHostCache() *PodHostCache {
 	return &PodHostCache{
-		signatures: newListCache(),
-		hostnames:  newListCache(),
+		signatures: newListCache(removePodHostCacheEntry),
+		hostnames:  newListCache(removePodHostCacheEntry),
 	}
 }
 
@@ -71,21 +73,17 @@ func (c *PodHostCache) AddPod(pod *v1.Pod, sortedHosts []framework.NodePluginSco
 		sortedHostnames[i] = sortedHosts[i].Name
 	}
 
-	return c.AddSignature(sig, sortedHostnames, time.Now())
+	c.AddSignature(sig, sortedHostnames, time.Now())
+	return nil
 }
 
-func (c *PodHostCache) AddSignature(signature string, sortedHostnames []string, t time.Time) error {
-	err := c.signatures.RemoveListIfExists(signature)
-	if err != nil {
-		return err
-	}
+func (c *PodHostCache) AddSignature(signature string, sortedHostnames []string, t time.Time) {
+	c.signatures.RemoveListIfExists(signature)
 
 	for _, hostname := range sortedHostnames {
 		e := c.newEntry(signature, hostname)
 		c.addEntry(e, t)
 	}
-
-	return nil
 }
 
 func (c *PodHostCache) SuggestedHost(pod *v1.Pod) (string, error) {
@@ -107,12 +105,12 @@ func (c *PodHostCache) SuggestedHostSig(signature string) (string, error) {
 		return "", fmt.Errorf("no signature list to use")
 	}
 
-	ent := l.list.Head()
+	ent := l.list.Front()
 	if ent == nil {
 		return "", fmt.Errorf("signature list is empty")
 	}
 
-	return ent.parent.(*entry).hostname, nil
+	return ent.Value.(*listCacheItem).Value.(*entry).hostname, nil
 }
 
 func (c *PodHostCache) HostAvailable(pod *v1.Pod) (bool, error) {
@@ -131,21 +129,19 @@ func (c *PodHostCache) HostAvailableSig(signature string) bool {
 	return found
 }
 
-func (c *PodHostCache) InvalidateHost(hostname string) error {
+func (c *PodHostCache) InvalidateHost(hostname string) {
 	if cacheEnabled {
-		return c.hostnames.RemoveListIfExists(hostname)
+		c.hostnames.RemoveListIfExists(hostname)
 	}
-	return nil
 }
 
 // Expire cache entries that are stale. Should be called each scheduling iteration before checking for suggested hosts.
 
-func (c *PodHostCache) Evict() error {
+func (c *PodHostCache) Evict() {
 	// This should only be nil in tests.
 	if c.signatures != nil {
-		return c.signatures.Evict(time.Now())
+		c.signatures.Evict(time.Now())
 	}
-	return nil
 }
 
 func (c *PodHostCache) newEntry(signature, hostname string) *entry {
@@ -154,221 +150,133 @@ func (c *PodHostCache) newEntry(signature, hostname string) *entry {
 		hostname:  hostname,
 		cache:     c,
 	}
-	e.signatureList.parent = e
-	e.hostList.parent = e
 	return e
 }
 
 func (c *PodHostCache) addEntry(ent *entry, t time.Time) {
-	c.signatures.AddOrPushToList(&ent.signatureList, ent.signature, t)
-	c.hostnames.AddOrPushToList(&ent.hostList, ent.hostname, t)
+	c.signatures.Add(ent.signature, ent, t, &ent.signatureList)
+	c.hostnames.Add(ent.hostname, ent, t, &ent.hostList)
 }
 
-func (ent *entry) Removed() error {
-	err := ent.signatureList.RemoveIfOnList()
-	if err != nil {
-		return err
-	}
-	err = ent.hostList.RemoveIfOnList()
-	if err != nil {
-		return err
-	}
-	return nil
+func removePodHostCacheEntry(elem any) {
+	ent := elem.(*entry)
+	ent.cache.signatures.Remove(&ent.signatureList)
+	ent.cache.hostnames.Remove(&ent.hostList)
 }
 
-func newListCache() *listCache {
+type itemRemovedCallback func(any)
+
+func newListCache(removedCallback itemRemovedCallback) *listCache {
 	return &listCache{
-		entries:      map[string]*listCacheEntry{},
-		evictionList: newDlist(nil),
+		entries:         map[string]*listCacheList{},
+		evictionList:    list.New(),
+		removedCallback: removedCallback,
 	}
 }
 
 // A cache of lists, indexed by string.
 type listCache struct {
-	entries map[string]*listCacheEntry
+	entries map[string]*listCacheList
 
 	// List of entries in the cache by time added, with the oldest item
 	// at the head of the list.
-	evictionList *dlist
+	evictionList *list.List
+
+	// Optional callback invoked when an item is removed from a list in the cache.
+	removedCallback itemRemovedCallback
 }
 
 // An entry in the listCache. This contains a list, the time when it was added
 // and an entry that links this into the evictionList for the cache.
-type listCacheEntry struct {
+type listCacheList struct {
 	key          string
-	list         *dlist
+	list         *list.List
 	timestamp    time.Time
-	evictionList dlistEntry
+	evictionList *list.Element
 	cache        *listCache
 }
 
-// If a list exists in our cache with the given key, remove it.
-
-func (m *listCache) RemoveListIfExists(key string) error {
-	if l, found := m.entries[key]; found {
-		delete(m.entries, key)
-		err := l.list.Clear()
-		if err != nil {
-			return err
-		}
-		err = l.evictionList.Remove()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+// An item inside a list in the list cache.
+type listCacheItem struct {
+	Value any
+	elem  *list.Element
+	list  *listCacheList
 }
 
 // Create a new list in our cache if it doesn't exist, add this entry to the tail of the list
 // if such a list already exists.
 
-func (m *listCache) AddOrPushToList(lent *dlistEntry, key string, t time.Time) {
+func (m *listCache) Add(key string, value any, t time.Time, outItem *listCacheItem) {
 	l, found := m.entries[key]
 	if !found {
-		l = &listCacheEntry{
+		l = &listCacheList{
 			key:       key,
 			timestamp: t,
 			cache:     m,
+			list:      list.New(),
 		}
-		l.list = newDlist(l)
-		l.evictionList.parent = l
 		m.entries[key] = l
-		m.evictionList.PushTail(&l.evictionList)
+		l.evictionList = m.evictionList.PushBack(l)
 	}
 
-	l.list.PushTail(lent)
+	*outItem = listCacheItem{
+		Value: value,
+		list:  l,
+		elem:  l.list.PushBack(outItem),
+	}
+}
+
+func (m *listCache) Remove(elem *listCacheItem) {
+	if elem.list != nil {
+		elem.list.list.Remove(elem.elem)
+		if elem.list.list.Len() == 0 {
+			m.RemoveListIfExists(elem.list.key)
+		}
+		elem.list = nil
+		if m.removedCallback != nil {
+			m.removedCallback(elem.Value)
+		}
+	}
+}
+
+// If a list exists in our cache with the given key, remove it.
+
+func (m *listCache) RemoveListIfExists(key string) {
+	if l, found := m.entries[key]; found {
+		delete(m.entries, key)
+		if m.removedCallback != nil {
+			elem := l.list.Front()
+			for {
+				if elem == nil {
+					break
+				}
+
+				// Grab the next element in case the callback deletes the entry.
+				next := elem.Next()
+
+				m.removedCallback(elem.Value.(*listCacheItem).Value)
+				elem = next
+			}
+		}
+		m.evictionList.Remove(l.evictionList)
+	}
 }
 
 // Evict stale list entries given the current time and cache settings.
 
-func (m *listCache) Evict(n time.Time) error {
+func (m *listCache) Evict(n time.Time) {
 	for {
-		t := m.evictionList.Head()
+		t := m.evictionList.Front()
 		if t == nil {
-			return nil
+			break
 		}
-		ent := t.parent.(*listCacheEntry)
+		ent := t.Value.(*listCacheList)
 		if n.Sub(ent.timestamp) > expirationTime || len(m.entries) > maxCacheSize {
 			ent.cache.RemoveListIfExists(ent.key)
 		} else {
 			break
 		}
 	}
-	return nil
-}
-
-func (l *listCacheEntry) ListEmpty() error {
-	return l.cache.RemoveListIfExists(l.key)
-}
-
-func (l *listCacheEntry) Removed() error {
-	return nil
-}
-
-// An intrusive doubly linked list, implemented as a circular list with the first entry a "dummy" entry.
-type dlist struct {
-	startEntry dlistEntry
-	parent     dlistParent
-}
-
-type dlistParent interface {
-	ListEmpty() error
-}
-
-type dlistEntry struct {
-	parent dlistEntryParent // Points to the parent struct, or nil for the dummy entry.
-	prev   *dlistEntry
-	next   *dlistEntry
-	onList *dlist
-}
-
-type dlistEntryParent interface {
-	// Callback invoked when the entry is removed from the list.
-	Removed() error
-}
-
-func newDlist(parent dlistParent) *dlist {
-	n := &dlist{parent: parent}
-	n.startEntry.prev = &n.startEntry
-	n.startEntry.next = &n.startEntry
-	return n
-}
-
-func (l *dlist) PushTail(ent *dlistEntry) error {
-	if ent.onList != nil {
-		return fmt.Errorf("trying to add entry to list that is already on a list")
-	}
-
-	ent.next = &l.startEntry
-	ent.prev = l.startEntry.prev
-	ent.onList = l
-
-	l.startEntry.prev.next = ent
-	l.startEntry.prev = ent
-
-	return nil
-}
-
-func (l *dlist) Head() *dlistEntry {
-	// Empty list
-	if l.startEntry.next == &l.startEntry {
-		return nil
-	}
-	return l.startEntry.next
-}
-
-func (l *dlist) Clear() error {
-	for {
-		ent := l.Head()
-		if ent == nil {
-			return nil
-		}
-
-		err := ent.Remove()
-		if err != nil {
-			return err
-		}
-	}
-}
-
-func (l *dlistEntry) Next() *dlistEntry {
-	if l.next == &l.onList.startEntry {
-		return nil
-	}
-	return l.next
-}
-
-func (l *dlistEntry) RemoveIfOnList() error {
-	if l.next != nil {
-		return l.Remove()
-	}
-	return nil
-}
-
-func (l *dlistEntry) Remove() error {
-	onList := l.onList
-	emptyList := (l.prev == l.next)
-
-	l.prev.next = l.next
-	l.next.prev = l.prev
-
-	l.next = nil
-	l.prev = nil
-	l.onList = nil
-
-	err := l.parent.Removed()
-	if err != nil {
-		return err
-	}
-
-	if emptyList && onList.parent != nil {
-		err = onList.parent.ListEmpty()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 // Functions to determine if a pod is cacheable and generating a signature for those that are cacheable.

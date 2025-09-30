@@ -14,19 +14,19 @@ import (
 // Check that the eviction list is in ascending time order and matches the signature
 // map.
 func validateCache(t *testing.T, c *PodHostCache) {
-	signatureLists := map[*listCacheEntry]bool{}
+	signatureLists := map[*listCacheList]bool{}
 	for sig, l := range c.signatures.entries {
 		if !c.HostAvailableSig(sig) {
 			t.Fatal("Doesn't show host available for signature in cache")
 		}
 		signatureLists[l] = true
-		lent := l.list.Head()
+		lent := l.list.Front()
 		if lent == nil {
 			t.Fatal("Empty list for ", sig)
 		}
 		hostnamesFound := map[string]bool{}
 		for lent != nil {
-			ent := lent.parent.(*entry)
+			ent := lent.Value.(*listCacheItem).Value.(*entry)
 			lent = lent.Next()
 			if sig != ent.signature {
 				t.Fatal("Signature in entry doesn't match list", sig, ent)
@@ -39,10 +39,10 @@ func validateCache(t *testing.T, c *PodHostCache) {
 			if !found {
 				t.Fatal("Hostname not found in hostname map", ent)
 			}
-			e := l2.list.Head()
+			e := l2.list.Front()
 			found = false
 			for e != nil {
-				if e.parent == ent {
+				if e.Value.(*listCacheItem).Value == ent {
 					found = true
 					break
 				}
@@ -55,12 +55,12 @@ func validateCache(t *testing.T, c *PodHostCache) {
 	}
 
 	if len(c.signatures.entries) > 0 {
-		l := c.signatures.evictionList.Head()
+		l := c.signatures.evictionList.Front()
 		var lastTime time.Time
 		timeSet := false
 		entriesFound := 0
 		for l != nil {
-			ent := l.parent.(*listCacheEntry)
+			ent := l.Value.(*listCacheList)
 			tm := ent.timestamp
 			if timeSet && !(tm.After(lastTime) || tm.Equal(lastTime)) {
 				t.Fatal("Timestamps out of order")
@@ -81,13 +81,13 @@ func validateCache(t *testing.T, c *PodHostCache) {
 	}
 
 	for hostname, l := range c.hostnames.entries {
-		lent := l.list.Head()
+		lent := l.list.Front()
 		if lent == nil {
 			t.Fatal("Empty list for ", hostname)
 		}
 		signaturesFound := map[string]bool{}
 		for lent != nil {
-			ent := lent.parent.(*entry)
+			ent := lent.Value.(*listCacheItem).Value.(*entry)
 			lent = lent.Next()
 			if hostname != ent.hostname {
 				t.Fatal("Hostname in entry doesn't match list", hostname, ent)
@@ -100,10 +100,10 @@ func validateCache(t *testing.T, c *PodHostCache) {
 			if !found {
 				t.Fatal("Signature not found in signature map", ent)
 			}
-			e := l2.list.Head()
+			e := l2.list.Front()
 			found = false
 			for e != nil {
-				if e.parent == ent {
+				if e.Value.(*listCacheItem).Value == ent {
 					found = true
 					break
 				}
@@ -118,10 +118,7 @@ func validateCache(t *testing.T, c *PodHostCache) {
 
 func TestPodHostCacheBasic(t *testing.T) {
 	c := NewPodHostCache()
-	err := c.AddSignature("sig", []string{"h1", "h2"}, time.Now())
-	if err != nil {
-		t.Fatal("Error adding")
-	}
+	c.AddSignature("sig", []string{"h1", "h2"}, time.Now())
 	validateCache(t, c)
 
 	host, err := c.SuggestedHostSig("sig")
@@ -147,16 +144,10 @@ func TestPodHostCacheBasic(t *testing.T) {
 
 func TestPodHostCacheDouble(t *testing.T) {
 	c := NewPodHostCache()
-	err := c.AddSignature("sig", []string{"h1", "h2"}, time.Now())
-	if err != nil {
-		t.Fatal("Error adding")
-	}
+	c.AddSignature("sig", []string{"h1", "h2"}, time.Now())
 	validateCache(t, c)
 
-	err = c.AddSignature("sig2", []string{"h1", "h3"}, time.Now())
-	if err != nil {
-		t.Fatal("Error adding")
-	}
+	c.AddSignature("sig2", []string{"h1", "h3"}, time.Now())
 	validateCache(t, c)
 
 	if !c.HostAvailableSig("sig") {
@@ -201,16 +192,10 @@ func TestPodHostCacheDouble(t *testing.T) {
 
 func TestPodHostCacheRemoveEmpty(t *testing.T) {
 	c := NewPodHostCache()
-	err := c.AddSignature("sig", []string{"h1"}, time.Now())
-	if err != nil {
-		t.Fatal("Error adding")
-	}
+	c.AddSignature("sig", []string{"h1"}, time.Now())
 	validateCache(t, c)
 
-	err = c.AddSignature("sig2", []string{"h1"}, time.Now())
-	if err != nil {
-		t.Fatal("Error adding")
-	}
+	c.AddSignature("sig2", []string{"h1"}, time.Now())
 	validateCache(t, c)
 
 	if !c.HostAvailableSig("sig") {

@@ -123,12 +123,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		return
 	}
 
-	err = sched.podHostCache.InvalidateHost(scheduleResult.SuggestedHost)
-	if err != nil {
-		// This should never happen.
-		utilruntime.HandleErrorWithContext(ctx, err, "Error while invalidating pod host cache")
-		return
-	}
+	sched.podHostCache.InvalidateHost(scheduleResult.SuggestedHost)
 
 	// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
 	go func() {
