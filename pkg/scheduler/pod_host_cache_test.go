@@ -357,14 +357,8 @@ func TestPodHostCacheEviction(t *testing.T) {
 }
 
 func TestPodHostCacheSizeLimitEviction(t *testing.T) {
-	// Set up cache using a small size limit
 	c := NewPodHostCache()
-	// NOTE: In a robust test environment, we would inject this limit into NewPodHostCache.
-	// For this unit test, we'll rely on direct manipulation/validation based on hardcoded maxCacheSize if we can't inject.
-
-	// We will simulate the size limit being 10, meaning we add 11 entries to ensure eviction.
-
-	// Add entries 0 through 9 (10 total) at T0
+	// Add entries at T0
 	t0 := time.Now()
 	for i := 0; i < maxCacheSize; i++ {
 		sig := fmt.Sprintf("s%d", i)

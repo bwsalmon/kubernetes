@@ -17,14 +17,10 @@ package scheduler
  */
 
 import (
-	"encoding/json"
-	"fmt"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-
-	"container/list"
 )
 
 const (
@@ -33,252 +29,63 @@ const (
 
 	// How long cached extries remain usable.
 	expirationTime = 10 * time.Second
-
-	// Maximum size of the cache
-	maxCacheSize = 1000
 )
 
 type PodHostCache struct {
-	signatures *listCache
-	hostnames  *listCache
+	hasData bool
+
+	controller string
+	hosts      []string
+	timeAdded  time.Time
 }
 
-type entry struct {
-	signature     string
-	hostname      string
-	signatureList listCacheItem
-	hostList      listCacheItem
-	cache         *PodHostCache
-}
-
-func NewPodHostCache() *PodHostCache {
-	return &PodHostCache{
-		signatures: newListCache(removePodHostCacheEntry),
-		hostnames:  newListCache(removePodHostCacheEntry),
-	}
-}
-
-func (c *PodHostCache) AddPod(pod *v1.Pod, sortedHosts []framework.NodePluginScores) error {
+func (c *PodHostCache) AddPod(pod *v1.Pod, sortedHosts []framework.NodePluginScores, t time.Time) {
 	if !podCachingCandidate(pod) || !cacheEnabled {
-		return nil
+		return
 	}
 
-	sig, err := podSchedulingSignature(pod)
-	if err != nil {
-		return err
-	}
+	c.controller = c.getPodController(pod)
+	c.hasData = true
+	c.timeAdded = t
 
-	c.signatures.RemoveListIfExists(sig)
-	for _, host := range sortedHosts {
-		e := c.newEntry(sig, host.Name)
-		c.addEntry(e, time.Now())
-	}
-
-	return nil
-}
-
-func (c *PodHostCache) AddSignature(signature string, sortedHostnames []string, t time.Time) {
-	c.signatures.RemoveListIfExists(signature)
-
-	for _, hostname := range sortedHostnames {
-		e := c.newEntry(signature, hostname)
-		c.addEntry(e, t)
+	c.hosts = make([]string, len(sortedHosts))
+	for i, host := range sortedHosts {
+		c.hosts[i] = host.Name
 	}
 }
 
-func (c *PodHostCache) SuggestedHost(pod *v1.Pod) (string, error) {
-	if !podCachingCandidate(pod) || !cacheEnabled {
-		return "", fmt.Errorf("pod not candidate for caching or cache disabled")
+func (c *PodHostCache) SuggestedHost(pod *v1.Pod, consumeHost bool) (string, bool) {
+	if !c.hasData || !podCachingCandidate(pod) || !cacheEnabled {
+		return "", false
 	}
 
-	sig, err := podSchedulingSignature(pod)
-	if err != nil {
-		return "", err
+	controller := c.getPodController(pod)
+
+	if c.controller != controller {
+		return "", false
 	}
 
-	return c.SuggestedHostSig(sig)
-}
-
-func (c *PodHostCache) SuggestedHostSig(signature string) (string, error) {
-	l, found := c.signatures.entries[signature]
-	if !found {
-		return "", fmt.Errorf("no signature list to use")
+	if time.Now().After(c.timeAdded.Add(expirationTime)) {
+		c.hasData = false
+		c.hosts = []string{}
+		return "", false
 	}
 
-	ent := l.list.Front()
-	if ent == nil {
-		return "", fmt.Errorf("signature list is empty")
-	}
-
-	return ent.Value.(*listCacheItem).Value.(*entry).hostname, nil
-}
-
-func (c *PodHostCache) HostAvailable(pod *v1.Pod) (bool, error) {
-	if podCachingCandidate(pod) && cacheEnabled {
-		sig, err := podSchedulingSignature(pod)
-		if err != nil {
-			return false, err
-		}
-		return c.HostAvailableSig(sig), nil
-	}
-	return false, nil
-}
-
-func (c *PodHostCache) HostAvailableSig(signature string) bool {
-	_, found := c.signatures.entries[signature]
-	return found
-}
-
-func (c *PodHostCache) InvalidateHost(hostname string) {
-	if cacheEnabled {
-		c.hostnames.RemoveListIfExists(hostname)
-	}
-}
-
-// Expire cache entries that are stale. Should be called each scheduling iteration before checking for suggested hosts.
-
-func (c *PodHostCache) Evict() {
-	// This should only be nil in tests.
-	if c.signatures != nil {
-		c.signatures.Evict(time.Now())
-	}
-}
-
-func (c *PodHostCache) newEntry(signature, hostname string) *entry {
-	e := &entry{
-		signature: signature,
-		hostname:  hostname,
-		cache:     c,
-	}
-	return e
-}
-
-func (c *PodHostCache) addEntry(ent *entry, t time.Time) {
-	c.signatures.Add(ent.signature, ent, t, &ent.signatureList)
-	c.hostnames.Add(ent.hostname, ent, t, &ent.hostList)
-}
-
-func removePodHostCacheEntry(elem any) {
-	ent := elem.(*entry)
-	ent.cache.signatures.Remove(&ent.signatureList)
-	ent.cache.hostnames.Remove(&ent.hostList)
-}
-
-type itemRemovedCallback func(any)
-
-func newListCache(removedCallback itemRemovedCallback) *listCache {
-	return &listCache{
-		entries:         map[string]*listCacheList{},
-		evictionList:    list.New(),
-		removedCallback: removedCallback,
-	}
-}
-
-// A cache of lists, indexed by string.
-type listCache struct {
-	entries map[string]*listCacheList
-
-	// List of entries in the cache by time added, with the oldest item
-	// at the head of the list.
-	evictionList *list.List
-
-	// Optional callback invoked when an item is removed from a list in the cache.
-	removedCallback itemRemovedCallback
-}
-
-// An entry in the listCache. This contains a list, the time when it was added
-// and an entry that links this into the evictionList for the cache.
-type listCacheList struct {
-	key          string
-	list         *list.List
-	timestamp    time.Time
-	evictionList *list.Element
-	cache        *listCache
-}
-
-// An item inside a list in the list cache.
-type listCacheItem struct {
-	Value any
-	elem  *list.Element
-	list  *listCacheList
-}
-
-// Create a new list in our cache if it doesn't exist, add this entry to the tail of the list
-// if such a list already exists.
-
-func (m *listCache) Add(key string, value any, t time.Time, outItem *listCacheItem) {
-	l, found := m.entries[key]
-	if !found {
-		l = &listCacheList{
-			key:       key,
-			timestamp: t,
-			cache:     m,
-			list:      list.New(),
-		}
-		m.entries[key] = l
-		l.evictionList = m.evictionList.PushBack(l)
-	}
-
-	*outItem = listCacheItem{
-		Value: value,
-		list:  l,
-		elem:  l.list.PushBack(outItem),
-	}
-}
-
-// Remove item from the list in which it resides, or a no-op if it isn't in a list.
-
-func (m *listCache) Remove(elem *listCacheItem) {
-	if elem.list != nil {
-		elem.list.list.Remove(elem.elem)
-		if elem.list.list.Len() == 0 {
-			m.RemoveListIfExists(elem.list.key)
-		}
-		elem.list = nil
-		if m.removedCallback != nil {
-			m.removedCallback(elem.Value)
-		}
-	}
-}
-
-// If a list exists in our cache with the given key, remove it.
-
-func (m *listCache) RemoveListIfExists(key string) {
-	if l, found := m.entries[key]; found {
-		delete(m.entries, key)
-		if m.removedCallback != nil {
-			elem := l.list.Front()
-			for {
-				if elem == nil {
-					break
-				}
-
-				// Grab the next element in case the callback deletes the entry.
-				next := elem.Next()
-
-				m.removedCallback(elem.Value.(*listCacheItem).Value)
-				elem = next
-			}
-		}
-		m.evictionList.Remove(l.evictionList)
-	}
-}
-
-// Evict stale list entries given the current time and cache settings.
-
-func (m *listCache) Evict(n time.Time) {
-	for {
-		t := m.evictionList.Front()
-		if t == nil {
-			break
-		}
-		ent := t.Value.(*listCacheList)
-		if n.Sub(ent.timestamp) > expirationTime || len(m.entries) > maxCacheSize {
-			ent.cache.RemoveListIfExists(ent.key)
+	host := c.hosts[0]
+	if consumeHost {
+		if len(c.hosts) > 1 {
+			c.hosts = c.hosts[1:]
 		} else {
-			break
+			c.hasData = false
+			c.hosts = []string{}
 		}
 	}
+
+	return host, true
+}
+
+func (c *PodHostCache) getPodController(pod *v1.Pod) string {
+	return "controller"
 }
 
 // Functions to determine if a pod is cacheable and generating a signature for those that are cacheable.
@@ -288,9 +95,10 @@ func (m *listCache) Evict(n time.Time) {
 func podCachingCandidate(p *v1.Pod) bool {
 	return onePodPerNode(p) &&
 		// Pods with topology spread constraints are not cacheable.
-		// XXX how do we tell if the default constraints are being applied?
-		// 		it looks like we literally have to reach into the plugin and read out the configuration?
 		len(p.Spec.TopologySpreadConstraints) == 0 &&
+
+		// We only support pods with a given set of controller types.
+		validPodControllerType(p) &&
 
 		// For now ignore pods with resource claims
 		// XXX do we also need to check the claims in the container resources?
@@ -301,8 +109,6 @@ func podCachingCandidate(p *v1.Pod) bool {
 }
 
 // Determine if a pod is a single pod per node. For now only consider pods with a fixed host port reservation.
-// XXX do we need to worry about host IP here? It looks like maybe you could bind the same pod port to different
-// IPs on the same host and not get one pod per node?
 
 func onePodPerNode(p *v1.Pod) bool {
 	for _, container := range p.Spec.Containers {
@@ -315,108 +121,7 @@ func onePodPerNode(p *v1.Pod) bool {
 	return false
 }
 
-// Compute a signature for a pod from its scheduling settings.
-
-func encode(out *[]byte, obj any) error {
-	jsonStr, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-	*out = append(*out, jsonStr...)
-	return nil
-}
-
-func podSchedulingSignature(p *v1.Pod) (string, error) {
-	out := []byte{}
-
-	err := encode(&out, p.Namespace)
-	if err != nil {
-		return "", err
-	}
-
-	err = encode(&out, p.Spec.SchedulerName)
-	if err != nil {
-		return "", err
-	}
-
-	if p.Spec.Priority != nil {
-		err = encode(&out, *p.Spec.Priority)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	err = encode(&out, p.Spec.Tolerations)
-	if err != nil {
-		return "", err
-	}
-
-	if p.Spec.Affinity != nil && p.Spec.Affinity.NodeAffinity != nil {
-		err = encode(&out, p.Spec.Affinity.NodeAffinity)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	err = encode(&out, p.Spec.NodeSelector)
-	if err != nil {
-		return "", err
-	}
-
-	if p.Spec.RuntimeClassName != nil {
-		err = encode(&out, p.Spec.RuntimeClassName)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	err = addContainersToHash(p.Spec.InitContainers, &out)
-	if err != nil {
-		return "", err
-	}
-
-	err = addContainersToHash(p.Spec.Containers, &out)
-	if err != nil {
-		return "", err
-	}
-
-	// XXX what about EphemeralContainers?
-	// XXX ServiceAccountName?
-	// XXX HostNetwork?
-	// XXX probably need SecurityContext
-	// XXX DNSPolicy?
-
-	err = addVolumesToHash(p.Spec.Volumes, &out)
-	if err != nil {
-		return "", err
-	}
-
-	return string(out), nil
-}
-
-func addContainersToHash(containers []v1.Container, out *[]byte) error {
-	for _, container := range containers {
-		err := encode(out, container.Ports)
-		if err != nil {
-			return err
-		}
-		err = encode(out, container.Resources)
-		if err != nil {
-			return err
-		}
-		// XXX what about volume devices & volume mounts?
-	}
-	return nil
-}
-
-func addVolumesToHash(volumes []v1.Volume, out *[]byte) error {
-	for _, vol := range volumes {
-		if vol.ConfigMap == nil && vol.Secret == nil {
-			err := encode(out, vol)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+func validPodControllerType(p *v1.Pod) bool {
+	// XXX fillme
+	return false
 }
