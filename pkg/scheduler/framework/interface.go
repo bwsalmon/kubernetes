@@ -507,7 +507,7 @@ type PodSignatureResult struct {
 	Signable bool
 
 	// The pod scheduling signature. Two pods with the same signature should
-	// get the same feasability and scores for the same set of nodes.
+	// get the same feasibility and scores for the same set of nodes.
 	Signature string
 
 	// Non-nil if the signature process encountered an internal error.
