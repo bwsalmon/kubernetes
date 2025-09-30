@@ -288,6 +288,8 @@ func (m *listCache) Evict(n time.Time) {
 func podCachingCandidate(p *v1.Pod) bool {
 	return onePodPerNode(p) &&
 		// Pods with topology spread constraints are not cacheable.
+		// XXX how do we tell if the default constraints are being applied?
+		// 		it looks like we literally have to reach into the plugin and read out the configuration?
 		len(p.Spec.TopologySpreadConstraints) == 0 &&
 
 		// For now ignore pods with resource claims
@@ -298,6 +300,8 @@ func podCachingCandidate(p *v1.Pod) bool {
 }
 
 // Determine if a pod is a single pod per node. For now only consider pods with a fixed host port reservation.
+// XXX do we need to worry about host IP here? It looks like maybe you could bind the same pod port to different
+// IPs on the same host and not get one pod per node?
 
 func onePodPerNode(p *v1.Pod) bool {
 	for _, container := range p.Spec.Containers {
@@ -376,6 +380,12 @@ func podSchedulingSignature(p *v1.Pod) (string, error) {
 		return "", err
 	}
 
+	// XXX what about EphemeralContainers?
+	// XXX ServiceAccountName?
+	// XXX HostNetwork?
+	// XXX probably need SecurityContext
+	// XXX DNSPolicy?
+
 	err = addVolumesToHash(p.Spec.Volumes, &out)
 	if err != nil {
 		return "", err
@@ -394,6 +404,7 @@ func addContainersToHash(containers []v1.Container, out *[]byte) error {
 		if err != nil {
 			return err
 		}
+		// XXX what about volume devices & volume mounts?
 	}
 	return nil
 }
