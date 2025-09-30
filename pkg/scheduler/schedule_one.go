@@ -66,7 +66,6 @@ const (
 func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	podInfo, err := sched.NextPod(logger)
-	logger.V(1).Info("schedone")
 	if err != nil {
 		utilruntime.HandleErrorWithContext(ctx, err, "Error while retrieving next pod from scheduling queue")
 		return
@@ -82,7 +81,6 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	ctx = klog.NewContext(ctx, logger)
-	logger.V(1).Info("About to try and schedule pod", "pod", klog.KObj(pod))
 
 	fwk, err := sched.frameworkForPod(pod)
 	if err != nil {
@@ -97,8 +95,6 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		sched.SchedulingQueue.Done(pod.UID)
 		return
 	}
-
-	logger.V(1).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
 
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
@@ -184,7 +180,7 @@ func (sched *Scheduler) schedulingCycle(
 		// into the resources that were preempted, but this is harmless.
 
 		if !schedFramework.HasPostFilterPlugins() {
-			logger.V(1).Info("No PostFilter plugins are registered, so no preemption will be performed")
+			logger.V(3).Info("No PostFilter plugins are registered, so no preemption will be performed")
 			return ScheduleResult{}, podInfo, fwk.NewStatus(fwk.Unschedulable).WithError(err)
 		}
 
@@ -195,7 +191,7 @@ func (sched *Scheduler) schedulingCycle(
 		if status.Code() == fwk.Error {
 			utilruntime.HandleErrorWithContext(ctx, nil, "Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		} else {
-			logger.V(1).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+			logger.V(3).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		}
 
 		var nominatingInfo *framework.NominatingInfo
@@ -348,7 +344,7 @@ func (sched *Scheduler) bindingCycle(
 	}
 
 	// Calculating nodeResourceString can be heavy. Avoid it if klog verbosity is below 2.
-	logger.V(1).Info("Successfully bound pod to node", "pod", klog.KObj(assumedPod), "node", scheduleResult.SuggestedHost, "evaluatedNodes", scheduleResult.EvaluatedNodes, "feasibleNodes", scheduleResult.FeasibleNodes)
+	logger.V(2).Info("Successfully bound pod to node", "pod", klog.KObj(assumedPod), "node", scheduleResult.SuggestedHost, "evaluatedNodes", scheduleResult.EvaluatedNodes, "feasibleNodes", scheduleResult.FeasibleNodes)
 	metrics.PodScheduled(schedFramework.ProfileName(), metrics.SinceInSeconds(start))
 	metrics.PodSchedulingAttempts.Observe(float64(assumedPodInfo.Attempts))
 	if assumedPodInfo.InitialAttemptTimestamp != nil {
