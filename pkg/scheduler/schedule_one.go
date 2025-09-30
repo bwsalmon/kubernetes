@@ -81,6 +81,7 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 	// https://github.com/kubernetes/kubernetes/issues/111672
 	logger = klog.LoggerWithValues(logger, "pod", klog.KObj(pod))
 	ctx = klog.NewContext(ctx, logger)
+	logger.V(4).Info("About to try and schedule pod", "pod", klog.KObj(pod))
 
 	fwk, err := sched.frameworkForPod(pod)
 	if err != nil {
@@ -95,6 +96,8 @@ func (sched *Scheduler) ScheduleOne(ctx context.Context) {
 		sched.SchedulingQueue.Done(pod.UID)
 		return
 	}
+
+	logger.V(3).Info("Attempting to schedule pod", "pod", klog.KObj(pod))
 
 	// Synchronously attempt to find a fit for the pod.
 	start := time.Now()
@@ -191,7 +194,7 @@ func (sched *Scheduler) schedulingCycle(
 		if status.Code() == fwk.Error {
 			utilruntime.HandleErrorWithContext(ctx, nil, "Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		} else {
-			logger.V(3).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+			logger.V(5).Info("Status after running PostFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		}
 
 		var nominatingInfo *framework.NominatingInfo
