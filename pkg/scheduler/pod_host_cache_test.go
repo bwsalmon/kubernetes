@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/mohae/deepcopy"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // Cosistency check the cache. Ensure that entries show up in the right
@@ -399,5 +401,141 @@ func TestPodHostCacheSizeLimitEviction(t *testing.T) {
 	// Check if the newest entry (s-overflow) is present
 	if !c.HostAvailableSig(sigOverflow) {
 		t.Errorf("Expected newest entry 's-overflow' to be present, but it was evicted")
+	}
+}
+
+// makeBasePod creates a minimal cacheable Pod with a HostPort.
+func makeBasePod() *v1.Pod {
+	return &v1.Pod{
+		Spec: v1.PodSpec{
+			SchedulerName: "default-scheduler",
+			Tolerations: []v1.Toleration{
+				{Key: "t1", Operator: v1.TolerationOpExists, Effect: v1.TaintEffectNoSchedule},
+			},
+			Containers: []v1.Container{
+				{
+					Name: "main-container",
+					Ports: []v1.ContainerPort{
+						{HostPort: 8080, ContainerPort: 80},
+					},
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("100m"),
+							v1.ResourceMemory: resource.MustParse("100Mi"),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestSignatureStability(t *testing.T) {
+	basePod := makeBasePod()
+
+	// 1. Compute Base Signature
+	sig1, err := podSchedulingSignature(basePod)
+	if err != nil {
+		t.Fatalf("Failed to compute base signature: %v", err)
+	}
+
+	testCases := map[string]func(*v1.Pod){
+		"Change_Metadata": func(p *v1.Pod) {
+			p.Name = "pod-v2"
+			p.Labels = map[string]string{"app": "new"}
+		},
+		"Change_EnvVar": func(p *v1.Pod) {
+			p.Spec.Containers[0].Env = []v1.EnvVar{{Name: "VERSION", Value: "2.0"}}
+		},
+		"Change_Command": func(p *v1.Pod) {
+			p.Spec.Containers[0].Command = []string{"/bin/new-app"}
+		},
+		"Change_ConfigMapVolume": func(p *v1.Pod) {
+			// ConfigMap and Secret volumes are explicitly ignored in addVolumesToHash
+			p.Spec.Volumes = append(p.Spec.Volumes, v1.Volume{
+				Name: "config-vol",
+				VolumeSource: v1.VolumeSource{
+					ConfigMap: &v1.ConfigMapVolumeSource{LocalObjectReference: v1.LocalObjectReference{Name: "new-config"}},
+				},
+			})
+		},
+		"Change_Image": func(p *v1.Pod) {
+			p.Spec.Containers[0].Image = "new-image:v2"
+		},
+	}
+
+	for name, mutate := range testCases {
+		t.Run(name, func(t *testing.T) {
+			mutatedPod := makeBasePod()
+
+			mutate(mutatedPod)
+
+			sig2, err := podSchedulingSignature(mutatedPod)
+			if err != nil {
+				t.Fatalf("Failed to compute signature for mutated pod: %v", err)
+			}
+
+			if sig1 != sig2 {
+				t.Errorf("Signature changed when it should have remained stable (field not used in hash). \nOld Sig: %s \nNew Sig: %s", sig1, sig2)
+			}
+		})
+	}
+}
+
+func TestSignatureSensitivity(t *testing.T) {
+	basePod := makeBasePod()
+
+	// 1. Compute Base Signature
+	sig1, err := podSchedulingSignature(basePod)
+	if err != nil {
+		t.Fatalf("Failed to compute base signature: %v", err)
+	}
+
+	testCases := map[string]func(*v1.Pod){
+		"Change_Resources": func(p *v1.Pod) {
+			p.Spec.Containers[0].Resources.Requests[v1.ResourceCPU] = resource.MustParse("300m")
+		},
+		"Change_Tolerations": func(p *v1.Pod) {
+			p.Spec.Tolerations = append(p.Spec.Tolerations, v1.Toleration{Key: "t2", Operator: v1.TolerationOpExists})
+		},
+		"Change_HostPort": func(p *v1.Pod) {
+			p.Spec.Containers[0].Ports[0].HostPort = 9090
+		},
+		"Add_NodeSelector": func(p *v1.Pod) {
+			p.Spec.NodeSelector = map[string]string{"disk": "ssd"}
+		},
+		"Add_NodeAffinity": func(p *v1.Pod) {
+			p.Spec.Affinity = &v1.Affinity{
+				NodeAffinity: &v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{{Key: "zone", Operator: v1.NodeSelectorOpIn, Values: []string{"us-east-1"}}},
+							},
+						},
+					},
+				},
+			}
+		},
+		"Change_Priority": func(p *v1.Pod) {
+			newPriority := int32(100)
+			p.Spec.Priority = &newPriority
+		},
+	}
+
+	for name, mutate := range testCases {
+		t.Run(name, func(t *testing.T) {
+			mutatedPod := makeBasePod()
+			mutate(mutatedPod)
+
+			sig2, err := podSchedulingSignature(mutatedPod)
+			if err != nil {
+				t.Fatalf("Failed to compute signature for mutated pod: %v", err)
+			}
+
+			if sig1 == sig2 {
+				t.Errorf("Signature did NOT change when it should have (field used in hash: %s). \nOld Sig: %s \nNew Sig: %s", name, sig1, sig2)
+			}
+		})
 	}
 }

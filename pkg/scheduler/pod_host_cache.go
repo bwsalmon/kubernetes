@@ -17,9 +17,7 @@ package scheduler
  */
 
 import (
-	"crypto/md5"
-	"encoding/gob"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -70,12 +68,12 @@ func (c *PodHostCache) AddPod(pod *v1.Pod, sortedHosts []framework.NodePluginSco
 		return err
 	}
 
-	sortedHostnames := make([]string, len(sortedHosts))
-	for i := range sortedHosts {
-		sortedHostnames[i] = sortedHosts[i].Name
+	c.signatures.RemoveListIfExists(sig)
+	for _, host := range sortedHosts {
+		e := c.newEntry(sig, host.Name)
+		c.addEntry(e, time.Now())
 	}
 
-	c.AddSignature(sig, sortedHostnames, time.Now())
 	return nil
 }
 
@@ -314,77 +312,85 @@ func onePodPerNode(p *v1.Pod) bool {
 
 // Compute a signature for a pod from its scheduling settings.
 
+func encode(out *[]byte, obj any) error {
+	jsonStr, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	*out = append(*out, jsonStr...)
+	return nil
+}
+
 func podSchedulingSignature(p *v1.Pod) (string, error) {
 	// Need to find something better than md5
-	h := md5.New()
-	enc := gob.NewEncoder(h)
+	out := []byte{}
 
-	err := enc.Encode(p.Namespace)
+	err := encode(&out, p.Namespace)
 	if err != nil {
 		return "", err
 	}
 
-	err = enc.Encode(p.Spec.SchedulerName)
+	err = encode(&out, p.Spec.SchedulerName)
 	if err != nil {
 		return "", err
 	}
 
 	if p.Spec.Priority != nil {
-		err = enc.Encode(*p.Spec.Priority)
+		err = encode(&out, *p.Spec.Priority)
 		if err != nil {
 			return "", err
 		}
 	}
 
-	err = enc.Encode(p.Spec.Tolerations)
+	err = encode(&out, p.Spec.Tolerations)
 	if err != nil {
 		return "", err
 	}
 
 	if p.Spec.Affinity != nil && p.Spec.Affinity.NodeAffinity != nil {
-		err = enc.Encode(p.Spec.Affinity.NodeAffinity)
+		err = encode(&out, p.Spec.Affinity.NodeAffinity)
 		if err != nil {
 			return "", err
 		}
 	}
 
-	err = enc.Encode(p.Spec.NodeSelector)
+	err = encode(&out, p.Spec.NodeSelector)
 	if err != nil {
 		return "", err
 	}
 
 	if p.Spec.RuntimeClassName != nil {
-		err = enc.Encode(p.Spec.RuntimeClassName)
+		err = encode(&out, p.Spec.RuntimeClassName)
 		if err != nil {
 			return "", err
 		}
 	}
 
-	err = addContainersToHash(p.Spec.InitContainers, enc)
+	err = addContainersToHash(p.Spec.InitContainers, &out)
 	if err != nil {
 		return "", err
 	}
 
-	err = addContainersToHash(p.Spec.Containers, enc)
+	err = addContainersToHash(p.Spec.Containers, &out)
 	if err != nil {
 		return "", err
 	}
 
-	err = addVolumesToHash(p.Spec.Volumes, enc)
+	err = addVolumesToHash(p.Spec.Volumes, &out)
 	if err != nil {
 		return "", err
 	}
 
-	return hex.Dump(h.Sum(nil)), nil
+	return string(out), nil
 }
 
-func addContainersToHash(containers []v1.Container, enc *gob.Encoder) error {
+func addContainersToHash(containers []v1.Container, out *[]byte) error {
 	for _, container := range containers {
-		err := enc.Encode(container.Ports)
+		err := encode(out, container.Ports)
 		if err != nil {
 			return err
 		}
-		err = enc.Encode(container.Resources)
+		err = encode(out, container.Resources)
 		if err != nil {
 			return err
 		}
@@ -392,10 +398,10 @@ func addContainersToHash(containers []v1.Container, enc *gob.Encoder) error {
 	return nil
 }
 
-func addVolumesToHash(volumes []v1.Volume, enc *gob.Encoder) error {
+func addVolumesToHash(volumes []v1.Volume, out *[]byte) error {
 	for _, vol := range volumes {
 		if vol.ConfigMap == nil && vol.Secret == nil {
-			err := enc.Encode(vol)
+			err := encode(out, vol)
 			if err != nil {
 				return err
 			}
