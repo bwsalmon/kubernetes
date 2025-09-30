@@ -318,3 +318,86 @@ func TestPodHostCacheFuzz(t *testing.T) {
 		testFuzz(t, s)
 	}
 }
+
+func TestPodHostCacheEviction(t *testing.T) {
+	// Set up a cache where entries expire quickly
+	c := NewPodHostCache()
+
+	// Add entry 1 at T0
+	t0 := time.Now()
+	c.AddSignature("sig-expired", []string{"h1"}, t0)
+
+	c.AddSignature("sig-active", []string{"h2"}, t0.Add(expirationTime+2*time.Second))
+
+	validateCache(t, c)
+
+	// Fast-forward time (simulated): Expire "sig-expired" (t0 + 1s)
+	t_expired := t0.Add(expirationTime + 1*time.Second)
+
+	// Set the current time for the Evict call
+	// NOTE: The real implementation needs a mechanism to inject time.
+	// We'll call Evict with a time past the expiration, assuming the cache uses it.
+
+	// Force eviction of stale entries
+	c.signatures.Evict(t_expired)
+	c.hostnames.Evict(t_expired)
+
+	validateCache(t, c)
+
+	// Check results
+	if c.HostAvailableSig("sig-expired") {
+		t.Errorf("Expected 'sig-expired' to be evicted, but it is still available")
+	}
+
+	if !c.HostAvailableSig("sig-active") {
+		t.Errorf("Expected 'sig-active' to still be available, but it was evicted")
+	}
+}
+
+func TestPodHostCacheSizeLimitEviction(t *testing.T) {
+	// Set up cache using a small size limit
+	c := NewPodHostCache()
+	// NOTE: In a robust test environment, we would inject this limit into NewPodHostCache.
+	// For this unit test, we'll rely on direct manipulation/validation based on hardcoded maxCacheSize if we can't inject.
+
+	// We will simulate the size limit being 10, meaning we add 11 entries to ensure eviction.
+
+	// Add entries 0 through 9 (10 total) at T0
+	t0 := time.Now()
+	for i := 0; i < maxCacheSize; i++ {
+		sig := fmt.Sprintf("s%d", i)
+		host := fmt.Sprintf("h%d", i)
+		// Add each signature slightly later to ensure chronological order in the eviction list
+		c.AddSignature(sig, []string{host}, t0.Add(time.Duration(i)*time.Millisecond))
+	}
+
+	// At this point, the cache has 10 entries.
+	if len(c.signatures.entries) != maxCacheSize {
+		t.Fatalf("Expected cache size %d, got %d before overflow", maxCacheSize, len(c.signatures.entries))
+	}
+
+	// Add the 11th entry at T1 (this should trigger eviction of the oldest, s0)
+	sigOverflow := "s-overflow"
+	hostOverflow := "h-overflow"
+	c.AddSignature(sigOverflow, []string{hostOverflow}, t0.Add(1*time.Second))
+
+	// Trigger eviction based on size limit
+	c.signatures.Evict(t0)
+
+	validateCache(t, c)
+
+	// After eviction, the size should be exactly the limit
+	if len(c.signatures.entries) != maxCacheSize {
+		t.Fatalf("Expected cache size to be exactly %d after overflow, got %d", maxCacheSize, len(c.signatures.entries))
+	}
+
+	// Check if the oldest entry (s0) was evicted
+	if c.HostAvailableSig("s0") {
+		t.Errorf("Expected oldest entry 's0' to be evicted, but it is still available")
+	}
+
+	// Check if the newest entry (s-overflow) is present
+	if !c.HostAvailableSig(sigOverflow) {
+		t.Errorf("Expected newest entry 's-overflow' to be present, but it was evicted")
+	}
+}
