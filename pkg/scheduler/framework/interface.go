@@ -300,6 +300,19 @@ type PreFilterExtensions interface {
 	RemovePod(ctx context.Context, state fwk.CycleState, podToSchedule *v1.Pod, podInfoToRemove fwk.PodInfo, nodeInfo fwk.NodeInfo) *fwk.Status
 }
 
+// SignaturePlugin is an interface that should be implemented by plugins that either filter or score
+// pods to enable result caching and gang scheduling optimizations. If an enabled plugin does not implement
+// this interface we will turn off signatures for all pods. For alpha / beta we will leave this optional,
+// but in the future we may make it mandatory for all filtering and scoring plugins to implement the interface
+// (but of course plugins may choose to always return "unsignable").
+type SignaturePlugin interface {
+	Plugin
+	// This is called before PreFilter and either returns true and a signature string that can be
+	// used to label results for this pod, or false (and any string) to indicate that this pod cannot be
+	// compared to other pods. If any plugin returns false for a pod, we will return "unsignable" for the pod.
+	PodSignature(pod *v1.Pod) (bool, string)
+}
+
 // PreFilterPlugin is an interface that must be implemented by "PreFilter" plugins.
 // These plugins are called at the beginning of the scheduling cycle.
 type PreFilterPlugin interface {
@@ -488,6 +501,19 @@ type BindPlugin interface {
 	Bind(ctx context.Context, state fwk.CycleState, p *v1.Pod, nodeName string) *fwk.Status
 }
 
+// Results from a PodSignature call.
+type PodSignatureResult struct {
+	// Can we create a scheduling signature for this pod?
+	Signable bool
+
+	// The pod scheduling signature. Two pods with the same signature should
+	// get the same feasability and scores for the same set of nodes.
+	Signature string
+
+	// Non-nil if the signature process encountered an internal error.
+	Error error
+}
+
 // Framework manages the set of plugins in use by the scheduling framework.
 // Configured plugins are called at specified points in a scheduling context.
 type Framework interface {
@@ -501,6 +527,12 @@ type Framework interface {
 
 	// QueueSortFunc returns the function to sort pods in scheduling queue
 	QueueSortFunc() LessFunc
+
+	// Create a scheduling signature for a given pod, if possible. Two pods with the same signature
+	// should get the same feasibility and scores for any given set of nodes. If some plugins
+	// are unable to create a signature, the pod may be "unsignable" which disables results caching
+	// and gang scheduling optimizations.
+	PodSignature(ctx context.Context, pod *v1.Pod) *PodSignatureResult
 
 	// RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns
 	// *fwk.Status and its code is set to non-success if any of the plugins returns

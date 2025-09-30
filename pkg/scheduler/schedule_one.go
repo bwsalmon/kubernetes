@@ -443,7 +443,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, ErrNoNodesAvailable
 	}
 
-	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+	feasibleNodes, diagnosis, podSignature, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
 	if err != nil {
 		return result, err
 	}
@@ -474,7 +474,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 	host, sortedHosts, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
 	trace.Step("Prioritizing done")
 
-	sched.podHostCache.AddPod(pod, sortedHosts[1:])
+	sched.podHostCache.AddSignature(podSignature, sortedHosts[1:], time.Now())
 
 	return ScheduleResult{
 		SuggestedHost:  host,
@@ -485,7 +485,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 
 // Filters the nodes to find the ones that fit the pod based on the framework
 // filter plugins and filter extenders.
-func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, state fwk.CycleState, pod *v1.Pod) ([]fwk.NodeInfo, framework.Diagnosis, error) {
+func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, state fwk.CycleState, pod *v1.Pod) ([]fwk.NodeInfo, framework.Diagnosis, *framework.PodSignatureResult, error) {
 	logger := klog.FromContext(ctx)
 	diagnosis := framework.Diagnosis{
 		NodeToStatus: framework.NewDefaultNodeToStatus(),
@@ -493,14 +493,20 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 
 	allNodes, err := sched.nodeInfoSnapshot.NodeInfos().List()
 	if err != nil {
-		return nil, diagnosis, err
+		return nil, diagnosis, nil, err
 	}
+
+	podSignature := schedFramework.PodSignature(ctx, pod)
+	if podSignature.Error != nil {
+		return nil, diagnosis, podSignature, podSignature.Error
+	}
+
 	// Run "prefilter" plugins.
 	preRes, s, unscheduledPlugins := schedFramework.RunPreFilterPlugins(ctx, state, pod)
 	diagnosis.UnschedulablePlugins = unscheduledPlugins
 	if !s.IsSuccess() {
 		if !s.IsRejected() {
-			return nil, diagnosis, s.AsError()
+			return nil, diagnosis, podSignature, s.AsError()
 		}
 		// All nodes in NodeToStatus will have the same status so that they can be handled in the preemption.
 		diagnosis.NodeToStatus.SetAbsentNodesStatus(s)
@@ -510,24 +516,21 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		diagnosis.PreFilterMsg = msg
 		logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
 		diagnosis.AddPluginStatus(s)
-		return nil, diagnosis, nil
+		return nil, diagnosis, podSignature, nil
 	}
 
 	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
 	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
-	cachedHostAvailable, err := sched.podHostCache.HostAvailable(pod)
-	if err != nil {
-		return nil, diagnosis, err
-	}
+	cachedHostAvailable := sched.podHostCache.HostAvailable(podSignature)
 
 	if len(pod.Status.NominatedNodeName) > 0 || cachedHostAvailable {
-		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, schedFramework, state, diagnosis)
+		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, schedFramework, state, diagnosis, podSignature)
 		if err != nil {
 			utilruntime.HandleErrorWithContext(ctx, err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
 		}
 		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
 		if len(feasibleNodes) != 0 {
-			return feasibleNodes, diagnosis, nil
+			return feasibleNodes, diagnosis, podSignature, nil
 		}
 	}
 
@@ -549,12 +552,12 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 	processedNodes := len(feasibleNodes) + diagnosis.NodeToStatus.Len()
 	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(allNodes)
 	if err != nil {
-		return nil, diagnosis, err
+		return nil, diagnosis, podSignature, err
 	}
 
 	feasibleNodesAfterExtender, err := findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatus)
 	if err != nil {
-		return nil, diagnosis, err
+		return nil, diagnosis, podSignature, err
 	}
 	if len(feasibleNodesAfterExtender) != len(feasibleNodes) {
 		// Extenders filtered out some nodes.
@@ -571,16 +574,16 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework 
 		diagnosis.UnschedulablePlugins.Insert(framework.ExtenderName)
 	}
 
-	return feasibleNodesAfterExtender, diagnosis, nil
+	return feasibleNodesAfterExtender, diagnosis, podSignature, nil
 }
 
-func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, schedFramework framework.Framework, state fwk.CycleState, diagnosis framework.Diagnosis) ([]fwk.NodeInfo, error) {
+func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, schedFramework framework.Framework, state fwk.CycleState, diagnosis framework.Diagnosis, podSignature *framework.PodSignatureResult) ([]fwk.NodeInfo, error) {
 	var nnn string
 	var err error
 	if len(pod.Status.NominatedNodeName) > 0 {
 		nnn = pod.Status.NominatedNodeName
 	} else {
-		nnn, err = sched.podHostCache.SuggestedHost(pod)
+		nnn, err = sched.podHostCache.SuggestedHost(podSignature)
 		if err != nil {
 			return nil, err
 		}

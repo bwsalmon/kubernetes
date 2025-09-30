@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +38,7 @@ import (
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
-	"k8s.io/kubernetes/pkg/scheduler/backend/api_dispatcher"
+	apidispatcher "k8s.io/kubernetes/pkg/scheduler/backend/api_dispatcher"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
@@ -715,6 +716,71 @@ func (f *frameworkImpl) QueueSortFunc() framework.LessFunc {
 
 	// Only one QueueSort plugin can be enabled.
 	return f.queueSortPlugins[0].Less
+}
+
+// XXX we should just do this once.
+
+func (f *frameworkImpl) cacheablePlugins() (bool, []framework.SignaturePlugin) {
+	plugins := []framework.SignaturePlugin{}
+
+	for _, pl := range f.preFilterPlugins {
+		cacheablePl, implementsInterface := pl.(framework.SignaturePlugin)
+		if !implementsInterface {
+			return false, plugins
+		} else {
+			plugins = append(plugins, cacheablePl)
+		}
+	}
+
+	for _, pl := range f.filterPlugins {
+		cacheablePl, implementsInterface := pl.(framework.SignaturePlugin)
+		if !implementsInterface {
+			return false, plugins
+		} else {
+			plugins = append(plugins, cacheablePl)
+		}
+	}
+
+	for _, pl := range f.scorePlugins {
+		cacheablePl, implementsInterface := pl.(framework.SignaturePlugin)
+		if !implementsInterface {
+			return false, plugins
+		} else {
+			plugins = append(plugins, cacheablePl)
+		}
+	}
+
+	return true, plugins
+}
+
+// PodSignature returns a signature for a given pod. Any two pods with the same signature should get
+// the same feasibility and scoring for the same set of hosts. If one or more plugins is unable to
+// construct a signature for the pod, the result will have "Signable" set to false, which means
+// there is no way to compare this pod against others, and will turn off a number of optimizations
+// for this pod.
+func (f *frameworkImpl) PodSignature(ctx context.Context, pod *v1.Pod) *framework.PodSignatureResult {
+	allPluginsCanSign, plugins := f.cacheablePlugins()
+	if !allPluginsCanSign {
+		return &framework.PodSignatureResult{Signable: false}
+	}
+
+	signatures := make([]string, len(plugins)*2)
+	for i, pl := range plugins {
+		cacheable, signature := pl.PodSignature(pod)
+		if cacheable {
+			signatures[i*2] = pl.Name()
+			signatures[i*2+1] = signature
+		} else {
+			return &framework.PodSignatureResult{Signable: false}
+		}
+	}
+
+	marshalled, err := json.Marshal(signatures)
+	if err != nil {
+		return &framework.PodSignatureResult{Error: err, Signable: false}
+	}
+
+	return &framework.PodSignatureResult{Signable: true, Signature: string(marshalled)}
 }
 
 // RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns

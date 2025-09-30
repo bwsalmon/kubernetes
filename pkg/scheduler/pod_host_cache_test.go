@@ -7,9 +7,20 @@ import (
 	"time"
 
 	"github.com/mohae/deepcopy"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
+
+func sigwrap(signature string) *framework.PodSignatureResult {
+	return &framework.PodSignatureResult{Signable: true, Signature: signature}
+}
+
+func hostwrap(hostnames ...string) []framework.NodePluginScores {
+	ret := []framework.NodePluginScores{}
+	for _, h := range hostnames {
+		ret = append(ret, framework.NodePluginScores{Name: h})
+	}
+	return ret
+}
 
 // Cosistency check the cache. Ensure that entries show up in the right
 // signature and hostname lists exactly once. Ensure we don't have empty lists.
@@ -18,7 +29,7 @@ import (
 func validateCache(t *testing.T, c *PodHostCache) {
 	signatureLists := map[*listCacheList]bool{}
 	for sig, l := range c.signatures.entries {
-		if !c.HostAvailableSig(sig) {
+		if !c.HostAvailable(sigwrap(sig)) {
 			t.Fatal("Doesn't show host available for signature in cache")
 		}
 		signatureLists[l] = true
@@ -120,10 +131,10 @@ func validateCache(t *testing.T, c *PodHostCache) {
 
 func TestPodHostCacheBasic(t *testing.T) {
 	c := NewPodHostCache()
-	c.AddSignature("sig", []string{"h1", "h2"}, time.Now())
+	c.AddSignature(sigwrap("sig"), hostwrap("h1", "h2"), time.Now())
 	validateCache(t, c)
 
-	host, err := c.SuggestedHostSig("sig")
+	host, err := c.SuggestedHost(sigwrap("sig"))
 	if err != nil {
 		t.Fatal("Error using", err)
 	}
@@ -133,7 +144,7 @@ func TestPodHostCacheBasic(t *testing.T) {
 	c.InvalidateHost(host)
 	validateCache(t, c)
 
-	host, err = c.SuggestedHostSig("sig")
+	host, err = c.SuggestedHost(sigwrap("sig"))
 	if err != nil {
 		t.Fatal("Error using", err)
 	}
@@ -146,16 +157,16 @@ func TestPodHostCacheBasic(t *testing.T) {
 
 func TestPodHostCacheDouble(t *testing.T) {
 	c := NewPodHostCache()
-	c.AddSignature("sig", []string{"h1", "h2"}, time.Now())
+	c.AddSignature(sigwrap("sig"), hostwrap("h1", "h2"), time.Now())
 	validateCache(t, c)
 
-	c.AddSignature("sig2", []string{"h1", "h3"}, time.Now())
+	c.AddSignature(sigwrap("sig2"), hostwrap("h1", "h3"), time.Now())
 	validateCache(t, c)
 
-	if !c.HostAvailableSig("sig") {
+	if !c.HostAvailable(sigwrap("sig")) {
 		t.Fatal("Expected host")
 	}
-	host, err := c.SuggestedHostSig("sig")
+	host, err := c.SuggestedHost(sigwrap("sig"))
 	if err != nil {
 		t.Fatal("Error using", err)
 	}
@@ -165,10 +176,10 @@ func TestPodHostCacheDouble(t *testing.T) {
 	c.InvalidateHost(host)
 	validateCache(t, c)
 
-	if !c.HostAvailableSig("sig2") {
+	if !c.HostAvailable(sigwrap("sig2")) {
 		t.Fatal("Expected host")
 	}
-	host, err = c.SuggestedHostSig("sig2")
+	host, err = c.SuggestedHost(sigwrap("sig2"))
 	if err != nil {
 		t.Fatal("Error using", err)
 	}
@@ -178,10 +189,10 @@ func TestPodHostCacheDouble(t *testing.T) {
 	c.InvalidateHost(host)
 	validateCache(t, c)
 
-	if !c.HostAvailableSig("sig") {
+	if !c.HostAvailable(sigwrap("sig")) {
 		t.Fatal("Expected host")
 	}
-	host, err = c.SuggestedHostSig("sig")
+	host, err = c.SuggestedHost(sigwrap("sig"))
 	if err != nil {
 		t.Fatal("Error using", err)
 	}
@@ -194,16 +205,16 @@ func TestPodHostCacheDouble(t *testing.T) {
 
 func TestPodHostCacheRemoveEmpty(t *testing.T) {
 	c := NewPodHostCache()
-	c.AddSignature("sig", []string{"h1"}, time.Now())
+	c.AddSignature(sigwrap("sig"), hostwrap("h1"), time.Now())
 	validateCache(t, c)
 
-	c.AddSignature("sig2", []string{"h1"}, time.Now())
+	c.AddSignature(sigwrap("sig2"), hostwrap("h1"), time.Now())
 	validateCache(t, c)
 
-	if !c.HostAvailableSig("sig") {
+	if !c.HostAvailable(sigwrap("sig")) {
 		t.Fatal("Expected host")
 	}
-	host, err := c.SuggestedHostSig("sig")
+	host, err := c.SuggestedHost(sigwrap("sig"))
 	if err != nil {
 		t.Fatal("Error using", err)
 	}
@@ -213,18 +224,18 @@ func TestPodHostCacheRemoveEmpty(t *testing.T) {
 	c.InvalidateHost(host)
 	validateCache(t, c)
 
-	if c.HostAvailableSig("sig") {
+	if c.HostAvailable(sigwrap("sig")) {
 		t.Fatal("Expected no hosts")
 	}
-	_, err = c.SuggestedHostSig("sig")
+	_, err = c.SuggestedHost(sigwrap("sig"))
 	if err == nil {
 		t.Fatal("Expected error in getting empty")
 	}
 
-	if c.HostAvailableSig("sig2") {
+	if c.HostAvailable(sigwrap("sig2")) {
 		t.Fatal("Expected no hosts")
 	}
-	_, err = c.SuggestedHostSig("sig2")
+	_, err = c.SuggestedHost(sigwrap("sig2"))
 	if err == nil {
 		t.Fatal("Expected error iun getting empty")
 	}
@@ -265,15 +276,15 @@ func testFuzz(t *testing.T, s *SimplePodHostCache) {
 	tm := time.Now()
 
 	for i := range s.values {
-		c.AddSignature(fmt.Sprintf("s%d", i), s.Get(i), tm)
+		c.AddSignature(sigwrap(fmt.Sprintf("s%d", i)), hostwrap(s.Get(i)...), tm)
 	}
 
 	hostsRemaining := deepcopy.Copy(s.hosts).(map[string]bool)
 	for {
 		sig := rand.Int() % len(s.values)
 		sigName := fmt.Sprintf("s%d", sig)
-		if c.HostAvailableSig(sigName) {
-			h, err := c.SuggestedHostSig(sigName)
+		if c.HostAvailable(sigwrap(sigName)) {
+			h, err := c.SuggestedHost(sigwrap(sigName))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -327,9 +338,9 @@ func TestPodHostCacheEviction(t *testing.T) {
 
 	// Add entry 1 at T0
 	t0 := time.Now()
-	c.AddSignature("sig-expired", []string{"h1"}, t0)
+	c.AddSignature(sigwrap("sig-expired"), hostwrap("h1"), t0)
 
-	c.AddSignature("sig-active", []string{"h2"}, t0.Add(expirationTime+2*time.Second))
+	c.AddSignature(sigwrap("sig-active"), hostwrap("h2"), t0.Add(expirationTime+2*time.Second))
 
 	validateCache(t, c)
 
@@ -347,11 +358,11 @@ func TestPodHostCacheEviction(t *testing.T) {
 	validateCache(t, c)
 
 	// Check results
-	if c.HostAvailableSig("sig-expired") {
+	if c.HostAvailable(sigwrap("sig-expired")) {
 		t.Errorf("Expected 'sig-expired' to be evicted, but it is still available")
 	}
 
-	if !c.HostAvailableSig("sig-active") {
+	if !c.HostAvailable(sigwrap("sig-active")) {
 		t.Errorf("Expected 'sig-active' to still be available, but it was evicted")
 	}
 }
@@ -370,7 +381,7 @@ func TestPodHostCacheSizeLimitEviction(t *testing.T) {
 		sig := fmt.Sprintf("s%d", i)
 		host := fmt.Sprintf("h%d", i)
 		// Add each signature slightly later to ensure chronological order in the eviction list
-		c.AddSignature(sig, []string{host}, t0.Add(time.Duration(i)*time.Millisecond))
+		c.AddSignature(sigwrap(sig), hostwrap(host), t0.Add(time.Duration(i)*time.Millisecond))
 	}
 
 	// At this point, the cache has maxCacheSize entries.
@@ -381,7 +392,7 @@ func TestPodHostCacheSizeLimitEviction(t *testing.T) {
 	// Add the 11th entry at T1 (this should trigger eviction of the oldest, s0)
 	sigOverflow := "s-overflow"
 	hostOverflow := "h-overflow"
-	c.AddSignature(sigOverflow, []string{hostOverflow}, t0.Add(1*time.Second))
+	c.AddSignature(sigwrap(sigOverflow), hostwrap(hostOverflow), t0.Add(1*time.Second))
 
 	// Trigger eviction based on size limit
 	c.signatures.Evict(t0)
@@ -394,148 +405,12 @@ func TestPodHostCacheSizeLimitEviction(t *testing.T) {
 	}
 
 	// Check if the oldest entry (s0) was evicted
-	if c.HostAvailableSig("s0") {
+	if c.HostAvailable(sigwrap("s0")) {
 		t.Errorf("Expected oldest entry 's0' to be evicted, but it is still available")
 	}
 
 	// Check if the newest entry (s-overflow) is present
-	if !c.HostAvailableSig(sigOverflow) {
+	if !c.HostAvailable(sigwrap(sigOverflow)) {
 		t.Errorf("Expected newest entry 's-overflow' to be present, but it was evicted")
-	}
-}
-
-// makeBasePod creates a minimal cacheable Pod with a HostPort.
-func makeBasePod() *v1.Pod {
-	return &v1.Pod{
-		Spec: v1.PodSpec{
-			SchedulerName: "default-scheduler",
-			Tolerations: []v1.Toleration{
-				{Key: "t1", Operator: v1.TolerationOpExists, Effect: v1.TaintEffectNoSchedule},
-			},
-			Containers: []v1.Container{
-				{
-					Name: "main-container",
-					Ports: []v1.ContainerPort{
-						{HostPort: 8080, ContainerPort: 80},
-					},
-					Resources: v1.ResourceRequirements{
-						Requests: v1.ResourceList{
-							v1.ResourceCPU:    resource.MustParse("100m"),
-							v1.ResourceMemory: resource.MustParse("100Mi"),
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func TestSignatureStability(t *testing.T) {
-	basePod := makeBasePod()
-
-	// 1. Compute Base Signature
-	sig1, err := podSchedulingSignature(basePod)
-	if err != nil {
-		t.Fatalf("Failed to compute base signature: %v", err)
-	}
-
-	testCases := map[string]func(*v1.Pod){
-		"Change_Metadata": func(p *v1.Pod) {
-			p.Name = "pod-v2"
-			p.Labels = map[string]string{"app": "new"}
-		},
-		"Change_EnvVar": func(p *v1.Pod) {
-			p.Spec.Containers[0].Env = []v1.EnvVar{{Name: "VERSION", Value: "2.0"}}
-		},
-		"Change_Command": func(p *v1.Pod) {
-			p.Spec.Containers[0].Command = []string{"/bin/new-app"}
-		},
-		"Change_ConfigMapVolume": func(p *v1.Pod) {
-			// ConfigMap and Secret volumes are explicitly ignored in addVolumesToHash
-			p.Spec.Volumes = append(p.Spec.Volumes, v1.Volume{
-				Name: "config-vol",
-				VolumeSource: v1.VolumeSource{
-					ConfigMap: &v1.ConfigMapVolumeSource{LocalObjectReference: v1.LocalObjectReference{Name: "new-config"}},
-				},
-			})
-		},
-		"Change_Image": func(p *v1.Pod) {
-			p.Spec.Containers[0].Image = "new-image:v2"
-		},
-	}
-
-	for name, mutate := range testCases {
-		t.Run(name, func(t *testing.T) {
-			mutatedPod := makeBasePod()
-
-			mutate(mutatedPod)
-
-			sig2, err := podSchedulingSignature(mutatedPod)
-			if err != nil {
-				t.Fatalf("Failed to compute signature for mutated pod: %v", err)
-			}
-
-			if sig1 != sig2 {
-				t.Errorf("Signature changed when it should have remained stable (field not used in hash). \nOld Sig: %s \nNew Sig: %s", sig1, sig2)
-			}
-		})
-	}
-}
-
-func TestSignatureSensitivity(t *testing.T) {
-	basePod := makeBasePod()
-
-	// 1. Compute Base Signature
-	sig1, err := podSchedulingSignature(basePod)
-	if err != nil {
-		t.Fatalf("Failed to compute base signature: %v", err)
-	}
-
-	testCases := map[string]func(*v1.Pod){
-		"Change_Resources": func(p *v1.Pod) {
-			p.Spec.Containers[0].Resources.Requests[v1.ResourceCPU] = resource.MustParse("300m")
-		},
-		"Change_Tolerations": func(p *v1.Pod) {
-			p.Spec.Tolerations = append(p.Spec.Tolerations, v1.Toleration{Key: "t2", Operator: v1.TolerationOpExists})
-		},
-		"Change_HostPort": func(p *v1.Pod) {
-			p.Spec.Containers[0].Ports[0].HostPort = 9090
-		},
-		"Add_NodeSelector": func(p *v1.Pod) {
-			p.Spec.NodeSelector = map[string]string{"disk": "ssd"}
-		},
-		"Add_NodeAffinity": func(p *v1.Pod) {
-			p.Spec.Affinity = &v1.Affinity{
-				NodeAffinity: &v1.NodeAffinity{
-					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-						NodeSelectorTerms: []v1.NodeSelectorTerm{
-							{
-								MatchExpressions: []v1.NodeSelectorRequirement{{Key: "zone", Operator: v1.NodeSelectorOpIn, Values: []string{"us-east-1"}}},
-							},
-						},
-					},
-				},
-			}
-		},
-		"Change_Priority": func(p *v1.Pod) {
-			newPriority := int32(100)
-			p.Spec.Priority = &newPriority
-		},
-	}
-
-	for name, mutate := range testCases {
-		t.Run(name, func(t *testing.T) {
-			mutatedPod := makeBasePod()
-			mutate(mutatedPod)
-
-			sig2, err := podSchedulingSignature(mutatedPod)
-			if err != nil {
-				t.Fatalf("Failed to compute signature for mutated pod: %v", err)
-			}
-
-			if sig1 == sig2 {
-				t.Errorf("Signature did NOT change when it should have (field used in hash: %s). \nOld Sig: %s \nNew Sig: %s", name, sig1, sig2)
-			}
-		})
 	}
 }

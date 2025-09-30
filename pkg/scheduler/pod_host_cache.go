@@ -17,14 +17,12 @@ package scheduler
  */
 
 import (
-	"encoding/json"
 	"fmt"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
-
 	"container/list"
+
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 const (
@@ -58,49 +56,25 @@ func NewPodHostCache() *PodHostCache {
 	}
 }
 
-func (c *PodHostCache) AddPod(pod *v1.Pod, sortedHosts []framework.NodePluginScores) error {
-	if !podCachingCandidate(pod) || !cacheEnabled {
-		return nil
+func (c *PodHostCache) AddSignature(signature *framework.PodSignatureResult, sortedHosts []framework.NodePluginScores, t time.Time) {
+	if !cacheEnabled || !signature.Signable {
+		return
 	}
 
-	sig, err := podSchedulingSignature(pod)
-	if err != nil {
-		return err
-	}
+	c.signatures.RemoveListIfExists(signature.Signature)
 
-	c.signatures.RemoveListIfExists(sig)
 	for _, host := range sortedHosts {
-		e := c.newEntry(sig, host.Name)
-		c.addEntry(e, time.Now())
-	}
-
-	return nil
-}
-
-func (c *PodHostCache) AddSignature(signature string, sortedHostnames []string, t time.Time) {
-	c.signatures.RemoveListIfExists(signature)
-
-	for _, hostname := range sortedHostnames {
-		e := c.newEntry(signature, hostname)
+		e := c.newEntry(signature.Signature, host.Name)
 		c.addEntry(e, t)
 	}
 }
 
-func (c *PodHostCache) SuggestedHost(pod *v1.Pod) (string, error) {
-	if !podCachingCandidate(pod) || !cacheEnabled {
-		return "", fmt.Errorf("pod not candidate for caching or cache disabled")
+func (c *PodHostCache) SuggestedHost(signature *framework.PodSignatureResult) (string, error) {
+	if !cacheEnabled || !signature.Signable {
+		return "", fmt.Errorf("pod not signable")
 	}
 
-	sig, err := podSchedulingSignature(pod)
-	if err != nil {
-		return "", err
-	}
-
-	return c.SuggestedHostSig(sig)
-}
-
-func (c *PodHostCache) SuggestedHostSig(signature string) (string, error) {
-	l, found := c.signatures.entries[signature]
+	l, found := c.signatures.entries[signature.Signature]
 	if !found {
 		return "", fmt.Errorf("no signature list to use")
 	}
@@ -113,19 +87,11 @@ func (c *PodHostCache) SuggestedHostSig(signature string) (string, error) {
 	return ent.Value.(*listCacheItem).Value.(*entry).hostname, nil
 }
 
-func (c *PodHostCache) HostAvailable(pod *v1.Pod) (bool, error) {
-	if podCachingCandidate(pod) && cacheEnabled {
-		sig, err := podSchedulingSignature(pod)
-		if err != nil {
-			return false, err
-		}
-		return c.HostAvailableSig(sig), nil
+func (c *PodHostCache) HostAvailable(signature *framework.PodSignatureResult) bool {
+	if !cacheEnabled || !signature.Signable {
+		return false
 	}
-	return false, nil
-}
-
-func (c *PodHostCache) HostAvailableSig(signature string) bool {
-	_, found := c.signatures.entries[signature]
+	_, found := c.signatures.entries[signature.Signature]
 	return found
 }
 
@@ -279,144 +245,4 @@ func (m *listCache) Evict(n time.Time) {
 			break
 		}
 	}
-}
-
-// Functions to determine if a pod is cacheable and generating a signature for those that are cacheable.
-
-// Check if a pod is a candidate for caching.
-
-func podCachingCandidate(p *v1.Pod) bool {
-	return onePodPerNode(p) &&
-		// Pods with topology spread constraints are not cacheable.
-		// XXX how do we tell if the default constraints are being applied?
-		// 		it looks like we literally have to reach into the plugin and read out the configuration?
-		len(p.Spec.TopologySpreadConstraints) == 0 &&
-
-		// For now ignore pods with resource claims
-		// XXX do we also need to check the claims in the container resources?
-		p.Spec.ResourceClaims == nil &&
-
-		// Pods with pod affinity or anti-affinity are not cacheable.
-		(p.Spec.Affinity == nil || (p.Spec.Affinity.PodAffinity == nil && p.Spec.Affinity.PodAntiAffinity == nil))
-}
-
-// Determine if a pod is a single pod per node. For now only consider pods with a fixed host port reservation.
-// XXX do we need to worry about host IP here? It looks like maybe you could bind the same pod port to different
-// IPs on the same host and not get one pod per node?
-
-func onePodPerNode(p *v1.Pod) bool {
-	for _, container := range p.Spec.Containers {
-		for _, port := range container.Ports {
-			if port.HostPort > 0 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// Compute a signature for a pod from its scheduling settings.
-
-func encode(out *[]byte, obj any) error {
-	jsonStr, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-	*out = append(*out, jsonStr...)
-	return nil
-}
-
-func podSchedulingSignature(p *v1.Pod) (string, error) {
-	out := []byte{}
-
-	err := encode(&out, p.Namespace)
-	if err != nil {
-		return "", err
-	}
-
-	err = encode(&out, p.Spec.SchedulerName)
-	if err != nil {
-		return "", err
-	}
-
-	if p.Spec.Priority != nil {
-		err = encode(&out, *p.Spec.Priority)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	err = encode(&out, p.Spec.Tolerations)
-	if err != nil {
-		return "", err
-	}
-
-	if p.Spec.Affinity != nil && p.Spec.Affinity.NodeAffinity != nil {
-		err = encode(&out, p.Spec.Affinity.NodeAffinity)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	err = encode(&out, p.Spec.NodeSelector)
-	if err != nil {
-		return "", err
-	}
-
-	if p.Spec.RuntimeClassName != nil {
-		err = encode(&out, p.Spec.RuntimeClassName)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	err = addContainersToHash(p.Spec.InitContainers, &out)
-	if err != nil {
-		return "", err
-	}
-
-	err = addContainersToHash(p.Spec.Containers, &out)
-	if err != nil {
-		return "", err
-	}
-
-	// XXX what about EphemeralContainers?
-	// XXX ServiceAccountName?
-	// XXX HostNetwork?
-	// XXX probably need SecurityContext
-	// XXX DNSPolicy?
-
-	err = addVolumesToHash(p.Spec.Volumes, &out)
-	if err != nil {
-		return "", err
-	}
-
-	return string(out), nil
-}
-
-func addContainersToHash(containers []v1.Container, out *[]byte) error {
-	for _, container := range containers {
-		err := encode(out, container.Ports)
-		if err != nil {
-			return err
-		}
-		err = encode(out, container.Resources)
-		if err != nil {
-			return err
-		}
-		// XXX what about volume devices & volume mounts?
-	}
-	return nil
-}
-
-func addVolumesToHash(volumes []v1.Volume, out *[]byte) error {
-	for _, vol := range volumes {
-		if vol.ConfigMap == nil && vol.Secret == nil {
-			err := encode(out, vol)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
