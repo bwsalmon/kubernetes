@@ -12,6 +12,8 @@ package scheduler
  * As we are caching results, it is possible that things have changed on nodes underneath us (pods dying). However, we already
  * experience this race because we freeze our cache before each scheduler iteration. We use a very short expiration time to
  * ensure we do not expose ourselves to a much larger window.
+ *
+ * Note that this cache is not thread safe; it is reliant on the scheduler running in a single go routine.
  */
 
 import (

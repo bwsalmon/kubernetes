@@ -371,7 +371,7 @@ func TestPodHostCacheSizeLimitEviction(t *testing.T) {
 		c.AddSignature(sig, []string{host}, t0.Add(time.Duration(i)*time.Millisecond))
 	}
 
-	// At this point, the cache has 10 entries.
+	// At this point, the cache has maxCacheSize entries.
 	if len(c.signatures.entries) != maxCacheSize {
 		t.Fatalf("Expected cache size %d, got %d before overflow", maxCacheSize, len(c.signatures.entries))
 	}
