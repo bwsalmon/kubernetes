@@ -310,7 +310,7 @@ type SignaturePlugin interface {
 	// This is called before PreFilter and either returns true and a signature string that can be
 	// used to label results for this pod, or false (and any string) to indicate that this pod cannot be
 	// compared to other pods. If any plugin returns false for a pod, we will return "unsignable" for the pod.
-	PodSignature(pod *v1.Pod) (bool, string)
+	PodSignature(pod *v1.Pod) *PodSignatureResult
 }
 
 // PreFilterPlugin is an interface that must be implemented by "PreFilter" plugins.

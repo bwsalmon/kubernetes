@@ -766,10 +766,13 @@ func (f *frameworkImpl) PodSignature(ctx context.Context, pod *v1.Pod) *framewor
 
 	signatures := make([]string, len(plugins)*2)
 	for i, pl := range plugins {
-		cacheable, signature := pl.PodSignature(pod)
-		if cacheable {
+		sigRes := pl.PodSignature(pod)
+		if sigRes.Error != nil {
+			return sigRes
+		}
+		if sigRes.Signable {
 			signatures[i*2] = pl.Name()
-			signatures[i*2+1] = signature
+			signatures[i*2+1] = sigRes.Signature
 		} else {
 			return &framework.PodSignatureResult{Signable: false}
 		}
