@@ -310,7 +310,7 @@ type SignaturePlugin interface {
 	// This is called before PreFilter. The return value can be:
 	// - A string that represents the signature of this pod from this plugin's perspective. All pods with the same signature should see the same feasibility and
 	//   scoring for the same set of nodes in the same state, from the perspective of this plugin.
-	// - The assertion that this pod cannot be signed by this plugin; i.e. the scoring of this node is dependent on more than the node and the pod. This
+	// - The assertion that this pod cannot be signed by this plugin; i.e. the scoring of this pod is dependent on more than the node and the pod. This
 	//   will disable caching and gang scheduling optimizations for the given pod, hurting performance.
 	// - An internal error condition passed back through the scheduling code.
 	PodSignature(pod *v1.Pod) *PodSignatureResult

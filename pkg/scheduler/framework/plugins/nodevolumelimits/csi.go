@@ -35,6 +35,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -619,4 +620,18 @@ func (pl *CSILimits) getNodeVolumeAttachmentInfo(logger klog.Logger, nodeName st
 
 func getVolumeUniqueName(driverName, volumeHandle string) string {
 	return fmt.Sprintf("%s/%s", driverName, volumeHandle)
+}
+
+// Feasibility and scoring are based on the pod's volume definitions. Note that
+// we exclude ConfigMap and Secret volumes because they are synthetic.
+// Note also that we include this same info from several plugins, we could
+// potentially optimize this in the future, but including from each is safe.
+func (pl *CSILimits) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	volumes := []v1.Volume{}
+	for _, volume := range pod.Spec.Volumes {
+		if volume.VolumeSource.ConfigMap == nil && volume.VolumeSource.Secret == nil {
+			volumes = append(volumes, volume)
+		}
+	}
+	return helper.PodSignatureFromObj(volumes)
 }
