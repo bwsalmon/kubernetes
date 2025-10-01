@@ -155,6 +155,8 @@ func (f *Fit) Name() string {
 	return Name
 }
 
+// Fit is based on the node resources for the pod. We reuse the function used
+// internally to compute the final resource list.
 func (f *Fit) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	return helper.PodSignatureFromObj(computePodResourceRequest(pod, ResourceRequestsOptions{EnablePodLevelResources: f.enablePodLevelResources}))
 }

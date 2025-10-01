@@ -59,6 +59,9 @@ func (pl *InterPodAffinity) Name() string {
 	return Name
 }
 
+// Inter pod affinity make feasibility and scoring dependent on the placement of other
+// pods in addition the current pod and node, so we cannot sign pods with these
+// constraints.
 func (pl *InterPodAffinity) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	if pod.Spec.Affinity != nil && (pod.Spec.Affinity.PodAffinity != nil || pod.Spec.Affinity.PodAntiAffinity != nil) {
 		return helper.PodUnsignable()

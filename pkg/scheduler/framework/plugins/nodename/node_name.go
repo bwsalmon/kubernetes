@@ -69,6 +69,7 @@ func (pl *NodeName) Name() string {
 	return Name
 }
 
+// NodeName scoring and feasibility are dependent on the NodeName field.
 func (pl *NodeName) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	return helper.PodSignatureFromObj(pod.Spec.NodeName)
 }

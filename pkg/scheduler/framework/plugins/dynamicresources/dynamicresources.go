@@ -238,6 +238,8 @@ func (pl *DynamicResources) Name() string {
 	return Name
 }
 
+// Because it isn't simple to determine if DRA claims are single host or more complex,
+// we exclude any pod with a DRA claim from signatures. We should improve this.
 func (pl *DynamicResources) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	if len(pod.Spec.ResourceClaims) > 0 {
 		return helper.PodUnsignable()

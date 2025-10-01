@@ -51,6 +51,7 @@ func (pl *ImageLocality) Name() string {
 	return Name
 }
 
+// Image locality filtering and scoring depends on images for the pod's containers.
 func (pl *ImageLocality) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	imageNames := []string{}
 

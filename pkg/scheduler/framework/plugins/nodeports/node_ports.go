@@ -65,6 +65,7 @@ func (pl *NodePorts) Name() string {
 	return Name
 }
 
+// NodePort feasibility and scheduling is based on the host ports for the containers.
 func (pl *NodePorts) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	return helper.PodSignatureFromObj(util.GetHostPorts(pod))
 }

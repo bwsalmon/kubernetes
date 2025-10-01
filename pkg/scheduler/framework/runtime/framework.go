@@ -754,8 +754,8 @@ func (f *frameworkImpl) cacheablePlugins() (bool, []framework.SignaturePlugin) {
 }
 
 // PodSignature returns a signature for a given pod. Any two pods with the same signature should get
-// the same feasibility and scoring for the same set of hosts. If one or more plugins is unable to
-// construct a signature for the pod, the result will have "Signable" set to false, which means
+// the same feasibility and scoring for the same set of nodes in the same state. If one or more plugins
+// is unable to construct a signature for the pod, the result will have "Signable" set to false, which means
 // there is no way to compare this pod against others, and will turn off a number of optimizations
 // for this pod.
 func (f *frameworkImpl) PodSignature(ctx context.Context, pod *v1.Pod) *framework.PodSignatureResult {

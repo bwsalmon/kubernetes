@@ -97,6 +97,8 @@ func (ba *BalancedAllocation) Name() string {
 	return BalancedAllocationName
 }
 
+// Feasibilty and scoring are based on a set of resources considered by BA. We
+// reuse the internal function used to determine the relevant resources.
 func (ba *BalancedAllocation) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	return helper.PodSignatureFromObj(ba.calculatePodResourceRequestList(pod, ba.resources))
 }

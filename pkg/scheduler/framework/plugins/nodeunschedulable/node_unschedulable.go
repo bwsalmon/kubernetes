@@ -26,6 +26,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -127,6 +128,11 @@ func (pl *NodeUnschedulable) isSchedulableAfterNodeChange(logger klog.Logger, po
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *NodeUnschedulable) Name() string {
 	return Name
+}
+
+// Feasibility and scoring based on the pod's tolerations.
+func (pl *NodeUnschedulable) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	return helper.PodSignatureFromObj(pod.Spec.Tolerations)
 }
 
 // Filter invoked at the filter extension point.

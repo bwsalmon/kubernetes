@@ -88,6 +88,10 @@ func (pl *PodTopologySpread) Name() string {
 	return Name
 }
 
+// Pod topology spread is not localized to a pod and node, so we cannot
+// sign pods that have topology spread constraints, either explicit or
+// defaulted.
+// XXX need to fix the case where the controller type doesn't get a default...
 func (pl *PodTopologySpread) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
 	if len(pod.Spec.TopologySpreadConstraints) > 0 || pl.systemDefaulted {
 		return helper.PodUnsignable()
