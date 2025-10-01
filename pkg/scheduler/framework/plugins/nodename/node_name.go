@@ -24,6 +24,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
@@ -66,6 +67,10 @@ func (pl *NodeName) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithH
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *NodeName) Name() string {
 	return Name
+}
+
+func (pl *NodeName) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	return helper.PodSignatureFromObj(pod.Spec.NodeName)
 }
 
 // Filter invoked at the filter extension point.

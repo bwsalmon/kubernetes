@@ -26,6 +26,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -62,6 +63,10 @@ func (s preFilterState) Clone() fwk.StateData {
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *NodePorts) Name() string {
 	return Name
+}
+
+func (pl *NodePorts) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	return helper.PodSignatureFromObj(util.GetHostPorts(pod))
 }
 
 // PreFilter invoked at the prefilter extension point.

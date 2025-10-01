@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
@@ -48,6 +49,20 @@ const Name = names.ImageLocality
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *ImageLocality) Name() string {
 	return Name
+}
+
+func (pl *ImageLocality) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	imageNames := []string{}
+
+	for _, container := range pod.Spec.InitContainers {
+		imageNames = append(imageNames, normalizedImageName(container.Image))
+	}
+
+	for _, container := range pod.Spec.Containers {
+		imageNames = append(imageNames, normalizedImageName(container.Image))
+	}
+
+	return helper.PodSignatureFromObj(imageNames)
 }
 
 // Score invoked at the score extension point.

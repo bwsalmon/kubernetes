@@ -31,6 +31,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -56,6 +57,14 @@ type InterPodAffinity struct {
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *InterPodAffinity) Name() string {
 	return Name
+}
+
+func (pl *InterPodAffinity) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	if pod.Spec.Affinity != nil && (pod.Spec.Affinity.PodAffinity != nil || pod.Spec.Affinity.PodAntiAffinity != nil) {
+		return helper.PodUnsignable()
+	} else {
+		return helper.EmptyPodSignature()
+	}
 }
 
 // EventsToRegister returns the possible events that may make a failed Pod

@@ -53,6 +53,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources/extended"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
@@ -235,6 +236,14 @@ var _ framework.PreBindPlugin = &DynamicResources{}
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *DynamicResources) Name() string {
 	return Name
+}
+
+func (pl *DynamicResources) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	if len(pod.Spec.ResourceClaims) > 0 {
+		return helper.PodUnsignable()
+	} else {
+		return helper.EmptyPodSignature()
+	}
 }
 
 // EventsToRegister returns the possible events that may make a Pod

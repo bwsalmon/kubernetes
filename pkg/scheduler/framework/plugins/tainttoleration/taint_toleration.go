@@ -57,6 +57,10 @@ func (pl *TaintToleration) Name() string {
 	return Name
 }
 
+func (pl *TaintToleration) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	return helper.PodSignatureFromObj(pod.Spec.Tolerations)
+}
+
 // EventsToRegister returns the possible events that may make a Pod
 // failed by this plugin schedulable.
 func (pl *TaintToleration) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {

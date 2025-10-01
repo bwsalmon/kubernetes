@@ -28,6 +28,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
@@ -94,6 +95,10 @@ func getBalancedAllocationPreScoreState(cycleState fwk.CycleState) (*balancedAll
 // Name returns name of the plugin. It is used in logs, etc.
 func (ba *BalancedAllocation) Name() string {
 	return BalancedAllocationName
+}
+
+func (ba *BalancedAllocation) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	return helper.PodSignatureFromObj(ba.calculatePodResourceRequestList(pod, ba.resources))
 }
 
 // Score invoked at the score extension point.

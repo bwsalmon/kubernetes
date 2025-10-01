@@ -75,6 +75,13 @@ func (pl *NodeAffinity) Name() string {
 	return Name
 }
 
+func (pl *NodeAffinity) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
+		return helper.PodSignatureFromObj(pod.Spec.Affinity.NodeAffinity)
+	}
+	return helper.EmptyPodSignature()
+}
+
 type preFilterState struct {
 	requiredNodeSelectorAndAffinity nodeaffinity.RequiredNodeAffinity
 }

@@ -35,6 +35,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -101,6 +102,16 @@ func translateToGALabel(label string) string {
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *VolumeZone) Name() string {
 	return Name
+}
+
+func (pl *VolumeZone) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	volumes := []v1.Volume{}
+	for _, volume := range pod.Spec.Volumes {
+		if volume.VolumeSource.ConfigMap == nil && volume.VolumeSource.Secret == nil {
+			volumes = append(volumes, volume)
+		}
+	}
+	return helper.PodSignatureFromObj(volumes)
 }
 
 // PreFilter invoked at the prefilter extension point

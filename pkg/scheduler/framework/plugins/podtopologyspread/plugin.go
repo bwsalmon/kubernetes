@@ -34,6 +34,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -85,6 +86,14 @@ const Name = names.PodTopologySpread
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *PodTopologySpread) Name() string {
 	return Name
+}
+
+func (pl *PodTopologySpread) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	if len(pod.Spec.TopologySpreadConstraints) > 0 || pl.systemDefaulted {
+		return helper.PodUnsignable()
+	} else {
+		return helper.EmptyPodSignature()
+	}
 }
 
 // New initializes a new plugin and returns it.

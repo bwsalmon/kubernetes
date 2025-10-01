@@ -95,6 +95,16 @@ func (pl *VolumeBinding) Name() string {
 	return Name
 }
 
+func (pl *VolumeBinding) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	volumes := []v1.Volume{}
+	for _, volume := range pod.Spec.Volumes {
+		if volume.VolumeSource.ConfigMap == nil && volume.VolumeSource.Secret == nil {
+			volumes = append(volumes, volume)
+		}
+	}
+	return helper.PodSignatureFromObj(volumes)
+}
+
 // EventsToRegister returns the possible events that may make a Pod
 // failed by this plugin schedulable.
 func (pl *VolumeBinding) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {

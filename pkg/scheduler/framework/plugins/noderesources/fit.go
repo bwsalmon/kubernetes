@@ -34,6 +34,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources/extended"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -152,6 +153,10 @@ func getPreScoreState(cycleState fwk.CycleState) (*preScoreState, error) {
 // Name returns name of the plugin. It is used in logs, etc.
 func (f *Fit) Name() string {
 	return Name
+}
+
+func (f *Fit) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+	return helper.PodSignatureFromObj(computePodResourceRequest(pod, ResourceRequestsOptions{EnablePodLevelResources: f.enablePodLevelResources}))
 }
 
 // NewFit initializes a new plugin and returns it.
