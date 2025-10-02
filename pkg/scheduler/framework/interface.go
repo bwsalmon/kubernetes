@@ -308,10 +308,10 @@ type PodSignatureMaker interface {
 }
 
 // SignaturePlugin is an interface that should be implemented by plugins that either filter or score
-// pods to enable result caching and gang scheduling optimizations. If an enabled plugin does not implement
-// this interface we will turn off signatures for all pods. For alpha / beta we will leave this optional,
-// but in the future we may make it mandatory for all filtering and scoring plugins to implement the interface
-// (but of course plugins may choose to always return "unsignable").
+// pods to enable result caching and gang scheduling optimizations. If an enabled plugin that does Scoring,
+// Prescoring, Filtering or Prefiltering does not implement this interface we will turn off signatures for all pods.
+// For now we leave this optional, but in the future we may make it mandatory for all filtering and scoring plugins
+// to implement the interface (but of course plugins may choose to always return "unsignable").
 type SignaturePlugin interface {
 	Plugin
 	// This is called before PreFilter. The return value can be:
