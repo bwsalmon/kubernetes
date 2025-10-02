@@ -24,7 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
@@ -52,7 +51,7 @@ func (pl *ImageLocality) Name() string {
 }
 
 // Image locality filtering and scoring depends on images for the pod's containers.
-func (pl *ImageLocality) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+func (pl *ImageLocality) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
 	imageNames := []string{}
 
 	for _, container := range pod.Spec.InitContainers {
@@ -63,7 +62,7 @@ func (pl *ImageLocality) PodSignature(pod *v1.Pod) *framework.PodSignatureResult
 		imageNames = append(imageNames, normalizedImageName(container.Image))
 	}
 
-	return helper.PodSignatureFromObj(imageNames)
+	return signature.AddElementFromObj(pl.Name(), imageNames)
 }
 
 // Score invoked at the score extension point.

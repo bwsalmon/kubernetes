@@ -76,7 +76,7 @@ func (pl *NodeAffinity) Name() string {
 }
 
 // Node affinity filtering and scoring depend on NodeAffinity and NodeSelectors.
-func (pl *NodeAffinity) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+func (pl *NodeAffinity) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
 	objs := []any{"affinity"}
 	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
 		objs = append(objs, pod.Spec.Affinity.NodeAffinity)
@@ -85,7 +85,7 @@ func (pl *NodeAffinity) PodSignature(pod *v1.Pod) *framework.PodSignatureResult 
 	objs = append(objs, "selector")
 	objs = append(objs, pod.Spec.NodeSelector)
 
-	return helper.PodSignatureFromObj(objs)
+	return signature.AddElementFromObj(pl.Name(), objs)
 }
 
 type preFilterState struct {

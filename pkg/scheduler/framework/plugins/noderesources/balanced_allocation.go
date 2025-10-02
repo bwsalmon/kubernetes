@@ -28,7 +28,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/validation"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
@@ -99,8 +98,8 @@ func (ba *BalancedAllocation) Name() string {
 
 // Feasibilty and scoring are based on a set of resources considered by BA. We
 // reuse the internal function used to determine the relevant resources.
-func (ba *BalancedAllocation) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
-	return helper.PodSignatureFromObj(ba.calculatePodResourceRequestList(pod, ba.resources))
+func (ba *BalancedAllocation) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	return signature.AddElementFromObj(ba.Name(), ba.calculatePodResourceRequestList(pod, ba.resources))
 }
 
 // Score invoked at the score extension point.

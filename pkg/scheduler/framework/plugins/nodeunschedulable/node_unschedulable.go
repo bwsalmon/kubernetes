@@ -26,7 +26,6 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -131,8 +130,11 @@ func (pl *NodeUnschedulable) Name() string {
 }
 
 // Feasibility and scoring based on the pod's tolerations.
-func (pl *NodeUnschedulable) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
-	return helper.PodSignatureFromObj(pod.Spec.Tolerations)
+func (pl *NodeUnschedulable) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Tolerations") {
+		return signature.AddElementFromObj("Tolerations", pod.Spec.Tolerations)
+	}
+	return nil
 }
 
 // Filter invoked at the filter extension point.

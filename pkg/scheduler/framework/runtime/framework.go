@@ -18,7 +18,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -764,26 +763,19 @@ func (f *frameworkImpl) PodSignature(ctx context.Context, pod *v1.Pod) *framewor
 		return &framework.PodSignatureResult{Signable: false}
 	}
 
-	signatures := make([]string, len(plugins)*2)
-	for i, pl := range plugins {
-		sigRes := pl.PodSignature(pod)
-		if sigRes.Error != nil {
-			return sigRes
+	signatureMaker := newPodSignatureMaker()
+	for _, pl := range plugins {
+		err := pl.PodSignature(pod, signatureMaker)
+		if err != nil {
+			return &framework.PodSignatureResult{Signable: false, Error: err}
 		}
-		if sigRes.Signable {
-			signatures[i*2] = pl.Name()
-			signatures[i*2+1] = sigRes.Signature
-		} else {
+		if !signatureMaker.signable {
 			return &framework.PodSignatureResult{Signable: false}
 		}
 	}
 
-	marshalled, err := json.Marshal(signatures)
-	if err != nil {
-		return &framework.PodSignatureResult{Error: err, Signable: false}
-	}
-
-	return &framework.PodSignatureResult{Signable: true, Signature: string(marshalled)}
+	marshalled, err := signatureMaker.Marshal()
+	return &framework.PodSignatureResult{Signable: err == nil, Signature: string(marshalled), Error: err}
 }
 
 // RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns

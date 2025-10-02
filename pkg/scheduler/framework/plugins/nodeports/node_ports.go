@@ -26,7 +26,6 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -66,8 +65,8 @@ func (pl *NodePorts) Name() string {
 }
 
 // NodePort feasibility and scheduling is based on the host ports for the containers.
-func (pl *NodePorts) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
-	return helper.PodSignatureFromObj(util.GetHostPorts(pod))
+func (pl *NodePorts) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	return signature.AddElementFromObj(pl.Name(), util.GetHostPorts(pod))
 }
 
 // PreFilter invoked at the prefilter extension point.

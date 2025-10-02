@@ -57,9 +57,12 @@ func (pl *TaintToleration) Name() string {
 	return Name
 }
 
-// Feasibilty and scoring is based on the pod's tolerations.
-func (pl *TaintToleration) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
-	return helper.PodSignatureFromObj(pod.Spec.Tolerations)
+// Feasibility and scoring based on the pod's tolerations.
+func (pl *TaintToleration) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Tolerations") {
+		return signature.AddElementFromObj("Tolerations", pod.Spec.Tolerations)
+	}
+	return nil
 }
 
 // EventsToRegister returns the possible events that may make a Pod

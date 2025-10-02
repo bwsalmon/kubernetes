@@ -300,6 +300,13 @@ type PreFilterExtensions interface {
 	RemovePod(ctx context.Context, state fwk.CycleState, podToSchedule *v1.Pod, podInfoToRemove fwk.PodInfo, nodeInfo fwk.NodeInfo) *fwk.Status
 }
 
+type PodSignatureMaker interface {
+	Unsignable()
+	AddElement(elementName, sigString string)
+	AddElementFromObj(elementName string, obj any) error
+	HasElement(elementName string) bool
+}
+
 // SignaturePlugin is an interface that should be implemented by plugins that either filter or score
 // pods to enable result caching and gang scheduling optimizations. If an enabled plugin does not implement
 // this interface we will turn off signatures for all pods. For alpha / beta we will leave this optional,
@@ -313,7 +320,7 @@ type SignaturePlugin interface {
 	// - The assertion that this pod cannot be signed by this plugin; i.e. the scoring of this pod is dependent on more than the node and the pod. This
 	//   will disable caching and gang scheduling optimizations for the given pod, hurting performance.
 	// - An internal error condition passed back through the scheduling code.
-	PodSignature(pod *v1.Pod) *PodSignatureResult
+	PodSignature(pod *v1.Pod, signature PodSignatureMaker) error
 }
 
 // PreFilterPlugin is an interface that must be implemented by "PreFilter" plugins.

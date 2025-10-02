@@ -24,7 +24,6 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
@@ -70,8 +69,9 @@ func (pl *NodeName) Name() string {
 }
 
 // NodeName scoring and feasibility are dependent on the NodeName field.
-func (pl *NodeName) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
-	return helper.PodSignatureFromObj(pod.Spec.NodeName)
+func (pl *NodeName) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	signature.AddElement(pl.Name(), pod.Spec.NodeName)
+	return nil
 }
 
 // Filter invoked at the filter extension point.

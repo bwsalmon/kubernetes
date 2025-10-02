@@ -95,18 +95,12 @@ func (pl *VolumeBinding) Name() string {
 	return Name
 }
 
-// Feasibility and scoring are based on the pod's volume definitions. Note that
-// we exclude ConfigMap and Secret volumes because they are synthetic.
-// Note also that we include this same info from several plugins, we could
-// potentially optimize this in the future, but including from each is safe.
-func (pl *VolumeBinding) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
-	volumes := []v1.Volume{}
-	for _, volume := range pod.Spec.Volumes {
-		if volume.VolumeSource.ConfigMap == nil && volume.VolumeSource.Secret == nil {
-			volumes = append(volumes, volume)
-		}
+// Feasibility and scoring are based on the pod's volume definitions.
+func (pl *VolumeBinding) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Volumes") {
+		return signature.AddElementFromObj("Volumes", helper.SignatureVolumes(pod))
 	}
-	return helper.PodSignatureFromObj(volumes)
+	return nil
 }
 
 // EventsToRegister returns the possible events that may make a Pod

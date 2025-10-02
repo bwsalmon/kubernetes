@@ -31,7 +31,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -62,12 +61,11 @@ func (pl *InterPodAffinity) Name() string {
 // Inter pod affinity make feasibility and scoring dependent on the placement of other
 // pods in addition the current pod and node, so we cannot sign pods with these
 // constraints.
-func (pl *InterPodAffinity) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+func (pl *InterPodAffinity) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
 	if pod.Spec.Affinity != nil && (pod.Spec.Affinity.PodAffinity != nil || pod.Spec.Affinity.PodAntiAffinity != nil) {
-		return helper.PodUnsignable()
-	} else {
-		return helper.EmptyPodSignature()
+		signature.Unsignable()
 	}
+	return nil
 }
 
 // EventsToRegister returns the possible events that may make a failed Pod

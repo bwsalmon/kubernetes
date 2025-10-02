@@ -53,7 +53,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources/extended"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
@@ -240,12 +239,11 @@ func (pl *DynamicResources) Name() string {
 
 // Because it isn't simple to determine if DRA claims are single host or more complex,
 // we exclude any pod with a DRA claim from signatures. We should improve this.
-func (pl *DynamicResources) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+func (pl *DynamicResources) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
 	if len(pod.Spec.ResourceClaims) > 0 {
-		return helper.PodUnsignable()
-	} else {
-		return helper.EmptyPodSignature()
+		signature.Unsignable()
 	}
+	return nil
 }
 
 // EventsToRegister returns the possible events that may make a Pod

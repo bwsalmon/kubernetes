@@ -34,7 +34,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -92,12 +91,11 @@ func (pl *PodTopologySpread) Name() string {
 // sign pods that have topology spread constraints, either explicit or
 // defaulted.
 // XXX need to fix the case where the controller type doesn't get a default...
-func (pl *PodTopologySpread) PodSignature(pod *v1.Pod) *framework.PodSignatureResult {
+func (pl *PodTopologySpread) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
 	if len(pod.Spec.TopologySpreadConstraints) > 0 || pl.systemDefaulted {
-		return helper.PodUnsignable()
-	} else {
-		return helper.EmptyPodSignature()
+		signature.Unsignable()
 	}
+	return nil
 }
 
 // New initializes a new plugin and returns it.
