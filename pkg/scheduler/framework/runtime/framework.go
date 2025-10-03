@@ -777,6 +777,7 @@ func (f *frameworkImpl) PodSignature(ctx context.Context, pod *v1.Pod) *framewor
 			return &framework.PodSignatureResult{Signable: false}
 		}
 	}
+	signatureMaker.AddNonPluginElements(pod)
 
 	marshalled, err := signatureMaker.Marshal()
 	return &framework.PodSignatureResult{Signable: err == nil, Signature: string(marshalled), Error: err}

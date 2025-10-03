@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"encoding/json"
+
+	v1 "k8s.io/api/core/v1"
 )
 
 type podSignatureMakerImpl struct {
@@ -51,4 +53,8 @@ func (s *podSignatureMakerImpl) HasElement(elementName string) bool {
 
 func (s *podSignatureMakerImpl) Marshal() ([]byte, error) {
 	return json.Marshal(s.elements)
+}
+
+func (s *podSignatureMakerImpl) AddNonPluginElements(pod *v1.Pod) {
+	s.AddElement("SchedulerName", pod.Spec.SchedulerName)
 }
