@@ -42,6 +42,7 @@ var _ framework.FilterPlugin = &TaintToleration{}
 var _ framework.PreScorePlugin = &TaintToleration{}
 var _ framework.ScorePlugin = &TaintToleration{}
 var _ framework.EnqueueExtensions = &TaintToleration{}
+var _ framework.SignaturePlugin = &TaintToleration{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.

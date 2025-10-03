@@ -74,6 +74,7 @@ type CSILimits struct {
 var _ framework.PreFilterPlugin = &CSILimits{}
 var _ framework.FilterPlugin = &CSILimits{}
 var _ framework.EnqueueExtensions = &CSILimits{}
+var _ framework.SignaturePlugin = &CSILimits{}
 
 // CSIName is the name of the plugin used in the plugin registry and configurations.
 const CSIName = names.NodeVolumeLimits

@@ -38,6 +38,7 @@ type NodeUnschedulable struct {
 
 var _ framework.FilterPlugin = &NodeUnschedulable{}
 var _ framework.EnqueueExtensions = &NodeUnschedulable{}
+var _ framework.SignaturePlugin = &NodeUnschedulable{}
 
 // Name is the name of the plugin used in the plugin registry and configurations.
 const Name = names.NodeUnschedulable

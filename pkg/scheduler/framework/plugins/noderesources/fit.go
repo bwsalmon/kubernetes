@@ -43,6 +43,7 @@ var _ framework.FilterPlugin = &Fit{}
 var _ framework.EnqueueExtensions = &Fit{}
 var _ framework.PreScorePlugin = &Fit{}
 var _ framework.ScorePlugin = &Fit{}
+var _ framework.SignaturePlugin = &Fit{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.

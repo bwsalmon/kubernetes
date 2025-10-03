@@ -78,6 +78,7 @@ var _ framework.FilterPlugin = &PodTopologySpread{}
 var _ framework.PreScorePlugin = &PodTopologySpread{}
 var _ framework.ScorePlugin = &PodTopologySpread{}
 var _ framework.EnqueueExtensions = &PodTopologySpread{}
+var _ framework.SignaturePlugin = &PodTopologySpread{}
 
 // Name is the name of the plugin used in the plugin registry and configurations.
 const Name = names.PodTopologySpread

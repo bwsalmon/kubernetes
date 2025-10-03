@@ -86,6 +86,7 @@ var _ framework.PreBindPlugin = &VolumeBinding{}
 var _ framework.PreScorePlugin = &VolumeBinding{}
 var _ framework.ScorePlugin = &VolumeBinding{}
 var _ framework.EnqueueExtensions = &VolumeBinding{}
+var _ framework.SignaturePlugin = &VolumeBinding{}
 
 // Name is the name of the plugin used in Registry and configurations.
 const Name = names.VolumeBinding

@@ -38,6 +38,7 @@ type NodePorts struct {
 var _ framework.PreFilterPlugin = &NodePorts{}
 var _ framework.FilterPlugin = &NodePorts{}
 var _ framework.EnqueueExtensions = &NodePorts{}
+var _ framework.SignaturePlugin = &NodePorts{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.

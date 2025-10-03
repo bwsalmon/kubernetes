@@ -34,6 +34,7 @@ type NodeName struct {
 
 var _ framework.FilterPlugin = &NodeName{}
 var _ framework.EnqueueExtensions = &NodeName{}
+var _ framework.SignaturePlugin = &NodeName{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.

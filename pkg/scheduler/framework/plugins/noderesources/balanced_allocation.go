@@ -40,6 +40,7 @@ type BalancedAllocation struct {
 
 var _ framework.PreScorePlugin = &BalancedAllocation{}
 var _ framework.ScorePlugin = &BalancedAllocation{}
+var _ framework.SignaturePlugin = &BalancedAllocation{}
 
 // BalancedAllocationName is the name of the plugin used in the plugin registry and configurations.
 const (

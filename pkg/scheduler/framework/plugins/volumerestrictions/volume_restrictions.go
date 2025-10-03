@@ -45,6 +45,7 @@ type VolumeRestrictions struct {
 var _ framework.PreFilterPlugin = &VolumeRestrictions{}
 var _ framework.FilterPlugin = &VolumeRestrictions{}
 var _ framework.EnqueueExtensions = &VolumeRestrictions{}
+var _ framework.SignaturePlugin = &VolumeRestrictions{}
 var _ fwk.StateData = &preFilterState{}
 
 const (

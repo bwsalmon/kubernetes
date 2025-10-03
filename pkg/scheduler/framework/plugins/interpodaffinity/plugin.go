@@ -43,6 +43,7 @@ var _ framework.FilterPlugin = &InterPodAffinity{}
 var _ framework.PreScorePlugin = &InterPodAffinity{}
 var _ framework.ScorePlugin = &InterPodAffinity{}
 var _ framework.EnqueueExtensions = &InterPodAffinity{}
+var _ framework.SignaturePlugin = &InterPodAffinity{}
 
 // InterPodAffinity is a plugin that checks inter pod affinity
 type InterPodAffinity struct {

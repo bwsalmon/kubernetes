@@ -231,6 +231,7 @@ var _ framework.PostFilterPlugin = &DynamicResources{}
 var _ framework.ReservePlugin = &DynamicResources{}
 var _ framework.EnqueueExtensions = &DynamicResources{}
 var _ framework.PreBindPlugin = &DynamicResources{}
+var _ framework.SignaturePlugin = &DynamicResources{}
 
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *DynamicResources) Name() string {

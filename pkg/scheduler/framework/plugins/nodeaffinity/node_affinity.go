@@ -49,6 +49,7 @@ var _ framework.FilterPlugin = &NodeAffinity{}
 var _ framework.PreScorePlugin = &NodeAffinity{}
 var _ framework.ScorePlugin = &NodeAffinity{}
 var _ framework.EnqueueExtensions = &NodeAffinity{}
+var _ framework.SignaturePlugin = &NodeAffinity{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.

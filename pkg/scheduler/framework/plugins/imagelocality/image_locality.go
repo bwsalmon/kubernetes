@@ -41,6 +41,7 @@ type ImageLocality struct {
 }
 
 var _ framework.ScorePlugin = &ImageLocality{}
+var _ framework.SignaturePlugin = &ImageLocality{}
 
 // Name is the name of the plugin used in the plugin registry and configurations.
 const Name = names.ImageLocality
