@@ -122,6 +122,8 @@ type Scheduler struct {
 	registeredHandlers []cache.ResourceEventHandlerRegistration
 
 	nominatedNodeNameForExpectationEnabled bool
+
+	podHostCache *PodHostCache
 }
 
 func (sched *Scheduler) applyDefaultHandlers() {
@@ -412,6 +414,8 @@ func New(ctx context.Context,
 		apiCache = apicache.New(podQueue, schedulerCache)
 	}
 
+	podHostCache := NewPodHostCache()
+
 	for _, fwk := range profiles {
 		fwk.SetPodNominator(podQueue)
 		fwk.SetPodActivator(podQueue)
@@ -434,6 +438,7 @@ func New(ctx context.Context,
 		logger:                                 logger,
 		APIDispatcher:                          apiDispatcher,
 		nominatedNodeNameForExpectationEnabled: feature.DefaultFeatureGate.Enabled(features.NominatedNodeNameForExpectation),
+		podHostCache:                           podHostCache,
 	}
 	sched.NextPod = podQueue.Pop
 	sched.applyDefaultHandlers()

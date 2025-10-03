@@ -78,6 +78,7 @@ var _ framework.FilterPlugin = &PodTopologySpread{}
 var _ framework.PreScorePlugin = &PodTopologySpread{}
 var _ framework.ScorePlugin = &PodTopologySpread{}
 var _ framework.EnqueueExtensions = &PodTopologySpread{}
+var _ framework.SignaturePlugin = &PodTopologySpread{}
 
 // Name is the name of the plugin used in the plugin registry and configurations.
 const Name = names.PodTopologySpread
@@ -85,6 +86,17 @@ const Name = names.PodTopologySpread
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *PodTopologySpread) Name() string {
 	return Name
+}
+
+// Pod topology spread is not localized to a pod and node, so we cannot
+// sign pods that have topology spread constraints, either explicit or
+// defaulted.
+// XXX need to fix the case where the controller type doesn't get a default...
+func (pl *PodTopologySpread) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if len(pod.Spec.TopologySpreadConstraints) > 0 || pl.systemDefaulted {
+		signature.Unsignable()
+	}
+	return nil
 }
 
 // New initializes a new plugin and returns it.

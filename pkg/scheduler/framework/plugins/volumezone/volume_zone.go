@@ -35,6 +35,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -50,6 +51,7 @@ type VolumeZone struct {
 var _ framework.FilterPlugin = &VolumeZone{}
 var _ framework.PreFilterPlugin = &VolumeZone{}
 var _ framework.EnqueueExtensions = &VolumeZone{}
+var _ framework.SignaturePlugin = &VolumeZone{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.
@@ -101,6 +103,14 @@ func translateToGALabel(label string) string {
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *VolumeZone) Name() string {
 	return Name
+}
+
+// Feasibility and scoring are based on the pod's volume definitions.
+func (pl *VolumeZone) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Volumes") {
+		return signature.AddElementFromObj("Volumes", helper.SignatureVolumes(pod))
+	}
+	return nil
 }
 
 // PreFilter invoked at the prefilter extension point

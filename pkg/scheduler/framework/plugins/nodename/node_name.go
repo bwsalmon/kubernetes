@@ -34,6 +34,7 @@ type NodeName struct {
 
 var _ framework.FilterPlugin = &NodeName{}
 var _ framework.EnqueueExtensions = &NodeName{}
+var _ framework.SignaturePlugin = &NodeName{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.
@@ -66,6 +67,12 @@ func (pl *NodeName) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithH
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *NodeName) Name() string {
 	return Name
+}
+
+// NodeName scoring and feasibility are dependent on the NodeName field.
+func (pl *NodeName) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	signature.AddElement(pl.Name(), pod.Spec.NodeName)
+	return nil
 }
 
 // Filter invoked at the filter extension point.

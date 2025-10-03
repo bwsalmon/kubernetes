@@ -49,6 +49,7 @@ var _ framework.FilterPlugin = &NodeAffinity{}
 var _ framework.PreScorePlugin = &NodeAffinity{}
 var _ framework.ScorePlugin = &NodeAffinity{}
 var _ framework.EnqueueExtensions = &NodeAffinity{}
+var _ framework.SignaturePlugin = &NodeAffinity{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.
@@ -73,6 +74,19 @@ const (
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *NodeAffinity) Name() string {
 	return Name
+}
+
+// Node affinity filtering and scoring depend on NodeAffinity and NodeSelectors.
+func (pl *NodeAffinity) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	objs := []any{"affinity"}
+	if pod.Spec.Affinity != nil && pod.Spec.Affinity.NodeAffinity != nil {
+		objs = append(objs, pod.Spec.Affinity.NodeAffinity)
+	}
+
+	objs = append(objs, "selector")
+	objs = append(objs, pod.Spec.NodeSelector)
+
+	return signature.AddElementFromObj(pl.Name(), objs)
 }
 
 type preFilterState struct {

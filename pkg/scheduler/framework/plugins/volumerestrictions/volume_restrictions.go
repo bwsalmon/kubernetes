@@ -30,6 +30,7 @@ import (
 	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -44,6 +45,7 @@ type VolumeRestrictions struct {
 var _ framework.PreFilterPlugin = &VolumeRestrictions{}
 var _ framework.FilterPlugin = &VolumeRestrictions{}
 var _ framework.EnqueueExtensions = &VolumeRestrictions{}
+var _ framework.SignaturePlugin = &VolumeRestrictions{}
 var _ fwk.StateData = &preFilterState{}
 
 const (
@@ -98,6 +100,14 @@ func (s *preFilterState) Clone() fwk.StateData {
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *VolumeRestrictions) Name() string {
 	return Name
+}
+
+// Feasibility and scoring are based on the pod's volume definitions.
+func (pl *VolumeRestrictions) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Volumes") {
+		return signature.AddElementFromObj("Volumes", helper.SignatureVolumes(pod))
+	}
+	return nil
 }
 
 func isVolumeConflict(volume *v1.Volume, pod *v1.Pod) bool {

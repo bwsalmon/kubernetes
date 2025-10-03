@@ -35,6 +35,7 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -73,6 +74,7 @@ type CSILimits struct {
 var _ framework.PreFilterPlugin = &CSILimits{}
 var _ framework.FilterPlugin = &CSILimits{}
 var _ framework.EnqueueExtensions = &CSILimits{}
+var _ framework.SignaturePlugin = &CSILimits{}
 
 // CSIName is the name of the plugin used in the plugin registry and configurations.
 const CSIName = names.NodeVolumeLimits
@@ -619,4 +621,11 @@ func (pl *CSILimits) getNodeVolumeAttachmentInfo(logger klog.Logger, nodeName st
 
 func getVolumeUniqueName(driverName, volumeHandle string) string {
 	return fmt.Sprintf("%s/%s", driverName, volumeHandle)
+}
+
+func (pl *CSILimits) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	if !signature.HasElement("Volumes") {
+		return signature.AddElementFromObj("Volumes", helper.SignatureVolumes(pod))
+	}
+	return nil
 }

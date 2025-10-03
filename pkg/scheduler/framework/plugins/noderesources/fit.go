@@ -43,6 +43,7 @@ var _ framework.FilterPlugin = &Fit{}
 var _ framework.EnqueueExtensions = &Fit{}
 var _ framework.PreScorePlugin = &Fit{}
 var _ framework.ScorePlugin = &Fit{}
+var _ framework.SignaturePlugin = &Fit{}
 
 const (
 	// Name is the name of the plugin used in the plugin registry and configurations.
@@ -152,6 +153,15 @@ func getPreScoreState(cycleState fwk.CycleState) (*preScoreState, error) {
 // Name returns name of the plugin. It is used in logs, etc.
 func (f *Fit) Name() string {
 	return Name
+}
+
+// Fit is based on the node resources for the pod. We reuse the function used
+// internally to compute the final resource list.
+func (f *Fit) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	return signature.AddElementFromObj(
+		f.Name(),
+		computePodResourceRequest(pod, ResourceRequestsOptions{EnablePodLevelResources: f.enablePodLevelResources}),
+	)
 }
 
 // NewFit initializes a new plugin and returns it.

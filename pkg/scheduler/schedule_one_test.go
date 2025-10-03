@@ -1097,6 +1097,7 @@ func TestSchedulerScheduleOne(t *testing.T) {
 							Profiles:                               profile.Map{testSchedulerName: schedFramework},
 							APIDispatcher:                          apiDispatcher,
 							nominatedNodeNameForExpectationEnabled: nominatedNodeNameForExpectationEnabled,
+							podHostCache:                           NewPodHostCache(),
 						}
 						queue.Add(logger, item.sendPod)
 
@@ -1451,6 +1452,7 @@ func TestScheduleOneMarksPodAsProcessedBeforePreBind(t *testing.T) {
 						SchedulingQueue: queue,
 						Profiles:        profile.Map{testSchedulerName: schedFramework},
 						APIDispatcher:   apiDispatcher,
+						podHostCache:    NewPodHostCache(),
 					}
 					queue.Add(logger, item.sendPod)
 
@@ -2075,6 +2077,7 @@ func TestSchedulerBinding(t *testing.T) {
 					nodeInfoSnapshot:         nil,
 					percentageOfNodesToScore: 0,
 					APIDispatcher:            apiDispatcher,
+					podHostCache:             NewPodHostCache(),
 				}
 				status := sched.bind(ctx, fwk, pod, "node", state)
 				if !status.IsSuccess() {
@@ -3494,6 +3497,7 @@ func TestSchedulerSchedulePod(t *testing.T) {
 				nodeInfoSnapshot:         snapshot,
 				percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
 				Extenders:                extenders,
+				podHostCache:             NewPodHostCache(),
 			}
 			sched.applyDefaultHandlers()
 
@@ -3553,7 +3557,7 @@ func TestFindFitAllError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), &v1.Pod{})
+	_, diagnosis, _, err := scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), &v1.Pod{})
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -3599,7 +3603,7 @@ func TestFindFitSomeError(t *testing.T) {
 	}
 
 	pod := st.MakePod().Name("1").UID("1").Obj()
-	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), pod)
+	_, diagnosis, _, err := scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), pod)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -3694,7 +3698,7 @@ func TestFindFitPredicateCallCounts(t *testing.T) {
 			}
 			fwk.AddNominatedPod(logger, podinfo, &framework.NominatingInfo{NominatingMode: framework.ModeOverride, NominatedNodeName: "1"})
 
-			_, _, err = scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), test.pod)
+			_, _, _, err = scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), test.pod)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
@@ -3829,11 +3833,12 @@ func TestZeroRequest(t *testing.T) {
 			sched := &Scheduler{
 				nodeInfoSnapshot:         snapshot,
 				percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
+				podHostCache:             NewPodHostCache(),
 			}
 			sched.applyDefaultHandlers()
 
 			state := framework.NewCycleState()
-			_, _, err = sched.findNodesThatFitPod(ctx, fwk, state, test.pod)
+			_, _, _, err = sched.findNodesThatFitPod(ctx, fwk, state, test.pod)
 			if err != nil {
 				t.Fatalf("error filtering nodes: %+v", err)
 			}
@@ -4322,6 +4327,7 @@ func TestNumFeasibleNodesToFind(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			sched := &Scheduler{
 				percentageOfNodesToScore: tt.globalPercentage,
+				podHostCache:             NewPodHostCache(),
 			}
 			if gotNumNodes := sched.numFeasibleNodesToFind(tt.profilePercentage, tt.numAllNodes); gotNumNodes != tt.wantNumNodes {
 				t.Errorf("Scheduler.numFeasibleNodesToFind() = %v, want %v", gotNumNodes, tt.wantNumNodes)
@@ -4364,7 +4370,7 @@ func TestFairEvaluationForNodes(t *testing.T) {
 
 	// Iterating over all nodes more than twice
 	for i := 0; i < 2*(numAllNodes/nodesToFind+1); i++ {
-		nodesThatFit, _, err := sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), &v1.Pod{})
+		nodesThatFit, _, _, err := sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), &v1.Pod{})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -4445,10 +4451,11 @@ func TestPreferNominatedNodeFilterCallCounts(t *testing.T) {
 				Cache:                    cache,
 				nodeInfoSnapshot:         snapshot,
 				percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
+				podHostCache:             NewPodHostCache(),
 			}
 			sched.applyDefaultHandlers()
 
-			_, _, err = sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), test.pod)
+			_, _, _, err = sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), test.pod)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 			}
@@ -4503,6 +4510,7 @@ func makeScheduler(ctx context.Context, nodes []*v1.Node) *Scheduler {
 		Cache:                    cache,
 		nodeInfoSnapshot:         emptySnapshot,
 		percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
+		podHostCache:             NewPodHostCache(),
 	}
 	sched.applyDefaultHandlers()
 	cache.UpdateSnapshot(logger, sched.nodeInfoSnapshot)
@@ -4620,6 +4628,7 @@ func setupTestScheduler(ctx context.Context, t *testing.T, client clientset.Inte
 		SchedulingQueue: schedulingQueue,
 		APIDispatcher:   apiDispatcher,
 		Profiles:        profile.Map{testSchedulerName: schedFramework},
+		podHostCache:    NewPodHostCache(),
 	}
 
 	sched.SchedulePod = sched.schedulePod

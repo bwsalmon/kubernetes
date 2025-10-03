@@ -41,6 +41,7 @@ type ImageLocality struct {
 }
 
 var _ framework.ScorePlugin = &ImageLocality{}
+var _ framework.SignaturePlugin = &ImageLocality{}
 
 // Name is the name of the plugin used in the plugin registry and configurations.
 const Name = names.ImageLocality
@@ -48,6 +49,21 @@ const Name = names.ImageLocality
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *ImageLocality) Name() string {
 	return Name
+}
+
+// Image locality filtering and scoring depends on images for the pod's containers.
+func (pl *ImageLocality) PodSignature(pod *v1.Pod, signature framework.PodSignatureMaker) error {
+	imageNames := []string{}
+
+	for _, container := range pod.Spec.InitContainers {
+		imageNames = append(imageNames, normalizedImageName(container.Image))
+	}
+
+	for _, container := range pod.Spec.Containers {
+		imageNames = append(imageNames, normalizedImageName(container.Image))
+	}
+
+	return signature.AddElementFromObj(pl.Name(), imageNames)
 }
 
 // Score invoked at the score extension point.
