@@ -114,6 +114,12 @@ type KubeSchedulerProfile struct {
 	// global PercentageOfNodesToScore will be used.
 	PercentageOfNodesToScore *int32
 
+	// If set, this enables the scheduler cache. This cache dramatically improves the performance
+	// when many pods are scheduled on large clusters. For 1-pod-per-node environments this
+	// cache has no downsides, but for multi-pod-per-node environments it will degrade the scoring
+	// of nodes to some degree.
+	CacheEnabled bool
+
 	// Plugins specify the set of plugins that should be enabled or disabled.
 	// Enabled plugins are the ones that should be enabled in addition to the
 	// default plugins. Disabled plugins are any of the default plugins that
@@ -176,6 +182,9 @@ type Plugins struct {
 
 	// MultiPoint is a simplified config field for enabling plugins for all valid extension points
 	MultiPoint PluginSet
+
+	// Signature plugins contribute to a pod's scheduling signature
+	Signature PluginSet
 }
 
 // PluginSet specifies enabled and disabled plugins for an extension point.

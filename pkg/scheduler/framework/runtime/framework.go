@@ -69,6 +69,7 @@ type frameworkImpl struct {
 	bindPlugins          []framework.BindPlugin
 	postBindPlugins      []framework.PostBindPlugin
 	permitPlugins        []framework.PermitPlugin
+	signaturePlugins     []framework.SignaturePlugin
 
 	// pluginsMap contains all plugins, by name.
 	pluginsMap map[string]framework.Plugin
@@ -83,6 +84,7 @@ type frameworkImpl struct {
 	metricsRecorder          *metrics.MetricAsyncRecorder
 	profileName              string
 	percentageOfNodesToScore *int32
+	signPods                 bool
 
 	extenders []framework.Extender
 	framework.PodNominator
@@ -118,6 +120,7 @@ func (f *frameworkImpl) getExtensionPoints(plugins *config.Plugins) []extensionP
 		{&plugins.Permit, &f.permitPlugins},
 		{&plugins.PreEnqueue, &f.preEnqueuePlugins},
 		{&plugins.QueueSort, &f.queueSortPlugins},
+		{&plugins.Signature, &f.signaturePlugins},
 	}
 }
 
@@ -319,6 +322,7 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
 
 	f.profileName = profile.SchedulerName
 	f.percentageOfNodesToScore = profile.PercentageOfNodesToScore
+	f.signPods = profile.CacheEnabled
 	if profile.Plugins == nil {
 		return f, nil
 	}
@@ -396,6 +400,9 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
 			return nil, fmt.Errorf("score plugin %q is not configured with weight", scorePlugin.Name())
 		}
 	}
+
+	// Disable signatures if we don't have the full support of all the needed plugins
+	f.checkPluginSignatures()
 
 	if options.captureProfile != nil {
 		if len(outputProfile.PluginConfig) != 0 {
@@ -717,39 +724,37 @@ func (f *frameworkImpl) QueueSortFunc() framework.LessFunc {
 	return f.queueSortPlugins[0].Less
 }
 
-// XXX we should just do this once.
-
-func (f *frameworkImpl) cacheablePlugins() (bool, []framework.SignaturePlugin) {
-	plugins := []framework.SignaturePlugin{}
-
+// If any of our preFilter, filter, preScore or score plugins haven't
+// implemented a signature, then disable the cache.
+func (f *frameworkImpl) checkPluginSignatures() {
 	for _, pl := range f.preFilterPlugins {
-		cacheablePl, implementsInterface := pl.(framework.SignaturePlugin)
-		if !implementsInterface {
-			return false, plugins
-		} else {
-			plugins = append(plugins, cacheablePl)
+		if _, implements := pl.(framework.SignaturePlugin); !implements && f.signPods {
+			f.logger.Info("Disabling scheduler cache for profile %s because plugin %s does not support it", f.profileName, pl.Name())
+			f.signPods = false
+			return
 		}
 	}
-
 	for _, pl := range f.filterPlugins {
-		cacheablePl, implementsInterface := pl.(framework.SignaturePlugin)
-		if !implementsInterface {
-			return false, plugins
-		} else {
-			plugins = append(plugins, cacheablePl)
+		if _, implements := pl.(framework.SignaturePlugin); !implements && f.signPods {
+			f.logger.Info("Disabling scheduler cache for profile %s because plugin %s does not support it", f.profileName, pl.Name())
+			f.signPods = false
+			return
 		}
 	}
-
+	for _, pl := range f.preScorePlugins {
+		if _, implements := pl.(framework.SignaturePlugin); !implements && f.signPods {
+			f.logger.Info("Disabling scheduler cache for profile %s because plugin %s does not support it", f.profileName, pl.Name())
+			f.signPods = false
+			return
+		}
+	}
 	for _, pl := range f.scorePlugins {
-		cacheablePl, implementsInterface := pl.(framework.SignaturePlugin)
-		if !implementsInterface {
-			return false, plugins
-		} else {
-			plugins = append(plugins, cacheablePl)
+		if _, implements := pl.(framework.SignaturePlugin); !implements && f.signPods {
+			f.logger.Info("Disabling scheduler cache for profile %s because plugin %s does not support it", f.profileName, pl.Name())
+			f.signPods = false
+			return
 		}
 	}
-
-	return true, plugins
 }
 
 // PodSignature returns a signature for a given pod. Any two pods with the same signature should get
@@ -758,13 +763,12 @@ func (f *frameworkImpl) cacheablePlugins() (bool, []framework.SignaturePlugin) {
 // there is no way to compare this pod against others, and will turn off a number of optimizations
 // for this pod.
 func (f *frameworkImpl) PodSignature(ctx context.Context, pod *v1.Pod) *framework.PodSignatureResult {
-	allPluginsCanSign, plugins := f.cacheablePlugins()
-	if !allPluginsCanSign {
+	if !f.signPods {
 		return &framework.PodSignatureResult{Signable: false}
 	}
 
 	signatureMaker := newPodSignatureMaker()
-	for _, pl := range plugins {
+	for _, pl := range f.signaturePlugins {
 		err := pl.PodSignature(pod, signatureMaker)
 		if err != nil {
 			return &framework.PodSignatureResult{Signable: false, Error: err}

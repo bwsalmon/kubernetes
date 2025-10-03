@@ -26,9 +26,6 @@ import (
 )
 
 const (
-	// Is the cache enabled?
-	cacheEnabled = true
-
 	// How long cached extries remain usable.
 	expirationTime = 10 * time.Second
 
@@ -57,7 +54,7 @@ func NewPodHostCache() *PodHostCache {
 }
 
 func (c *PodHostCache) AddSignature(signature *framework.PodSignatureResult, sortedHosts []framework.NodePluginScores, t time.Time) {
-	if !cacheEnabled || !signature.Signable {
+	if !signature.Signable {
 		return
 	}
 
@@ -70,7 +67,7 @@ func (c *PodHostCache) AddSignature(signature *framework.PodSignatureResult, sor
 }
 
 func (c *PodHostCache) SuggestedHost(signature *framework.PodSignatureResult) (string, error) {
-	if !cacheEnabled || !signature.Signable {
+	if !signature.Signable {
 		return "", fmt.Errorf("pod not signable")
 	}
 
@@ -88,7 +85,7 @@ func (c *PodHostCache) SuggestedHost(signature *framework.PodSignatureResult) (s
 }
 
 func (c *PodHostCache) HostAvailable(signature *framework.PodSignatureResult) bool {
-	if !cacheEnabled || !signature.Signable {
+	if !signature.Signable {
 		return false
 	}
 	_, found := c.signatures.entries[signature.Signature]
@@ -96,18 +93,13 @@ func (c *PodHostCache) HostAvailable(signature *framework.PodSignatureResult) bo
 }
 
 func (c *PodHostCache) InvalidateHost(hostname string) {
-	if cacheEnabled {
-		c.hostnames.RemoveListIfExists(hostname)
-	}
+	c.hostnames.RemoveListIfExists(hostname)
 }
 
 // Expire cache entries that are stale. Should be called each scheduling iteration before checking for suggested hosts.
 
 func (c *PodHostCache) Evict() {
-	// This should only be nil in tests.
-	if c.signatures != nil {
-		c.signatures.Evict(time.Now())
-	}
+	c.signatures.Evict(time.Now())
 }
 
 func (c *PodHostCache) newEntry(signature, hostname string) *entry {
