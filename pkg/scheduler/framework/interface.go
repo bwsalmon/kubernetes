@@ -153,6 +153,12 @@ func NewPodsToActivate() *PodsToActivate {
 	return &PodsToActivate{Map: make(map[string]*v1.Pod)}
 }
 
+// A list of scored nodes, returned from scheduling.
+type SortedScoredNodes interface {
+	Pop() string
+	Len() int
+}
+
 // Framework manages the set of plugins in use by the scheduling framework.
 // Configured plugins are called at specified points in a scheduling context.
 type Framework interface {
@@ -183,6 +189,18 @@ type Framework interface {
 	// to execute first and return Unschedulable status, or ones that try to change the
 	// cluster state to make the pod potentially schedulable in a future scheduling cycle.
 	RunPostFilterPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, filteredNodeStatusMap fwk.NodeToStatusReader) (*fwk.PostFilterResult, *fwk.Status)
+
+	// Get a "node hint" for a given pod. A node hint is the name of a node provided by the batching code when information
+	// from the previous scheduling cycle can be reused for this cycle. The hinted node can be used without needing to filter or
+	// score other nodes in the system. If the batching code cannot provide a hint, the function returns "".
+	// See https://github.com/kubernetes/enhancements/issues/5598
+	GetNodeHint(ctx context.Context, pod *v1.Pod, state fwk.CycleState, nodeInfos fwk.NodeInfoLister, cycleCount int64) (hint string, signature string)
+
+	// Store the results after we have sorted and filtered nodes.
+	StoreScheduleResults(ctx context.Context, signature string, hintedNode, chosenNode string, otherNodes SortedScoredNodes, cycleCount int64)
+
+	// Called when a pod successfully schedules.
+	PodSucceeded(ctx context.Context)
 
 	// RunPreBindPlugins runs the set of configured PreBind plugins. It returns
 	// *fwk.Status and its code is set to non-success if any of the plugins returns

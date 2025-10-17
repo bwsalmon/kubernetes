@@ -92,6 +92,30 @@ const (
 	PodPoppedInFlightEvent = "PodPopped"
 )
 
+// Possible batch results
+const (
+	BatchResultHint        = "hint"
+	BatchResultNoHint      = "no_hint"
+	BatchResultHintNotUsed = "hint_not_used"
+)
+
+// Possible batch events
+const (
+	BatchEventUnusableState = "unusable_state"
+)
+
+// Possible batch reasons
+const (
+	BatchEventPodFailed       = "pod_failed"
+	BatchEventPodSkipped      = "pod_skipped"
+	BatchEventNodeMissing     = "node_missing"
+	BatchEventNodeNotFull     = "node_not_full"
+	BatchEventEmptyList       = "empty_list"
+	BatchEventExpired         = "expired"
+	BatchEventPodIncompatible = "pod_incompatible"
+	BatchEventPodNotBatchable = "pod_not_batchable"
+)
+
 // All the histogram based metrics have 1ms as size for the smallest bucket.
 var (
 	scheduleAttempts           *metrics.CounterVec
@@ -103,6 +127,8 @@ var (
 	pendingPods                *metrics.GaugeVec
 	InFlightEvents             *metrics.GaugeVec
 	Goroutines                 *metrics.GaugeVec
+	BatchUsageStats            *metrics.CounterVec
+	BatchEventStats            *metrics.CounterVec
 
 	PodSchedulingSLIDuration        *metrics.HistogramVec
 	PodSchedulingAttempts           *metrics.Histogram
@@ -230,6 +256,20 @@ func InitMetrics() {
 			Help:           "Number of running goroutines split by the work they do such as binding.",
 			StabilityLevel: metrics.ALPHA,
 		}, []string{"operation"})
+	BatchUsageStats = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      SchedulerSubsystem,
+			Name:           "batch_use_total",
+			Help:           "Counts of results when we attempt to use batching.",
+			StabilityLevel: metrics.ALPHA,
+		}, []string{"result"})
+	BatchEventStats = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      SchedulerSubsystem,
+			Name:           "batch_events_total",
+			Help:           "Counts of various interesting events during batching.",
+			StabilityLevel: metrics.ALPHA,
+		}, []string{"event", "reason"})
 
 	PodSchedulingSLIDuration = metrics.NewHistogramVec(
 		&metrics.HistogramOpts{
@@ -395,6 +435,8 @@ func InitMetrics() {
 		CacheSize,
 		unschedulableReasons,
 		PluginEvaluationTotal,
+		BatchUsageStats,
+		BatchEventStats,
 	}
 }
 

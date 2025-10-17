@@ -122,6 +122,8 @@ type Scheduler struct {
 	registeredHandlers []cache.ResourceEventHandlerRegistration
 
 	nominatedNodeNameForExpectationEnabled bool
+
+	batchCycleCount int64
 }
 
 func (sched *Scheduler) applyDefaultHandlers() {
