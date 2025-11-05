@@ -311,7 +311,7 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
 		logger:               logger,
 	}
 
-	f.batch = newOpportunisticBatch(f, profile, noBatchSignatures)
+	f.batch = newOpportunisticBatch(f, profile, signUsingFramework)
 
 	if len(f.extenders) > 0 {
 		// Extender doesn't support any kind of requeueing feature like EnqueueExtensions in the scheduling framework.

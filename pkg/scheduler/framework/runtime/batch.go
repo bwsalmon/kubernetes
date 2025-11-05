@@ -28,10 +28,12 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 )
 
-type PodSignatureFunc func(p *v1.Pod) string
+type PodSignatureFunc func(h fwk.Handle, ctx context.Context, p *v1.Pod) string
 
-// Only needed until we connect signatures
-func noBatchSignatures(p *v1.Pod) string { return "" }
+func signUsingFramework(h fwk.Handle, ctx context.Context, p *v1.Pod) string {
+	sig, _ := h.SignPod(ctx, p)
+	return sig
+}
 
 // OpportunisticBatching caches results from filtering and scoring when possible to optimize
 // scheduling of common pods.
@@ -66,7 +68,7 @@ const (
 func (b *OpportunisticBatch) GetNodeHint(ctx context.Context, pod *v1.Pod, state fwk.CycleState, nodeInfos fwk.NodeInfoLister, cycleCount int64) (string, string) {
 	logger := klog.FromContext(ctx)
 
-	signature := b.signatureFunc(pod)
+	signature := b.signatureFunc(b.handle, ctx, pod)
 	logger.V(3).Info("OpportunisticBatch getting hint",
 		"profile", b.profileName, "pod", pod.GetUID(), "signature", signature, "cycleCount", cycleCount)
 
