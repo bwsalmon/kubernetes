@@ -311,7 +311,7 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
 		logger:               logger,
 	}
 
-	f.batch = newOpportunisticBatch(f, profile, noBatchSignatures)
+	f.batch = newOpportunisticBatch(f, profile, signUsingFramework)
 
 	if len(f.extenders) > 0 {
 		// Extender doesn't support any kind of requeueing feature like EnqueueExtensions in the scheduling framework.
@@ -782,6 +782,12 @@ func (f *frameworkImpl) computeBatchablePlugins() error {
 // there is no way to compare this pod against others, and will turn off a number of optimizations
 // for this pod.
 func (f *frameworkImpl) SignPod(ctx context.Context, pod *v1.Pod) (string, *fwk.Status) {
+	startTime := time.Now()
+	var status *fwk.Status
+	defer func() {
+		metrics.FrameworkExtensionPointDuration.WithLabelValues(metrics.SignPod, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
+	}()
+
 	if !f.enableSignatures {
 		return "", nil
 	}
@@ -792,7 +798,8 @@ func (f *frameworkImpl) SignPod(ctx context.Context, pod *v1.Pod) (string, *fwk.
 
 	for _, plugin := range f.batchablePlugins {
 		startTime := time.Now()
-		fragments, status := plugin.SignPod(ctx, pod)
+		var fragments []fwk.SignFragment
+		fragments, status = plugin.SignPod(ctx, pod)
 		if !status.IsSuccess() {
 			f.metricsRecorder.ObservePluginDurationAsync(metrics.SignPod, plugin.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 			return "", fwk.NewStatus(fwk.Success)
@@ -803,12 +810,10 @@ func (f *frameworkImpl) SignPod(ctx context.Context, pod *v1.Pod) (string, *fwk.
 		f.metricsRecorder.ObservePluginDurationAsync(metrics.SignPod, plugin.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
 	}
 
-	startTime := time.Now()
 	sigBytes, err := json.Marshal(sig)
 	if err != nil {
 		return "", fwk.AsStatus(fmt.Errorf("error marshalling signature object %w", err))
 	}
-	f.metricsRecorder.ObservePluginDurationAsync(metrics.SignPod, "_Json", "Success", metrics.SinceInSeconds(startTime))
 
 	return string(sigBytes), nil
 }

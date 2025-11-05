@@ -743,6 +743,9 @@ type Handle interface {
 	// Use this to ensure the scheduler's view of the cluster remains consistent.
 	// This is non-nil if the SchedulerAsyncAPICalls feature gate is enabled.
 	APICacher() APICacher
+
+	// Sign a pod.
+	SignPod(ctx context.Context, pod *v1.Pod) (string, *Status)
 }
 
 // Parallelizer helps run scheduling operations in parallel chunks where possible, to improve performance and CPU utilization.
