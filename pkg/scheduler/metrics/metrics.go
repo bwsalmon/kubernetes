@@ -63,6 +63,8 @@ var ExtensionPoints = []string{
 	Unreserve,
 	Permit,
 	SignPod,
+	GetNodeHint,
+	StoreScheduleResults,
 }
 
 const (
@@ -82,6 +84,8 @@ const (
 	Unreserve                   = "Unreserve"
 	Permit                      = "Permit"
 	SignPod                     = "SignPod"
+	GetNodeHint                 = "GetNodeHint"
+	StoreScheduleResults        = "StoreScheduleResults"
 )
 
 const (

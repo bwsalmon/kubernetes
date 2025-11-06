@@ -67,6 +67,16 @@ const (
 // current one does not fit). Note that this call does not modify state.
 func (b *OpportunisticBatch) GetNodeHint(ctx context.Context, pod *v1.Pod, state fwk.CycleState, nodeInfos fwk.NodeInfoLister, cycleCount int64) (string, string) {
 	logger := klog.FromContext(ctx)
+	var hint string
+
+	startTime := time.Now()
+	defer func() {
+		hinted := "hint"
+		if hint == "" {
+			hinted = "no_hint"
+		}
+		metrics.FrameworkExtensionPointDuration.WithLabelValues(metrics.GetNodeHint, hinted, b.profileName).Observe(metrics.SinceInSeconds(startTime))
+	}()
 
 	signature := b.signatureFunc(b.handle, ctx, pod)
 	logger.V(3).Info("OpportunisticBatch getting hint",
@@ -83,7 +93,7 @@ func (b *OpportunisticBatch) GetNodeHint(ctx context.Context, pod *v1.Pod, state
 	// Otherwise, pop the head of the list in our state and return it as
 	// a hint. Also record it in our data to compare on storage.
 	metrics.BatchUsageStats.WithLabelValues(metrics.BatchResultHint).Inc()
-	hint := b.state.sortedNodes.Pop()
+	hint = b.state.sortedNodes.Pop()
 	logger.V(3).Info("OpportunisticBatch provided node hint",
 		"profile", b.profileName, "pod", pod.GetUID(), "cycleCount", cycleCount, "hint", hint,
 		"remainingNodes", b.state.sortedNodes.Len(), "signature", signature)
@@ -94,6 +104,11 @@ func (b *OpportunisticBatch) GetNodeHint(ctx context.Context, pod *v1.Pod, state
 // Store results from scheduling for use as a batch later.
 func (b *OpportunisticBatch) StoreScheduleResults(ctx context.Context, signature, hintedNode, chosenNode string, otherNodes framework.SortedScoredNodes, cycleCount int64) {
 	logger := klog.FromContext(ctx)
+
+	startTime := time.Now()
+	defer func() {
+		metrics.FrameworkExtensionPointDuration.WithLabelValues(metrics.StoreScheduleResults, "", b.profileName).Observe(metrics.SinceInSeconds(startTime))
+	}()
 
 	// Set our cycle information for next time.
 	b.lastCycle = schedulingCycle{
