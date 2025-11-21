@@ -1,21 +1,29 @@
 package fort
 
-type StateSpec interface {
-	Source(name string)
-	Join(name, left, right string)
-	MapReduce(name string, mapper Mapper, reducer Reducer, source string)
-}
+type StateSpec interface{}
 
 func NewSpec() StateSpec {
 	return newSpec()
 }
 
+func NewSource[K comparable](s StateSpec, name string) {
+	s.(*stateSpec).Register(
+		func(s State, isClone bool) {
+			makeOrCloneMap[K](s.(*state), name, isClone)
+		},
+	)
+}
+
+func Join[LK, RK comparable](s StateSpec, name, left, right string) {
+	s.(*stateSpec).Register(newJoinFactory[LK, RK](name, left, right))
+}
+
+func MapReduce[I, O comparable](s StateSpec, name string, mapper Mapper[I, O], reducer Reducer, source string) {
+	s.(*stateSpec).Register(newMapReduceFactory(name, mapper, reducer, source))
+}
+
 type State interface {
-	Get(name string) KeyValueMap
-	Source(name string) KeyValueSource
-
 	Clone() State
-
 	Print()
 }
 
@@ -23,13 +31,25 @@ func New(spec StateSpec) State {
 	return newState(spec)
 }
 
+func Source[K comparable](s State, name string) KeyValueSource[K] {
+	v, _ := s.(*state).root.Get(name)
+	return v.(KeyValueSource[K])
+}
+
+func GetMap[K comparable](s State, name string) KeyValueMap[K] {
+	v, _ := s.(*state).root.Get(name)
+	return v.(KeyValueMap[K])
+}
+
 // Join structures
 
 // This is the value returned by a join operation.
-type JoinValue struct {
-	Left  KeyValue
-	Right KeyValue
+type JoinValue[LK, RK comparable] struct {
+	Left  KeyValue[LK]
+	Right KeyValue[RK]
 }
+
+type JoinKey [2]any
 
 // Common reducers
 
@@ -41,7 +61,7 @@ var (
 
 // MapReduce structures
 
-type Mapper func(kv *KeyValue) KeyValueSet
+type Mapper[I, O comparable] func(kv *KeyValue[I]) KeyValueSet[O]
 type Reducer func(owner any) ReducerEntry
 
 type Cloneable interface {
@@ -56,36 +76,38 @@ type ReducerEntry interface {
 	Cloneable
 }
 
+type StrTuple [2]string
+
 // Key value sets
 
-type KeyValueSource interface {
-	Update(key string, value any)
-	Delete(key string)
+type KeyValueSource[K comparable] interface {
+	Update(key K, value any)
+	Delete(key K)
 }
 
-type KeyValue struct {
-	Key   string
+type KeyValue[K comparable] struct {
+	Key   K
 	Value any
 }
 
-type KeyValueSet map[string]any
+type KeyValueSet[K comparable] []KeyValue[K]
 
-type KeyValueIterator func(yield func(key string, value any) bool)
+type KeyValueIterator[K comparable] func(yield func(key K, value any) bool)
 
-type KeyValueMap interface {
-	Get(key string) (any, bool)
-	Has(key string) bool
-	All() KeyValueIterator
+type KeyValueMap[K comparable] interface {
+	Get(key K) (any, bool)
+	Has(key K) bool
+	All() KeyValueIterator[K]
 
 	Print()
 
 	keyValueSource
 }
 
-func (s KeyValueSet) All() KeyValueIterator {
-	return func(yield func(key string, value any) bool) {
-		for key, value := range s {
-			if !yield(key, value) {
+func (s KeyValueSet[K]) All() KeyValueIterator[K] {
+	return func(yield func(key K, value any) bool) {
+		for _, kv := range s {
+			if !yield(kv.Key, kv.Value) {
 				return
 			}
 		}

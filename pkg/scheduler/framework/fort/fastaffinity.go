@@ -12,56 +12,65 @@ type aff struct {
 }
 
 func FastPodAffinity(spec StateSpec) {
-	spec.MapReduce(
+	MapReduce(
+		spec,
 		"affinityTerms",
-		func(kv *KeyValue) KeyValueSet {
+		func(kv *KeyValue[string]) KeyValueSet[string] {
 			podInfo := kv.Value.(fwk.PodInfo)
 			affinityTerms := podInfo.GetRequiredAffinityTerms()
 			antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
 			termsId, _ := json.Marshal(affinityTerms)
 			antiTermsId, _ := json.Marshal(antiAffinityTerms)
-			return KeyValueSet{
-				string(termsId):     &aff{t: affinityTerms},
-				string(antiTermsId): &aff{t: antiAffinityTerms},
+			return KeyValueSet[string]{
+				{Key: string(termsId), Value: &aff{t: affinityTerms}},
+				{Key: string(antiTermsId), Value: &aff{t: antiAffinityTerms}},
 			}
 		},
 		Identical,
 		"podInfos",
 	)
 
-	spec.MapReduce(
+	MapReduce(
+		spec,
 		"outgoingNodeAntiAffinityTerms",
-		func(kv *KeyValue) KeyValueSet {
+		func(kv *KeyValue[string]) KeyValueSet[StrTuple] {
 			podInfo := kv.Value.(fwk.PodInfo)
 			antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
 			antiTermsId, _ := json.Marshal(antiAffinityTerms)
 			nodeName := podInfo.GetPod().Spec.NodeName
-			return KeyValueSet{
-				string(antiTermsId) + "/" + nodeName: &aff{t: antiAffinityTerms},
+			return KeyValueSet[StrTuple]{
+				{
+					Key:   StrTuple{string(antiTermsId), nodeName},
+					Value: &aff{t: antiAffinityTerms},
+				},
 			}
 		},
 		Identical,
 		"podInfos",
 	)
 
-	spec.Join("podTerms", "affinityTerms", "podInfos")
+	Join[string, string](spec, "podTerms", "affinityTerms", "podInfos")
 
-	spec.MapReduce(
+	MapReduce(
+		spec,
 		"podsMatchingTermsOnNode",
-		func(kv *KeyValue) KeyValueSet {
-			val := kv.Value.(JoinValue)
+		func(kv *KeyValue[JoinKey]) KeyValueSet[StrTuple] {
+			val := kv.Value.(JoinValue[string, string])
 
 			affinityKey := val.Left.Key
 			affinityTerms := val.Left.Value.(*aff)
 			pod := val.Right.Value.(fwk.PodInfo).GetPod()
 
 			if podMatchesAllAffinityTerms(affinityTerms.t, pod) {
-				return KeyValueSet{
-					affinityKey + "/" + pod.Spec.NodeName: 1,
+				return KeyValueSet[StrTuple]{
+					{
+						Key:   StrTuple{affinityKey, pod.Spec.NodeName},
+						Value: 1,
+					},
 				}
 			}
 
-			return KeyValueSet{}
+			return KeyValueSet[StrTuple]{}
 		},
 		Identical,
 		"podTerms",
@@ -83,36 +92,29 @@ func podMatchesAllAffinityTerms(terms []fwk.AffinityTerm, pod *v1.Pod) bool {
 	return true
 }
 
-func Filter(nodeInfo fwk.NodeInfo, podInfo fwk.PodInfo, state State, matchingAffinityTerms []string) bool {
+func Filter(nodeInfo fwk.NodeInfo, podInfo fwk.PodInfo, state State, matchingAffinityTerms []string, affinityTerms string, antiAffinityTerms string, matchingPods KeyValueMap[StrTuple], outgoing KeyValueMap[StrTuple]) bool {
 	nodeName := nodeInfo.Node().Name
-
-	matchingPods := state.Get("podsMatchingTermsOnNode")
 
 	// If our pod has affinity terms and the node does not have
 	// a pod that matches, then we cannot use the node.
-	affinityTerms := podInfo.GetRequiredAffinityTerms()
 	if len(affinityTerms) > 0 {
-		termsId, _ := json.Marshal(affinityTerms)
-		if !matchingPods.Has(string(termsId) + "/" + nodeName) {
+		if !matchingPods.Has(StrTuple{affinityTerms, nodeName}) {
 			return false
 		}
 	}
 
 	// If our pod has anti-affinity terms and the node has some
 	// pod that matches, then we cannot use the node.
-	antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
-	if len(affinityTerms) > 0 {
-		termsId, _ := json.Marshal(antiAffinityTerms)
-		if matchingPods.Has(string(termsId) + "/" + nodeName) {
+	if len(antiAffinityTerms) > 0 {
+		if matchingPods.Has(StrTuple{antiAffinityTerms, nodeName}) {
 			return false
 		}
 	}
 
 	// If the node has pods with outgoing anti-affinity terms that
 	// match us, then we can't use the node.
-	outgoing := state.Get("outgoingNodeAntiAffinityTerms")
 	for _, termId := range matchingAffinityTerms {
-		if outgoing.Has(termId + "/" + nodeName) {
+		if outgoing.Has(StrTuple{termId, nodeName}) {
 			return false
 		}
 	}
@@ -122,7 +124,7 @@ func Filter(nodeInfo fwk.NodeInfo, podInfo fwk.PodInfo, state State, matchingAff
 
 func getPodMatchingAffinityTerms(pod fwk.PodInfo, state State) []string {
 	matching := []string{}
-	terms := state.Get("affinityTerms")
+	terms := GetMap[string](state, "affinityTerms")
 	for termId, terms := range terms.All() {
 		if podMatchesAllAffinityTerms(terms.(*aff).t, pod.GetPod()) {
 			matching = append(matching, termId)
@@ -133,18 +135,45 @@ func getPodMatchingAffinityTerms(pod fwk.PodInfo, state State) []string {
 
 func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 	spec := NewSpec()
-	spec.Source("podInfos")
+	NewSource[string](spec, "podInfos")
 	FastPodAffinity(spec)
 
 	state := New(spec)
 
-	podMap := state.Source("podInfos")
+	podMap := Source[string](state, "podInfos")
+	matchingPods := GetMap[StrTuple](state, "podsMatchingTermsOnNode")
+	outgoing := GetMap[StrTuple](state, "outgoingNodeAntiAffinityTerms")
 
-	for _, pod := range pods {
-		matching := getPodMatchingAffinityTerms(pod, state)
-		for _, node := range nodes {
-			Filter(node, pod, state, matching)
+	for _, podInfo := range pods {
+		matching := getPodMatchingAffinityTerms(podInfo, state)
+
+		// If our pod has affinity terms and the node does not have
+		// a pod that matches, then we cannot use the node.
+		affinityTerms := podInfo.GetRequiredAffinityTerms()
+		aff := ""
+		if len(affinityTerms) > 0 {
+			termsId, _ := json.Marshal(affinityTerms)
+			aff = string(termsId)
 		}
-		podMap.Update(string(pod.GetPod().GetUID()), pod)
+
+		// If our pod has anti-affinity terms and the node has some
+		// pod that matches, then we cannot use the node.
+		antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
+		anti := ""
+		if len(affinityTerms) > 0 {
+			termsId, _ := json.Marshal(antiAffinityTerms)
+			anti = string(termsId)
+		}
+
+		currNode := nodes[0]
+		for _, node := range nodes {
+			if Filter(node, podInfo, state, matching, aff, anti, matchingPods, outgoing) &&
+				len(node.GetPods()) < 5 {
+				currNode = node
+			}
+		}
+
+		podInfo.GetPod().Spec.NodeName = currNode.Node().Name
+		podMap.Update(string(podInfo.GetPod().GetUID()), podInfo)
 	}
 }

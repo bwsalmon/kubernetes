@@ -2,12 +2,8 @@ package fort
 
 import (
 	"fmt"
-	"log"
 	"math/rand"
-	"os"
-	"runtime/pprof"
 	"testing"
-	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,18 +27,19 @@ type TestData struct {
 }
 
 func TestFastAffinity(t *testing.T) {
-	f, err := os.Create("profile.pprof")
-	if err != nil {
-		log.Fatal(err)
-	}
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
-	rand.Seed(time.Now().UnixNano())
+	/*
+		f, err := os.Create("profile.pprof")
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+		rand.Seed(time.Now().UnixNano())
+	*/
 
 	// Generate 10 nodes with 50 existing pods spread across them
 	// Generate 20 incoming pods with various affinity rules
-	data := GenerateSchedulerTestData(1000, 20000, 40000)
+	data := GenerateSchedulerTestData(10000, 20000, 40000)
 
 	fmt.Printf("Generated %d Nodes and %d Incoming Pods.\n", len(data.Nodes), len(data.IncomingPods))
 	fmt.Printf("Example Node: %s (Zone: %s)\n", data.Nodes[0].Node().Name, data.Nodes[0].Node().Labels["topology.kubernetes.io/zone"])

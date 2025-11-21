@@ -2,20 +2,20 @@ package fort
 
 import "log"
 
-func newMapReduceFactory(name string, mapper Mapper, reducer Reducer, source string) StateUpdateFunc {
+func newMapReduceFactory[I, O comparable](name string, mapper Mapper[I, O], reducer Reducer, source string) StateUpdateFunc {
 	return func(s State, isClone bool) {
 		st := s.(*state)
 
-		mr := &mapReducer{
+		mr := &mapReducer[I, O]{
 			owner:          nil,
 			mapper:         mapper,
 			reducer:        reducer,
-			mapperResults:  st.makeOrCloneMap("_mapper_"+name, isClone),
-			reducerResults: st.makeOrCloneMap("_reducer_"+name, isClone),
-			results:        st.makeOrCloneMap(name, isClone),
+			mapperResults:  makeOrCloneMap[I](st, "_mapper_"+name, isClone),
+			reducerResults: makeOrCloneMap[O](st, "_reducer_"+name, isClone),
+			results:        makeOrCloneMap[O](st, name, isClone),
 		}
 
-		sourceObj := st.Get(source)
+		sourceObj := GetMap[I](s, source)
 		if sourceObj == nil {
 			log.Fatalf("Couldn't find source %s", source)
 		}
@@ -23,35 +23,35 @@ func newMapReduceFactory(name string, mapper Mapper, reducer Reducer, source str
 	}
 }
 
-type mapReducer struct {
-	owner          *CloneMap
-	mapper         Mapper
-	mapperResults  *CloneMap
+type mapReducer[I, O comparable] struct {
+	owner          any
+	mapper         Mapper[I, O]
+	mapperResults  *CloneMap[I]
 	reducer        Reducer
-	reducerResults *CloneMap
-	results        *CloneMap
+	reducerResults *CloneMap[O]
+	results        *CloneMap[O]
 }
 
-var _ keyValueTarget = &mapReducer{}
+var _ keyValueTarget = &mapReducer[string, string]{}
 
-func (m *mapReducer) onUpdate(kv *KeyValue, source keyValueSource) {
-	results := m.mapper(kv)
-	for key, value := range results {
-		m.addToResults(key, value)
+func (m *mapReducer[I, O]) onUpdate(key any, value any, source keyValueSource) {
+	results := m.mapper(&KeyValue[I]{Key: key.(I), Value: value})
+	for _, res := range results {
+		m.addToResults(res.Key, res.Value)
 	}
-	m.mapperResults.Update(kv.Key, results)
+	m.mapperResults.Update(key.(I), results)
 }
 
-func (m *mapReducer) onDelete(kv *KeyValue, source keyValueSource) {
-	if existing, found := m.mapperResults.Get(kv.Key); found {
-		for key, value := range existing.(KeyValueSet) {
-			m.removeFromResults(key, value)
+func (m *mapReducer[I, O]) onDelete(key any, value any, source keyValueSource) {
+	if existing, found := m.mapperResults.Get(key.(I)); found {
+		for _, kv := range existing.(KeyValueSet[O]) {
+			m.removeFromResults(kv.Key, kv.Value)
 		}
 	}
-	m.mapperResults.Delete(kv.Key)
+	m.mapperResults.Delete(key.(I))
 }
 
-func (m *mapReducer) addToResults(key string, value any) {
+func (m *mapReducer[I, O]) addToResults(key O, value any) {
 	var mutable ReducerEntry
 
 	existing, found := m.reducerResults.Get(key)
@@ -69,7 +69,7 @@ func (m *mapReducer) addToResults(key string, value any) {
 	m.results.Update(key, mutable.Value())
 }
 
-func (m *mapReducer) removeFromResults(key string, value any) {
+func (m *mapReducer[I, O]) removeFromResults(key O, value any) {
 	if existing, found := m.reducerResults.Get(key); found {
 		mutable := existing.(ReducerEntry).Clone(m.owner).(ReducerEntry)
 		if mutable.Remove(value) {

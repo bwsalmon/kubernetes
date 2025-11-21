@@ -8,8 +8,8 @@ import (
 type StateUpdateFunc func(s State, clonedState bool)
 
 type keyValueTarget interface {
-	onUpdate(kv *KeyValue, source keyValueSource)
-	onDelete(kv *KeyValue, source keyValueSource)
+	onUpdate(key any, value any, source keyValueSource)
+	onDelete(key any, value any, source keyValueSource)
 }
 
 type keyValueSource interface {
@@ -27,15 +27,7 @@ func newState(spec StateSpec) State {
 
 type state struct {
 	spec StateSpec
-	root *CloneMap
-}
-
-func (s *state) Source(name string) KeyValueSource {
-	return Get[*CloneMap](s.root, name)
-}
-
-func (s *state) Get(name string) KeyValueMap {
-	return Get[KeyValueMap](s.root, name)
+	root *CloneMap[string]
 }
 
 func (s *state) Clone() State {
@@ -56,15 +48,15 @@ func (s *state) Clone() State {
 	return newState
 }
 
-func (s *state) makeOrCloneMap(name string, isClone bool) *CloneMap {
+func makeOrCloneMap[K comparable](s *state, name string, isClone bool) *CloneMap[K] {
 	if isClone {
 		if v, found := s.root.Get(name); found {
-			return v.(*CloneMap)
+			return v.(*CloneMap[K])
 		}
 		log.Fatalf("Couldn't find map %s", name)
 	}
 
-	nm := newCloneMap(map[string]any{}, nil, s.root, 0)
+	nm := newCloneMap(map[K]any{}, nil, s.root, 0)
 	s.root.Update(name, nm)
 	return nm
 }
@@ -73,7 +65,7 @@ func (s *state) Print() {
 	fmt.Printf("State{\n")
 	for name, cmap := range s.root.All() {
 		fmt.Printf("  %s:\n", name)
-		cmap.(*CloneMap).Print()
+		cmap.(*CloneMap[any]).Print()
 	}
 	fmt.Printf("}\n")
 }
@@ -96,24 +88,4 @@ func (s *stateSpec) Update(st *state, clonedState bool) {
 	for _, f := range s.updateFuncs {
 		f(st, clonedState)
 	}
-}
-
-func (s *stateSpec) Source(name string) {
-	s.Register(
-		func(s State, isClone bool) {
-			s.(*state).makeOrCloneMap(name, isClone)
-		},
-	)
-}
-
-func (s *stateSpec) Join(name, left, right string) {
-	s.Register(
-		newJoinFactory(name, left, right),
-	)
-}
-
-func (s *stateSpec) MapReduce(name string, mapper Mapper, reducer Reducer, source string) {
-	s.Register(
-		newMapReduceFactory(name, mapper, reducer, source),
-	)
 }
