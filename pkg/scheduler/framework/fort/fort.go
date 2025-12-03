@@ -14,8 +14,16 @@ func NewSource[K comparable](s StateSpec, name string) {
 	)
 }
 
-func Join[LK, RK comparable](s StateSpec, name, left, right string) {
-	s.(*stateSpec).Register(newJoinFactory[LK, RK](name, left, right))
+func FullJoin[LK, RK comparable](s StateSpec, name, left, right string) {
+	Join(s, name, left, right, getAllItems[LK, RK], getAllItems[RK, LK])
+}
+
+func KeyJoin[K comparable](s StateSpec, name, left, right string) {
+	Join(s, name, left, right, lookupByKey[K], lookupByKey[K])
+}
+
+func Join[LK, RK comparable](s StateSpec, name, left, right string, leftLookup LookupFunc[RK, LK], rightLookup LookupFunc[LK, RK]) {
+	s.(*stateSpec).Register(newJoinFactory(name, left, right, leftLookup, rightLookup))
 }
 
 func MapReduce[I, O comparable](s StateSpec, name string, mapper Mapper[I, O], reducer Reducer, source string) {
@@ -43,10 +51,12 @@ func GetMap[K comparable](s State, name string) KeyValueMap[K] {
 
 // Join structures
 
+type LookupFunc[S, T comparable] func(sourceItem *KeyValue[S], targetItems *CloneMap[T]) KeyValueIterator[T]
+
 // This is the value returned by a join operation.
 type JoinValue[LK, RK comparable] struct {
-	Left  KeyValue[LK]
-	Right KeyValue[RK]
+	Left  *KeyValue[LK]
+	Right *KeyValue[RK]
 }
 
 type JoinKey [2]any
@@ -63,6 +73,7 @@ var (
 
 type Mapper[I, O comparable] func(kv *KeyValue[I]) KeyValueSet[O]
 type Reducer func(owner any) ReducerEntry
+type KeyFunc[I, O comparable] func(key I, value any) O
 
 type Cloneable interface {
 	Clone(root any) Cloneable

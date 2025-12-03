@@ -30,6 +30,13 @@ func FastPodAffinity(spec StateSpec) {
 		"podInfos",
 	)
 
+	KeyJoin[string](
+		spec,
+		"podNodeInfos",
+		"podInfos",
+		"nodeInfos",
+	)
+
 	MapReduce(
 		spec,
 		"outgoingNodeAntiAffinityTerms",
@@ -49,7 +56,7 @@ func FastPodAffinity(spec StateSpec) {
 		"podInfos",
 	)
 
-	Join[string, string](spec, "podTerms", "affinityTerms", "podInfos")
+	FullJoin[string, string](spec, "podTerms", "affinityTerms", "podInfos")
 
 	MapReduce(
 		spec,
