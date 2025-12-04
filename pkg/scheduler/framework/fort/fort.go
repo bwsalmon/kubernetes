@@ -1,6 +1,10 @@
 /*
-Fort is a database-lite (a datafort). It is an in-memory engine for mapreduce and join operations.
+Fort is almost a database (its a datafort!). It is an in-memory engine for mapreduce and
+join operations. All data in fort is represented as memory key-value maps.
+All the results of mapreduces and joins are automatically updated as source data is updated.
 All of the maps are fast cloneable so the entire "db" can be cloned quickly.
+This makes it simple to generate complex data structures that are automatically
+updated as data changes, and are easily fast cloneable.
 */
 package fort
 

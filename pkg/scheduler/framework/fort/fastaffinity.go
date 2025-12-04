@@ -11,7 +11,15 @@ type aff struct {
 	t []fwk.AffinityTerm
 }
 
+// Set up data structures for filtering based on pod affinity.
 func FastPodAffinity(spec StateSpec) {
+	// XXX Note that in a real implementation we need to use topology terms
+	// rather than node names, but this is a good first approximation of
+	// cost (it assumes only node topology terms).
+	// Adding additional topology terms should be nominally more expensive, but probably
+	// doesn't add much fidelity to the model.
+
+	// Generate a set of unique affinityTerms across all pods in the system.
 	MapReduce(
 		spec,
 		"affinityTerms",
@@ -29,6 +37,9 @@ func FastPodAffinity(spec StateSpec) {
 		Identical,
 		"podInfos",
 	)
+
+	// Generate a set of antiAffinityTerms found on at least one pod
+	// on each node in the system.
 
 	MapReduce(
 		spec,
@@ -49,8 +60,15 @@ func FastPodAffinity(spec StateSpec) {
 		"podInfos",
 	)
 
+	// Generate a set of affinity term / node pairs, where the given node
+	// has at least one pod matching that term.
+
+	// Start by pairing each affinity term with each pod.
 	FullJoin[string, string](spec, "podTerms", "affinityTerms", "podInfos")
 
+	// Then use map reduce to see if each pod matches the corresponding
+	// affinity term. If it does, track that the node hosting the pod
+	// has a pod matching the given term.
 	MapReduce(
 		spec,
 		"podsMatchingTermsOnNode",
