@@ -57,6 +57,13 @@ func Join[LK, RK comparable](s StateSpec, name, left, right string, leftLookup L
 }
 
 // Run map reduce on a given input map and generate a new map based on the operation.
+//
+// Logically map reduce will:
+//   - call the mapper function on each key value pair in the original map. The mapper
+//     function returns one or more key value pairs generated from the source key value pair.
+//   - aggregate the results of all the mapper calls by key.
+//   - call the reducer function on the set of values with a given key.
+//   - save the reducer output in the result map with the given key.
 func MapReduce[I, O comparable](s StateSpec, name string, mapper Mapper[I, O], reducer Reducer, source string) {
 	s.(*stateSpec).Register(newMapReduceFactory(name, mapper, reducer, source))
 }
