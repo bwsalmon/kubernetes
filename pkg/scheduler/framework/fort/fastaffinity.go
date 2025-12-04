@@ -30,13 +30,6 @@ func FastPodAffinity(spec StateSpec) {
 		"podInfos",
 	)
 
-	KeyJoin[string](
-		spec,
-		"podNodeInfos",
-		"podInfos",
-		"nodeInfos",
-	)
-
 	MapReduce(
 		spec,
 		"outgoingNodeAntiAffinityTerms",
