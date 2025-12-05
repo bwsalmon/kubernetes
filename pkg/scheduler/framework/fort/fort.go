@@ -39,21 +39,17 @@ type KeyValueSource[K comparable] interface {
 // This will create a new map with one entry for each pair of entries in the source maps.
 // The keys are JoinKey objects and the values are JoinValue objects.
 func FullJoin[LK, RK comparable](s StateSpec, name, left, right string) {
-	Join(s, name, left, right, getAllItems[LK, RK], getAllItems[RK, LK])
+	Join(s, name, left, right, fullJoinMatcherFactory[LK, RK])
 }
 
-// Define a new map created by doing a "key join" between two maps on the given spec.
-// This creates a single entry for the objects with the same key in
-// the two source maps. If both maps do not have a key, then no
-// value is generated for that key. The key is the same as the input
-// key, and the value is a JoinValue.
-func KeyJoin[K comparable](s StateSpec, name, left, right string) {
-	Join(s, name, left, right, lookupByKey[K], lookupByKey[K])
-}
+type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
 
-// Internal join operator used to implement FullJoin and KeyJoin.
-func Join[LK, RK comparable](s StateSpec, name, left, right string, leftLookup LookupFunc[RK, LK], rightLookup LookupFunc[LK, RK]) {
-	s.(*stateSpec).Register(newJoinFactory(name, left, right, leftLookup, rightLookup))
+// Define a new map created by joining two source maps on the given spec.
+// This performs a "one-to-many" join between the two source maps.
+// It will create a new map with one entry for each item in left with the corresponding
+// entry given by the key returned from the lookup function provided.
+func LookupJoin[LK, RK comparable](s StateSpec, name, left, right string, lookupFunc LookupFunc[LK, RK]) {
+	Join(s, name, left, right, lookupJoinMatcherFactory(lookupFunc))
 }
 
 // Run map reduce on a given input map and generate a new map based on the operation.
@@ -102,13 +98,8 @@ type KeyValueMap[K comparable] interface {
 	All() KeyValueIterator[K]
 
 	Print()
-
 	keyValueSource
 }
-
-// Join structures
-
-type LookupFunc[S, T comparable] func(sourceItem *KeyValue[S], targetItems *CloneMap[T]) KeyValueIterator[T]
 
 // This is the value returned by a join operation.
 type JoinValue[LK, RK comparable] struct {

@@ -7,6 +7,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 type aff struct {
@@ -195,8 +196,9 @@ func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 			}
 		}
 
-		podInfo.GetPod().Spec.NodeName = currNode.Node().Name
-		podMap.Update(string(podInfo.GetPod().GetUID()), podInfo)
+		newPodInfo, _ := framework.NewPodInfo(podInfo.GetPod().DeepCopy())
+		newPodInfo.GetPod().Spec.NodeName = currNode.Node().Name
+		podMap.Update(string(newPodInfo.GetPod().GetUID()), newPodInfo)
 	}
 
 	stop := time.Now()
