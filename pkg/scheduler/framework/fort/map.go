@@ -52,8 +52,13 @@ func (m *CloneMap[K]) Has(key K) bool {
 
 func (m *CloneMap[K]) getLocked(key K) (any, bool) {
 	v, found := m.data[key]
+
 	if !found && m.base != nil {
 		v, found = m.base.Get(key)
+	}
+
+	if v == tombstone {
+		return nil, false
 	}
 
 	return v, found
@@ -65,8 +70,10 @@ func (m *CloneMap[K]) All() KeyValueIterator[K] {
 		defer m.lock.RUnlock()
 
 		for key, value := range m.data {
-			if !yield(key, value) {
-				return
+			if value != tombstone {
+				if !yield(key, value) {
+					return
+				}
 			}
 		}
 		if m.base != nil {
@@ -118,6 +125,10 @@ func (m *CloneMap[K]) deleteNoCallback(key K, callback *KeyValue[K]) bool {
 		if m.base == nil {
 			delete(m.data, key)
 		} else {
+			// Note that if the key doesn't exist in our base map
+			// we are adding an unnecessary entry, but we will remove it
+			// when we do the merge later, so we avoid doing a
+			// lookup in the base map here.
 			m.data[key] = tombstone
 		}
 
@@ -133,7 +144,7 @@ func (m *CloneMap[K]) Clone(root any) Cloneable {
 	defer m.lock.Unlock()
 
 	if m.root != root {
-		newBase := newCloneMap[K](m.data, m.base, m.root, 2)
+		newBase := newCloneMap(m.data, m.base, m.root, 2)
 
 		m.data = map[K]any{}
 		m.base = newBase
