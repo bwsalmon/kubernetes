@@ -35,11 +35,19 @@ type mapReducer[I, O comparable] struct {
 var _ keyValueTarget = &mapReducer[string, string]{}
 
 func (m *mapReducer[I, O]) onUpdate(key any, value any, source keyValueSource) {
+	existingResults, foundExistingResults := m.mapperResults.Get(key.(I))
+
 	results := m.mapper(&KeyValue[I]{Key: key.(I), Value: value})
 	for _, res := range results {
 		m.addToResults(res.Key, res.Value)
 	}
 	m.mapperResults.Update(key.(I), results)
+
+	if foundExistingResults {
+		for _, kv := range existingResults.(KeyValueSet[O]) {
+			m.removeFromResults(kv.Key, kv.Value)
+		}
+	}
 }
 
 func (m *mapReducer[I, O]) onDelete(key any, value any, source keyValueSource) {

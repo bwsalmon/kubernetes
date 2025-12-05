@@ -148,6 +148,12 @@ type StrTuple [2]string
 
 // Key value sets
 
+// Key value.
+// Note that the keyvalue pair is
+// templated by key type but not result type.
+// This is because arbitrary length key generation is
+// expensive; typing the keys allows us to avoid this
+// issue.
 type KeyValue[K comparable] struct {
 	Key   K
 	Value any

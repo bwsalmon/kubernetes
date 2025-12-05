@@ -2,6 +2,8 @@ package fort
 
 import (
 	"encoding/json"
+	"fmt"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -162,6 +164,8 @@ func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 	matchingPods := GetMap[StrTuple](state, "podsMatchingTermsOnNode")
 	outgoing := GetMap[StrTuple](state, "outgoingNodeAntiAffinityTerms")
 
+	start := time.Now()
+
 	for _, podInfo := range pods {
 		matching := getPodMatchingAffinityTerms(podInfo, state)
 
@@ -194,4 +198,7 @@ func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 		podInfo.GetPod().Spec.NodeName = currNode.Node().Name
 		podMap.Update(string(podInfo.GetPod().GetUID()), podInfo)
 	}
+
+	stop := time.Now()
+	fmt.Printf("Time %f", float64(stop.Sub(start))/float64(time.Second))
 }

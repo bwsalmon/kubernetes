@@ -39,7 +39,7 @@ func TestFastAffinity(t *testing.T) {
 
 	// Generate 10 nodes with 50 existing pods spread across them
 	// Generate 20 incoming pods with various affinity rules
-	data := GenerateSchedulerTestData(10000, 20000, 40000)
+	data := GenerateSchedulerTestData(5000, 0, 500000)
 
 	fmt.Printf("Generated %d Nodes and %d Incoming Pods.\n", len(data.Nodes), len(data.IncomingPods))
 	fmt.Printf("Example Node: %s (Zone: %s)\n", data.Nodes[0].Node().Name, data.Nodes[0].Node().Labels["topology.kubernetes.io/zone"])
