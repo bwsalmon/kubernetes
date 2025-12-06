@@ -37,9 +37,10 @@ type KeyValueSource[K comparable] interface {
 
 // Define a new map created by joining two source maps on the given spec.
 // This will create a new map with one entry for each pair of entries in the source maps.
-// The keys are JoinKey objects and the values are JoinValue objects.
+// The keys of the resulting map will be a JoinKey, the values will be a JoinValue.
 func FullJoin[LK, RK comparable](s StateSpec, name, left, right string) {
-	Join(s, name, left, right, fullJoinMatcherFactory[LK, RK])
+	st := s.(*stateSpec)
+	st.Register(fullJoinFactory[LK, RK](name, left, right))
 }
 
 type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
@@ -48,8 +49,10 @@ type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
 // This performs a "one-to-many" join between the two source maps.
 // It will create a new map with one entry for each item in left with the corresponding
 // entry given by the key returned from the lookup function provided.
+// The keys of the resulting map will be the keys from the left map, the values will be a JoinValue.
 func LookupJoin[LK, RK comparable](s StateSpec, name, left, right string, lookupFunc LookupFunc[LK, RK]) {
-	Join(s, name, left, right, lookupJoinMatcherFactory(lookupFunc))
+	st := s.(*stateSpec)
+	st.Register(lookupJoinFactory(name, left, right, lookupFunc))
 }
 
 // Run map reduce on a given input map and generate a new map based on the operation.
