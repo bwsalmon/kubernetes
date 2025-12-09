@@ -41,6 +41,11 @@ type Snapshot struct {
 	// keyed in the format "namespace/name".
 	usedPVCSet sets.Set[string]
 	generation int64
+	nodeState  map[string]SnapshotState
+}
+
+type SnapshotState interface {
+	Update(old fwk.NodeInfo, current fwk.NodeInfo)
 }
 
 var _ fwk.SharedLister = &Snapshot{}

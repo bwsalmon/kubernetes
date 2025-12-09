@@ -1,25 +1,30 @@
 package fort
 
-import "log"
+import (
+	"log"
+	"maps"
+)
 
-func newMapReduceFactory[I, O comparable](name string, mapper Mapper[I, O], reducer Reducer, source string) StateUpdateFunc {
-	return func(s State, isClone bool) {
+func newMapReduceFactory[I, O comparable](mapper Mapper[I, O], reducer Reducer, source string) SourceSpec {
+	return func(s State, name string, isClone bool) any {
 		st := s.(*state)
 
 		mr := &mapReducer[I, O]{
 			owner:          nil,
 			mapper:         mapper,
 			reducer:        reducer,
-			mapperResults:  makeOrCloneMap[I](st, "_mapper_"+name, isClone),
-			reducerResults: makeOrCloneMap[O](st, "_reducer_"+name, isClone),
+			mapperResults:  makeOrCloneMap[I](st, "@mapper_"+name, isClone),
+			reducerResults: makeOrCloneMap[O](st, "@reducer_"+name, isClone),
 			results:        makeOrCloneMap[O](st, name, isClone),
 		}
 
-		sourceObj := GetMap[I](s, source)
+		sourceObj := GetSource(s, source)
 		if sourceObj == nil {
 			log.Fatalf("Couldn't find source %s", source)
 		}
 		sourceObj.addTarget(mr)
+
+		return mr.results
 	}
 }
 
@@ -32,9 +37,9 @@ type mapReducer[I, O comparable] struct {
 	results        *CloneMap[O]
 }
 
-var _ keyValueTarget = &mapReducer[string, string]{}
+var _ KeyValueTarget = &mapReducer[string, string]{}
 
-func (m *mapReducer[I, O]) onUpdate(key any, value any, source keyValueSource) {
+func (m *mapReducer[I, O]) onUpdate(key any, value any, source KeyValueSource) {
 	existingResults, foundExistingResults := m.mapperResults.Get(key.(I))
 
 	results := m.mapper(&KeyValue[I]{Key: key.(I), Value: value})
@@ -50,7 +55,7 @@ func (m *mapReducer[I, O]) onUpdate(key any, value any, source keyValueSource) {
 	}
 }
 
-func (m *mapReducer[I, O]) onDelete(key any, value any, source keyValueSource) {
+func (m *mapReducer[I, O]) onDelete(key any, value any, source KeyValueSource) {
 	if existing, found := m.mapperResults.Get(key.(I)); found {
 		for _, kv := range existing.(KeyValueSet[O]) {
 			m.removeFromResults(kv.Key, kv.Value)
@@ -119,7 +124,7 @@ func (c *counter) Clone(owner any) Cloneable {
 	return c
 }
 
-func IdenticalReducer(owner any) ReducerEntry {
+func AnyValueReducer(owner any) ReducerEntry {
 	return &identical{owner: owner}
 }
 
@@ -152,45 +157,94 @@ func (s *identical) Clone(owner any) Cloneable {
 	return s
 }
 
-func SumListReducer(listLength int) Reducer {
-	return func(owner any) ReducerEntry {
-		return &sumListReducer{sums: make([]int64, listLength)}
+func MakeMap[K comparable](owner any) ReducerEntry {
+	return &makeMapReducer[K]{
+		owner:  owner,
+		values: make(MakeMapMap[K]),
 	}
 }
 
-type sumListReducer struct {
-	owner any
-	sums  []int64
+type MakeMapValue struct {
+	Count int64
+	Value any
 }
 
-func (s *sumListReducer) Add(value any) {
-	v := value.([]int64)
-	for i := range v {
-		s.sums[i] += v[i]
-	}
+type MakeMapMap[K comparable] map[K]MakeMapValue
+
+type makeMapReducer[K comparable] struct {
+	owner  any
+	values MakeMapMap[K]
 }
 
-func (s *sumListReducer) Remove(value any) bool {
-	allZero := true
-	v := value.([]int64)
-	for i := range v {
-		s.sums[i] -= v[i]
-		if s.sums[i] != 0 {
-			allZero = false
+func (m *makeMapReducer[K]) Add(value any) {
+	kv := value.(KeyValue[K])
+	if curr, found := m.values[kv.Key]; found {
+		m.values[kv.Key] = MakeMapValue{
+			Count: curr.Count + 1,
+			Value: kv.Value,
+		}
+	} else {
+		m.values[kv.Key] = MakeMapValue{
+			Count: 1,
+			Value: kv.Value,
 		}
 	}
-	return allZero
 }
 
-func (s *sumListReducer) Value() any {
-	return s.sums
+func (m *makeMapReducer[K]) Remove(value any) bool {
+	kv := value.(KeyValue[K])
+	if curr, found := m.values[kv.Key]; found {
+		if curr.Count > 1 {
+			m.values[kv.Key] = MakeMapValue{
+				Count: curr.Count - 1,
+				Value: kv.Value,
+			}
+		} else {
+			delete(m.values, kv.Key)
+		}
+	}
+	return len(m.values) == 0
 }
 
-func (s *sumListReducer) Clone(owner any) Cloneable {
+func (m *makeMapReducer[K]) Value() any {
+	return m.values
+}
+
+func (m *makeMapReducer[K]) Clone(owner any) Cloneable {
+	if owner != m.owner {
+		return &makeMapReducer[K]{
+			owner:  owner,
+			values: maps.Clone(m.values),
+		}
+	}
+	return m
+}
+
+func SumReducer(owner any) ReducerEntry {
+	return &sumReducer{owner: owner}
+}
+
+type sumReducer struct {
+	owner any
+	sum   int
+}
+
+func (s *sumReducer) Add(value any) {
+	s.sum += value.(int)
+}
+
+func (s *sumReducer) Remove(value any) bool {
+	s.sum -= value.(int)
+	return s.sum == 0
+}
+
+func (s *sumReducer) Value() any {
+	return s.sum
+}
+
+func (s *sumReducer) Clone(owner any) Cloneable {
 	if owner != s.owner {
-		newList := make([]int64, len(s.sums))
-		copy(newList, s.sums)
-		return &sumListReducer{owner: s.owner, sums: newList}
+		return &sumReducer{owner: owner, sum: s.sum}
 	}
 	return s
 }

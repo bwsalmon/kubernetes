@@ -12,10 +12,11 @@ type CloneMap[K comparable] struct {
 	data       map[K]any
 	base       *CloneMap[K]
 	root       any
-	targets    []keyValueTarget
+	targets    []KeyValueTarget
 }
 
 var _ KeyValueMap[string] = &CloneMap[string]{}
+var _ KeyValueSource = &CloneMap[string]{}
 
 func newCloneMap[K comparable](data map[K]any, base *CloneMap[K], root any, references int64) *CloneMap[K] {
 	newMap := &CloneMap[K]{
@@ -217,7 +218,7 @@ func updateLockedMaps[K comparable](dest map[K]any, src map[K]any) {
 	}
 }
 
-func (m *CloneMap[K]) addTarget(target keyValueTarget) {
+func (m *CloneMap[K]) addTarget(target KeyValueTarget) {
 	m.targets = append(m.targets, target)
 }
 
@@ -231,6 +232,14 @@ func (m *CloneMap[K]) callOnDelete(kv *KeyValue[K]) {
 	for _, target := range m.targets {
 		target.onDelete(kv.Key, kv.Value, m)
 	}
+}
+
+func (m *CloneMap[K]) onUpdate(key any, value any, _ KeyValueSource) {
+	m.Update(key.(K), value)
+}
+
+func (m *CloneMap[K]) onDelete(key any, value any, _ KeyValueSource) {
+	m.Delete(key.(K))
 }
 
 func (m *CloneMap[K]) Print() {

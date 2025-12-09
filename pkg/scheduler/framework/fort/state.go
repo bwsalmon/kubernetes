@@ -5,15 +5,49 @@ import (
 	"log"
 )
 
-type StateUpdateFunc func(s State, clonedState bool)
+type SourceSpec func(s State, name string, clonedState bool) any
 
-type keyValueTarget interface {
-	onUpdate(key any, value any, source keyValueSource)
-	onDelete(key any, value any, source keyValueSource)
+type keyValueConnector[K comparable] struct {
+	targets []KeyValueTarget
 }
 
-type keyValueSource interface {
-	addTarget(target keyValueTarget)
+var _ KeyValueSource = &keyValueConnector[string]{}
+
+func newKeyValueConnector[K comparable]() *keyValueConnector[K] {
+	return &keyValueConnector[K]{
+		targets: []KeyValueTarget{},
+	}
+}
+
+func (m *keyValueConnector[K]) addTarget(target KeyValueTarget) {
+	m.targets = append(m.targets, target)
+}
+
+func (m *keyValueConnector[K]) Update(key K, value any) {
+	for _, target := range m.targets {
+		target.onUpdate(key, value, m)
+	}
+}
+
+func (m *keyValueConnector[K]) Delete(key K, value any) {
+	for _, target := range m.targets {
+		target.onDelete(key, value, m)
+	}
+}
+
+func newMaterializer[K comparable](source string) SourceSpec {
+	return func(s State, name string, isClone bool) any {
+		st := s.(*state)
+		v, _ := st.root.Get(source)
+		if mapValue, isMap := v.(*CloneMap[K]); isMap {
+			return mapValue
+		}
+
+		sourceValue := v.(KeyValueSource)
+		newMap := makeOrCloneMap[K](st, name, isClone)
+		sourceValue.addTarget(newMap)
+		return newMap
+	}
 }
 
 func newState(spec StateSpec) State {
@@ -70,22 +104,38 @@ func (s *state) Print() {
 	fmt.Printf("}\n")
 }
 
+type specName struct {
+	name string
+	spec SourceSpec
+}
+
 type stateSpec struct {
-	updateFuncs []StateUpdateFunc
+	specMap map[string]bool
+	specs   []specName
 }
 
 func newSpec() *stateSpec {
 	return &stateSpec{
-		updateFuncs: []StateUpdateFunc{},
+		specMap: map[string]bool{},
+		specs:   []specName{},
 	}
 }
 
-func (s *stateSpec) Register(f StateUpdateFunc) {
-	s.updateFuncs = append(s.updateFuncs, f)
+func (s *stateSpec) New(name string, spec SourceSpec) error {
+	if name[0] == '@' {
+		return fmt.Errorf("Names beginning with @ are reserved for internal use")
+	}
+	if _, exists := s.specMap[name]; exists {
+		return fmt.Errorf("A map named %s already exists", name)
+	}
+	s.specMap[name] = true
+	s.specs = append(s.specs, specName{name: name, spec: spec})
+	return nil
 }
 
 func (s *stateSpec) Update(st *state, clonedState bool) {
-	for _, f := range s.updateFuncs {
-		f(st, clonedState)
+	for _, spec := range s.specs {
+		newSource := spec.spec(st, spec.name, clonedState)
+		st.root.Update(spec.name, newSource)
 	}
 }

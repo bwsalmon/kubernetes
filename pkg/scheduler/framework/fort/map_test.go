@@ -30,13 +30,13 @@ type mockTarget struct {
 	deleteValue    any
 }
 
-func (m *mockTarget) onUpdate(key any, value any, kvs keyValueSource) {
+func (m *mockTarget) onUpdate(key any, value any, kvs KeyValueSource) {
 	m.onUpdateCalled = true
 	m.updateKey = key
 	m.updateValue = value
 }
 
-func (m *mockTarget) onDelete(key any, value any, kvs keyValueSource) {
+func (m *mockTarget) onDelete(key any, value any, kvs KeyValueSource) {
 	m.onDeleteCalled = true
 	m.deleteKey = key
 	m.deleteValue = value

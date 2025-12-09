@@ -9,9 +9,9 @@ import (
 
 func TestSource(t *testing.T) {
 	spec := NewSpec()
-	NewSource[string](spec, "src")
+	spec.New("src", NewExternalSource[string]())
 	state := New(spec)
-	src := Source[string](state, "src")
+	src := GetExternalSource[string](state, "src")
 	src.Update("foo", "bar")
 
 	m := GetMap[string](state, "src")
@@ -32,8 +32,8 @@ func TestSource(t *testing.T) {
 
 func setupSources() StateSpec {
 	spec := NewSpec()
-	NewSource[string](spec, "a")
-	NewSource[string](spec, "b")
+	spec.New("a", NewExternalSource[string]())
+	spec.New("b", NewExternalSource[string]())
 	return spec
 }
 
@@ -50,113 +50,114 @@ func expectMap[K comparable, V any](t *testing.T, m KeyValueMap[K], expected map
 
 func TestFullJoin(t *testing.T) {
 	spec := setupSources()
-	FullJoin[string, string](spec, "c", "a", "b")
+	spec.New("ci", FullJoin[string, string]("a", "b"))
+	spec.New("c", Materialize[JoinKey[string, string]]("ci"))
 
 	state := New(spec)
-	a := Source[string](state, "a")
-	b := Source[string](state, "b")
-	c := GetMap[JoinKey](state, "c")
+	a := GetExternalSource[string](state, "a")
+	b := GetExternalSource[string](state, "b")
+	c := GetMap[JoinKey[string, string]](state, "c")
 
 	a.Update("foo", "fab")
 
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{},
+		map[JoinKey[string, string]]JoinValue{},
 	)
 
 	b.Update("boo", "bab")
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{
+		map[JoinKey[string, string]]JoinValue{
 			{"foo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "fab",
+				Right: "bab",
 			},
 		},
 	)
 
 	b.Update("coo", "cab")
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{
+		map[JoinKey[string, string]]JoinValue{
 			{"foo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "fab",
+				Right: "bab",
 			},
 			{"foo", "coo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "coo", Value: "cab"},
+				Left:  "fab",
+				Right: "cab",
 			},
 		},
 	)
 
 	b.Update("coo", "cabb")
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{
+		map[JoinKey[string, string]]JoinValue{
 			{"foo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "fab",
+				Right: "bab",
 			},
 			{"foo", "coo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "coo", Value: "cabb"},
+				Left:  "fab",
+				Right: "cabb",
 			},
 		},
 	)
 
 	b.Delete("coo")
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{
+		map[JoinKey[string, string]]JoinValue{
 			{"foo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "fab",
+				Right: "bab",
 			},
 		},
 	)
 
 	b.Update("doo", "dab")
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{
+		map[JoinKey[string, string]]JoinValue{
 			{"foo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "fab",
+				Right: "bab",
 			},
 			{"foo", "doo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "doo", Value: "dab"},
+				Left:  "fab",
+				Right: "dab",
 			},
 		},
 	)
 
 	a.Update("goo", "gab")
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{
+		map[JoinKey[string, string]]JoinValue{
 			{"foo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "fab",
+				Right: "bab",
 			},
 			{"foo", "doo"}: {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "doo", Value: "dab"},
+				Left:  "fab",
+				Right: "dab",
 			},
 			{"goo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "goo", Value: "gab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "gab",
+				Right: "bab",
 			},
 			{"goo", "doo"}: {
-				Left:  &KeyValue[string]{Key: "goo", Value: "gab"},
-				Right: &KeyValue[string]{Key: "doo", Value: "dab"},
+				Left:  "gab",
+				Right: "dab",
 			},
 		},
 	)
 
 	a.Delete("foo")
 	expectMap(t, c,
-		map[JoinKey]JoinValue[string, string]{
+		map[JoinKey[string, string]]JoinValue{
 			{"goo", "boo"}: {
-				Left:  &KeyValue[string]{Key: "goo", Value: "gab"},
-				Right: &KeyValue[string]{Key: "boo", Value: "bab"},
+				Left:  "gab",
+				Right: "bab",
 			},
 			{"goo", "doo"}: {
-				Left:  &KeyValue[string]{Key: "goo", Value: "gab"},
-				Right: &KeyValue[string]{Key: "doo", Value: "dab"},
+				Left:  "gab",
+				Right: "dab",
 			},
 		},
 	)
@@ -168,97 +169,98 @@ func lookupByValue(kv *KeyValue[string]) string {
 
 func TestLookupJoin(t *testing.T) {
 	spec := setupSources()
-	LookupJoin(spec, "c", "a", "b", lookupByValue)
+	spec.New("ci", LookupJoin("a", "b", lookupByValue))
+	spec.New("c", Materialize[string]("ci"))
 
 	state := New(spec)
-	a := Source[string](state, "a")
-	b := Source[string](state, "b")
+	a := GetExternalSource[string](state, "a")
+	b := GetExternalSource[string](state, "b")
 	c := GetMap[string](state, "c")
 
 	a.Update("foo", "fab")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{},
+		map[string]JoinValue{},
 	)
 
 	b.Update("boo", "bab")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{},
+		map[string]JoinValue{},
 	)
 
 	b.Update("fab", "gab")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{
+		map[string]JoinValue{
 			"foo": {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "gab"},
+				Left:  "fab",
+				Right: "gab",
 			},
 		},
 	)
 
 	a.Update("hoo", "fab")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{
+		map[string]JoinValue{
 			"foo": {
-				Left:  &KeyValue[string]{Key: "foo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "gab"},
+				Left:  "fab",
+				Right: "gab",
 			},
 			"hoo": {
-				Left:  &KeyValue[string]{Key: "hoo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "gab"},
+				Left:  "fab",
+				Right: "gab",
 			},
 		},
 	)
 
 	a.Delete("foo")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{
+		map[string]JoinValue{
 			"hoo": {
-				Left:  &KeyValue[string]{Key: "hoo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "gab"},
+				Left:  "fab",
+				Right: "gab",
 			},
 		},
 	)
 
 	a.Update("hoo", "bab")
-	expectMap(t, c, map[string]JoinValue[string, string]{})
+	expectMap(t, c, map[string]JoinValue{})
 
 	a.Update("hoo", "fab")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{
+		map[string]JoinValue{
 			"hoo": {
-				Left:  &KeyValue[string]{Key: "hoo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "gab"},
+				Left:  "fab",
+				Right: "gab",
 			},
 		},
 	)
 
 	a.Update("soo", "fab")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{
+		map[string]JoinValue{
 			"soo": {
-				Left:  &KeyValue[string]{Key: "soo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "gab"},
+				Left:  "fab",
+				Right: "gab",
 			},
 			"hoo": {
-				Left:  &KeyValue[string]{Key: "hoo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "gab"},
+				Left:  "fab",
+				Right: "gab",
 			},
 		},
 	)
 
 	b.Delete("fab")
-	expectMap(t, c, map[string]JoinValue[string, string]{})
+	expectMap(t, c, map[string]JoinValue{})
 
 	b.Update("fab", "tab")
 	expectMap(t, c,
-		map[string]JoinValue[string, string]{
+		map[string]JoinValue{
 			"soo": {
-				Left:  &KeyValue[string]{Key: "soo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "tab"},
+				Left:  "fab",
+				Right: "tab",
 			},
 			"hoo": {
-				Left:  &KeyValue[string]{Key: "hoo", Value: "fab"},
-				Right: &KeyValue[string]{Key: "fab", Value: "tab"},
+				Left:  "fab",
+				Right: "tab",
 			},
 		},
 	)

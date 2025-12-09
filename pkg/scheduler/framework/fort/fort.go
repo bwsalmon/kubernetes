@@ -9,7 +9,9 @@ updated as data changes, and are easily fast cloneable.
 package fort
 
 // A state spec defines a set of sources and derived maps.
-type StateSpec interface{}
+type StateSpec interface {
+	New(name string, spec SourceSpec) error
+}
 
 // Create a new empty spec
 func NewSpec() StateSpec {
@@ -19,18 +21,16 @@ func NewSpec() StateSpec {
 // Add a source to the spec. A source is a map
 // that is updated by external logic. Everything in fort
 // is derived from a source (or a map derived from a source, etc)
-func NewSource[K comparable](s StateSpec, name string) {
-	s.(*stateSpec).Register(
-		func(s State, isClone bool) {
-			makeOrCloneMap[K](s.(*state), name, isClone)
-		},
-	)
+func NewExternalSource[K comparable]() SourceSpec {
+	return func(s State, name string, isClone bool) any {
+		return makeOrCloneMap[K](s.(*state), name, isClone)
+	}
 }
 
-// A key value source can be updated using the given methods.
+// An external source can be updated using the given methods.
 // All derived maps are updated when these operators are called.
 // A source is just a map from key to value.
-type KeyValueSource[K comparable] interface {
+type ExternalSource[K comparable] interface {
 	Update(key K, value any)
 	Delete(key K)
 }
@@ -38,9 +38,8 @@ type KeyValueSource[K comparable] interface {
 // Define a new map created by joining two source maps on the given spec.
 // This will create a new map with one entry for each pair of entries in the source maps.
 // The keys of the resulting map will be a JoinKey, the values will be a JoinValue.
-func FullJoin[LK, RK comparable](s StateSpec, name, left, right string) {
-	st := s.(*stateSpec)
-	st.Register(fullJoinFactory[LK, RK](name, left, right))
+func FullJoin[LK, RK comparable](left, right string) SourceSpec {
+	return fullJoinFactory[LK, RK](left, right)
 }
 
 type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
@@ -50,9 +49,8 @@ type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
 // It will create a new map with one entry for each item in left with the corresponding
 // entry given by the key returned from the lookup function provided.
 // The keys of the resulting map will be the keys from the left map, the values will be a JoinValue.
-func LookupJoin[LK, RK comparable](s StateSpec, name, left, right string, lookupFunc LookupFunc[LK, RK]) {
-	st := s.(*stateSpec)
-	st.Register(lookupJoinFactory(name, left, right, lookupFunc))
+func LookupJoin[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) SourceSpec {
+	return lookupJoinFactory(left, right, lookupFunc)
 }
 
 // Run map reduce on a given input map and generate a new map based on the operation.
@@ -63,8 +61,12 @@ func LookupJoin[LK, RK comparable](s StateSpec, name, left, right string, lookup
 //   - aggregate the results of all the mapper calls by key.
 //   - call the reducer function on the set of values with a given key.
 //   - save the reducer output in the result map with the given key.
-func MapReduce[I, O comparable](s StateSpec, name string, mapper Mapper[I, O], reducer Reducer, source string) {
-	s.(*stateSpec).Register(newMapReduceFactory(name, mapper, reducer, source))
+func MapReduce[I, O comparable](mapper Mapper[I, O], reducer Reducer, source string) SourceSpec {
+	return newMapReduceFactory(mapper, reducer, source)
+}
+
+func Materialize[K comparable](source string) SourceSpec {
+	return newMaterializer[K](source)
 }
 
 // State object. This is a set of named maps and their operators.
@@ -81,9 +83,9 @@ func New(spec StateSpec) State {
 }
 
 // Get a reference to a source object from the state given its name.
-func Source[K comparable](s State, name string) KeyValueSource[K] {
+func GetExternalSource[K comparable](s State, name string) ExternalSource[K] {
 	v, _ := s.(*state).root.Get(name)
-	return v.(KeyValueSource[K])
+	return v.(ExternalSource[K])
 }
 
 // Get a reference to a derived map object given its name.
@@ -94,6 +96,23 @@ func GetMap[K comparable](s State, name string) KeyValueMap[K] {
 	return v.(KeyValueMap[K])
 }
 
+type KeyValueTarget interface {
+	onUpdate(key any, value any, source KeyValueSource)
+	onDelete(key any, value any, source KeyValueSource)
+}
+
+type KeyValueSource interface {
+	addTarget(target KeyValueTarget)
+}
+
+// Get a reference to a derived map object given its name.
+// Note that derived maps are read only. They are updated
+// by the internal operators when source maps are updated.
+func GetSource(s State, name string) KeyValueSource {
+	v, _ := s.(*state).root.Get(name)
+	return v.(KeyValueSource)
+}
+
 // A KeyValueMap is a simple read-only map interface.
 type KeyValueMap[K comparable] interface {
 	Get(key K) (any, bool)
@@ -101,23 +120,26 @@ type KeyValueMap[K comparable] interface {
 	All() KeyValueIterator[K]
 
 	Print()
-	keyValueSource
+	KeyValueSource
 }
 
 // This is the value returned by a join operation.
-type JoinValue[LK, RK comparable] struct {
-	Left  *KeyValue[LK]
-	Right *KeyValue[RK]
+type JoinValue struct {
+	Left  any
+	Right any
 }
 
-type JoinKey [2]any
+type JoinKey[LK, RK comparable] struct {
+	Left  LK
+	Right RK
+}
 
 // Common reducers
 
 var (
-	Count     = CountReducer
-	Identical = IdenticalReducer
-	SumList   = SumListReducer
+	Count    = CountReducer
+	AnyValue = AnyValueReducer
+	Sum      = SumReducer
 )
 
 // MapReduce structures
@@ -139,6 +161,7 @@ type ReducerEntry interface {
 }
 
 type StrTuple [2]string
+type StrTriple [3]string
 
 // Key value sets
 

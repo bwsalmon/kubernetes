@@ -1,5 +1,6 @@
 package fort
 
+/*
 import (
 	"encoding/json"
 	"fmt"
@@ -37,7 +38,7 @@ func FastPodAffinity(spec StateSpec) {
 				{Key: string(antiTermsId), Value: &aff{t: antiAffinityTerms}},
 			}
 		},
-		Identical,
+		AnyValue,
 		"podInfos",
 	)
 
@@ -59,7 +60,7 @@ func FastPodAffinity(spec StateSpec) {
 				},
 			}
 		},
-		Identical,
+		AnyValue,
 		"podInfos",
 	)
 
@@ -93,7 +94,7 @@ func FastPodAffinity(spec StateSpec) {
 
 			return KeyValueSet[StrTuple]{}
 		},
-		Identical,
+		AnyValue,
 		"podTerms",
 	)
 }
@@ -156,7 +157,7 @@ func getPodMatchingAffinityTerms(pod fwk.PodInfo, state State) []string {
 
 func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 	spec := NewSpec()
-	NewSource[string](spec, "podInfos")
+	NewExternalSource[string](spec, "podInfos")
 	FastPodAffinity(spec)
 
 	state := New(spec)
@@ -204,3 +205,5 @@ func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 	stop := time.Now()
 	fmt.Printf("Time %f", float64(stop.Sub(start))/float64(time.Second))
 }
+
+*/
