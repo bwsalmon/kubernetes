@@ -5,26 +5,29 @@ import (
 	"maps"
 )
 
-func newMapReduceFactory[I, O comparable](mapper Mapper[I, O], reducer Reducer, source string) SourceSpec {
-	return func(s State, name string, isClone bool) any {
-		st := s.(*state)
+func newMapReduceFactory[I, O comparable](mapper Mapper[I, O], reducer Reducer, source string) *SourceSpec {
+	return &SourceSpec{
+		Create: func(s State, name string, isClone bool) (any, error) {
+			st := s.(*state)
 
-		mr := &mapReducer[I, O]{
-			owner:          nil,
-			mapper:         mapper,
-			reducer:        reducer,
-			mapperResults:  makeOrCloneMap[I](st, "@mapper_"+name, isClone),
-			reducerResults: makeOrCloneMap[O](st, "@reducer_"+name, isClone),
-			results:        makeOrCloneMap[O](st, name, isClone),
-		}
+			mr := &mapReducer[I, O]{
+				owner:          nil,
+				mapper:         mapper,
+				reducer:        reducer,
+				mapperResults:  makeOrCloneMap[I](st, "@mapper_"+name, isClone),
+				reducerResults: makeOrCloneMap[O](st, "@reducer_"+name, isClone),
+				results:        makeOrCloneMap[O](st, name, isClone),
+			}
 
-		sourceObj := GetSource(s, source)
-		if sourceObj == nil {
-			log.Fatalf("Couldn't find source %s", source)
-		}
-		sourceObj.addTarget(mr)
+			sourceObj := GetSource(s, source)
+			if sourceObj == nil {
+				log.Fatalf("Couldn't find source %s", source)
+			}
+			sourceObj.addTarget(mr)
 
-		return mr.results
+			return mr.results, nil
+		},
+		Dependencies: []string{source},
 	}
 }
 

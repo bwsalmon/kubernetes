@@ -7,95 +7,133 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
-type aff struct {
-	t []fwk.AffinityTerm
-}
-
 // Set up data structures for filtering based on pod affinity.
 func FastPodAffinity(spec StateSpec) {
-	// XXX Note that in a real implementation we need to use topology terms
-	// rather than node names, but this is a good first approximation of
-	// cost (it assumes only node topology terms).
-	// Adding additional topology terms should be nominally more expensive, but probably
-	// doesn't add much fidelity to the model.
-
 	// Generate a set of unique affinityTerms across all pods in the system.
-	MapReduce(
-		spec,
+	spec.New(
 		"affinityTerms",
-		func(kv *KeyValue[string]) KeyValueSet[string] {
-			podInfo := kv.Value.(fwk.PodInfo)
-			affinityTerms := podInfo.GetRequiredAffinityTerms()
-			antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
-			termsId, _ := json.Marshal(affinityTerms)
-			antiTermsId, _ := json.Marshal(antiAffinityTerms)
-			return KeyValueSet[string]{
-				{Key: string(termsId), Value: &aff{t: affinityTerms}},
-				{Key: string(antiTermsId), Value: &aff{t: antiAffinityTerms}},
-			}
-		},
-		AnyValue,
-		"podInfos",
+		MapReduce(
+			func(kv *KeyValue[string]) KeyValueSet[string] {
+				ret := KeyValueSet[string]{}
+				podInfo := kv.Value.(fwk.PodInfo)
+				pod := podInfo.GetPod()
+				affinityTerms := podInfo.GetRequiredAffinityTerms()
+				for i, t := range affinityTerms {
+					// XXX this is an exceptionally horrible hack that must be fixed.
+					termId, _ := json.Marshal(pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i])
+					ret = append(ret, KeyValue[string]{
+						Key:   string(termId),
+						Value: &t,
+					})
+				}
+				antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
+				for i, t := range antiAffinityTerms {
+					// XXX this is an exceptionally horrible hack that must be fixed.
+					termId, _ := json.Marshal(pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i])
+					ret = append(ret, KeyValue[string]{
+						Key:   string(termId),
+						Value: &t,
+					})
+				}
+				return ret
+			},
+			AnyValue,
+			"podInfos",
+		),
 	)
 
-	// Generate a set of antiAffinityTerms found on at least one pod
-	// on each node in the system.
-
-	MapReduce(
-		spec,
-		"outgoingNodeAntiAffinityTerms",
-		func(kv *KeyValue[string]) KeyValueSet[StrTuple] {
-			podInfo := kv.Value.(fwk.PodInfo)
-			antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
-			antiTermsId, _ := json.Marshal(antiAffinityTerms)
-			nodeName := podInfo.GetPod().Spec.NodeName
-			return KeyValueSet[StrTuple]{
-				{
-					Key:   StrTuple{string(antiTermsId), nodeName},
-					Value: &aff{t: antiAffinityTerms},
-				},
-			}
-		},
-		AnyValue,
-		"podInfos",
+	spec.New(
+		"podNodes",
+		LookupJoin(
+			"podInfos",
+			"nodes",
+			func(kv *KeyValue[string]) string {
+				pod := kv.Value.(fwk.PodInfo).GetPod()
+				return pod.Spec.NodeName
+			},
+		),
 	)
 
-	// Generate a set of affinity term / node pairs, where the given node
-	// has at least one pod matching that term.
+	spec.New(
+		"podsHavingTermDomain",
+		MapReduce(
+			func(kv *KeyValue[string]) KeyValueSet[[4]string] {
+				ret := KeyValueSet[[4]string]{}
+				podInfo := kv.Value.(JoinValue).Left.(fwk.PodInfo)
+				node := kv.Value.(JoinValue).Right.(*v1.Node)
+				pod := podInfo.GetPod()
+				affinityTerms := podInfo.GetRequiredAffinityTerms()
+				for i, t := range affinityTerms {
+					// XXX this is an exceptionally horrible hack that must be fixed.
+					termId, _ := json.Marshal(pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i])
+					domain := node.Labels[t.TopologyKey]
+					ret = append(ret, KeyValue[[4]string]{
+						Key:   [4]string{"p", string(termId), t.TopologyKey, domain},
+						Value: &t,
+					})
+				}
+				antiAffinityTerms := podInfo.GetRequiredAntiAffinityTerms()
+				for i, t := range antiAffinityTerms {
+					// XXX this is an exceptionally horrible hack that must be fixed.
+					termId, _ := json.Marshal(pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i])
+					domain := node.Labels[t.TopologyKey]
+					ret = append(ret, KeyValue[[4]string]{
+						Key:   [4]string{"n", string(termId), t.TopologyKey, domain},
+						Value: &t,
+					})
+				}
+				return ret
+			},
+			AnyValue,
+			"podNodes",
+		),
+	)
 
 	// Start by pairing each affinity term with each pod.
-	FullJoin[string, string](spec, "podTerms", "affinityTerms", "podInfos")
+	spec.New(
+		"termPodNodes",
+		FullJoin[string, string](
+			"affinityTerms",
+			"podNodes",
+		),
+	)
 
 	// Then use map reduce to see if each pod matches the corresponding
 	// affinity term. If it does, track that the node hosting the pod
 	// has a pod matching the given term.
-	MapReduce(
-		spec,
-		"podsMatchingTermsOnNode",
-		func(kv *KeyValue[JoinKey]) KeyValueSet[StrTuple] {
-			val := kv.Value.(JoinValue[string, string])
+	spec.New(
+		"podsMatchingTermDomain",
+		MapReduce(
+			func(kv *KeyValue[JoinKey[string, string]]) KeyValueSet[StrTriple] {
+				val := kv.Value.(JoinValue)
 
-			affinityKey := val.Left.Key
-			affinityTerms := val.Left.Value.(*aff)
-			pod := val.Right.Value.(fwk.PodInfo).GetPod()
+				termKey := kv.Key.Left
+				term := val.Left.(*fwk.AffinityTerm)
+				pod := val.Right.(JoinValue).Left.(fwk.PodInfo).GetPod()
+				node := val.Right.(JoinValue).Right.(*v1.Node)
 
-			if podMatchesAllAffinityTerms(affinityTerms.t, pod) {
-				return KeyValueSet[StrTuple]{
-					{
-						Key:   StrTuple{affinityKey, pod.Spec.NodeName},
-						Value: 1,
-					},
+				ret := KeyValueSet[StrTriple]{}
+				// XXX need to use the namespace selector as well by using term.Matches
+				// rather than term.Selector.Matches.
+				if term.Selector.Matches(labels.Set(pod.Labels)) {
+					if domain, hasKey := node.Labels[term.TopologyKey]; hasKey {
+						ret = append(ret, KeyValue[StrTriple]{
+							Key:   StrTriple{termKey, term.TopologyKey, domain},
+							Value: true,
+						})
+					}
 				}
-			}
 
-			return KeyValueSet[StrTuple]{}
-		},
-		AnyValue,
-		"podTerms",
+				return ret
+			},
+			Count,
+			"termPodNodes",
+		),
 	)
 }
 
@@ -114,14 +152,18 @@ func podMatchesAllAffinityTerms(terms []fwk.AffinityTerm, pod *v1.Pod) bool {
 	return true
 }
 
-func Filter(nodeInfo fwk.NodeInfo, podInfo fwk.PodInfo, state State, matchingAffinityTerms []string, affinityTerms string, antiAffinityTerms string, matchingPods KeyValueMap[StrTuple], outgoing KeyValueMap[StrTuple]) bool {
+func Filter(nodeInfo fwk.NodeInfo, podInfo fwk.PodInfo, state State, matchingAffinityTerms []string, affinityTerms string, antiAffinityTerms string, matchingPods KeyValueMap[StrTriple]) bool {
+	node := nodeInfo.Node()
 	nodeName := nodeInfo.Node().Name
 
 	// If our pod has affinity terms and the node does not have
 	// a pod that matches, then we cannot use the node.
 	if len(affinityTerms) > 0 {
-		if !matchingPods.Has(StrTuple{affinityTerms, nodeName}) {
-			return false
+		for _, term := range affinityTerms {
+			domain := node.Labels[term.TopologyKey]
+			if !matchingPods.Has(StrTriple{term.Id, term.TopologyKey, domain}) {
+				return false
+			}
 		}
 	}
 
@@ -133,13 +175,15 @@ func Filter(nodeInfo fwk.NodeInfo, podInfo fwk.PodInfo, state State, matchingAff
 		}
 	}
 
-	// If the node has pods with outgoing anti-affinity terms that
-	// match us, then we can't use the node.
-	for _, termId := range matchingAffinityTerms {
-		if outgoing.Has(StrTuple{termId, nodeName}) {
-			return false
+	/*
+		// If the node has pods with outgoing anti-affinity terms that
+		// match us, then we can't use the node.
+		for _, termId := range matchingAffinityTerms {
+			if outgoing.Has(StrTuple{termId, nodeName}) {
+				return false
+			}
 		}
-	}
+	*
 
 	return true
 }
@@ -147,8 +191,10 @@ func Filter(nodeInfo fwk.NodeInfo, podInfo fwk.PodInfo, state State, matchingAff
 func getPodMatchingAffinityTerms(pod fwk.PodInfo, state State) []string {
 	matching := []string{}
 	terms := GetMap[string](state, "affinityTerms")
-	for termId, terms := range terms.All() {
-		if podMatchesAllAffinityTerms(terms.(*aff).t, pod.GetPod()) {
+	for termId, term := range terms.All() {
+		// XXX need to use the namespace selector as well by using term.Matches
+		// rather than term.Selector.Matches.
+		if term.(*fwk.AffinityTerm).Selector.Matches(labels.Set(pod.GetPod().Labels)) {
 			matching = append(matching, termId)
 		}
 	}
@@ -157,14 +203,19 @@ func getPodMatchingAffinityTerms(pod fwk.PodInfo, state State) []string {
 
 func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 	spec := NewSpec()
-	NewExternalSource[string](spec, "podInfos")
+	spec.New("podInfos", NewExternalSource[string]())
+	spec.New("nodes", NewExternalSource[string]())
 	FastPodAffinity(spec)
 
 	state := New(spec)
 
-	podMap := Source[string](state, "podInfos")
-	matchingPods := GetMap[StrTuple](state, "podsMatchingTermsOnNode")
-	outgoing := GetMap[StrTuple](state, "outgoingNodeAntiAffinityTerms")
+	podMap := GetExternalSource[string](state, "podInfos")
+	nodeMap := GetExternalSource[string](state, "nodes")
+	matchingPods := GetMap[StrTuple](state, "podsPerTermDomain")
+
+	for _, node := range nodes {
+		nodeMap.Update(node.Node().Name, node)
+	}
 
 	start := time.Now()
 
@@ -191,7 +242,7 @@ func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 
 		currNode := nodes[0]
 		for _, node := range nodes {
-			if Filter(node, podInfo, state, matching, aff, anti, matchingPods, outgoing) &&
+			if Filter(node, podInfo, state, matching, aff, anti, matchingPods) &&
 				len(node.GetPods()) < 5 {
 				currNode = node
 			}
@@ -205,5 +256,4 @@ func filterWithFastPodAffinity(pods []fwk.PodInfo, nodes []fwk.NodeInfo) {
 	stop := time.Now()
 	fmt.Printf("Time %f", float64(stop.Sub(start))/float64(time.Second))
 }
-
 */

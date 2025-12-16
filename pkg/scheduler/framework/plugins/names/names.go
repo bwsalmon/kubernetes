@@ -21,6 +21,7 @@ const (
 	DefaultBinder                   = "DefaultBinder"
 	DefaultPreemption               = "DefaultPreemption"
 	DynamicResources                = "DynamicResources"
+	FastPodSpread                   = "FastPodSpread"
 	GangScheduling                  = "GangScheduling"
 	ImageLocality                   = "ImageLocality"
 	InterPodAffinity                = "InterPodAffinity"

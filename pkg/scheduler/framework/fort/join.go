@@ -2,21 +2,24 @@ package fort
 
 import "k8s.io/apimachinery/pkg/util/sets"
 
-func fullJoinFactory[LK, RK comparable](left, right string) SourceSpec {
-	return func(s State, name string, clonedState bool) any {
-		st := s.(*state)
-		j := &fullJoiner[LK, RK]{
-			target:      newKeyValueConnector[JoinKey[LK, RK]](),
-			leftSource:  GetSource(st, left),
-			left:        makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
-			rightSource: GetSource(st, right),
-			right:       makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
-		}
+func fullJoinFactory[LK, RK comparable](left, right string) *SourceSpec {
+	return &SourceSpec{
+		Create: func(s State, name string, clonedState bool) (any, error) {
+			st := s.(*state)
+			j := &fullJoiner[LK, RK]{
+				target:      newKeyValueConnector[JoinKey[LK, RK]](),
+				leftSource:  GetSource(st, left),
+				left:        makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
+				rightSource: GetSource(st, right),
+				right:       makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
+			}
 
-		j.leftSource.addTarget(j)
-		j.rightSource.addTarget(j)
+			j.leftSource.addTarget(j)
+			j.rightSource.addTarget(j)
 
-		return j.target
+			return j.target, nil
+		},
+		Dependencies: []string{left, right},
 	}
 }
 
@@ -82,23 +85,26 @@ func (j *fullJoiner[LK, RK]) joinDelete(left KeyValueIterator[LK], right KeyValu
 	}
 }
 
-func lookupJoinFactory[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) SourceSpec {
-	return func(s State, name string, clonedState bool) any {
-		st := s.(*state)
-		j := &lookupJoiner[LK, RK]{
-			target:       makeOrCloneMap[LK](st, name, clonedState),
-			leftSource:   GetMap[LK](st, left),
-			left:         makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
-			rightSource:  GetMap[RK](st, right),
-			right:        makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
-			reverseIndex: makeOrCloneMap[RK](st, "@join_rindex_"+name, clonedState),
-			getTargetKey: lookupFunc,
-		}
+func lookupJoinFactory[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) *SourceSpec {
+	return &SourceSpec{
+		Create: func(s State, name string, clonedState bool) (any, error) {
+			st := s.(*state)
+			j := &lookupJoiner[LK, RK]{
+				target:       makeOrCloneMap[LK](st, name, clonedState),
+				leftSource:   GetSource(st, left),
+				left:         makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
+				rightSource:  GetSource(st, right),
+				right:        makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
+				reverseIndex: makeOrCloneMap[RK](st, "@join_rindex_"+name, clonedState),
+				getTargetKey: lookupFunc,
+			}
 
-		j.leftSource.addTarget(j)
-		j.rightSource.addTarget(j)
+			j.leftSource.addTarget(j)
+			j.rightSource.addTarget(j)
 
-		return j.target
+			return j.target, nil
+		},
+		Dependencies: []string{left, right},
 	}
 }
 
@@ -194,3 +200,24 @@ func (m *lookupJoiner[LK, RK]) removeFromReverseIndex(sourceKey RK, targetKey LK
 		}
 	}
 }
+
+/*
+type unioner[K comparable] struct {
+	target  *keyValueConnector[K]
+	sources []KeyValueSource
+}
+
+func unionFactory[K comparable](sources ...string) *SourceSpec {
+	return &SourceSpec{
+		Create: func(s State, name string, clonedState bool) (any, error) {
+			target := newKeyValueConnector[K]()
+			for _, srcName := range sources {
+				src := GetSource(s, srcName)
+				src.addTarget(target)
+			}
+			return target, nil
+		},
+		Dependencies: sources,
+	}
+}
+*/

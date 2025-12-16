@@ -1,6 +1,18 @@
 package fort
 
 /*
+import (
+	"fmt"
+	"math/rand"
+	"testing"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+)
+
 // Constants to ensure "random" labels actually match affinity selectors
 var (
 	TopologyZones   = []string{"us-east-1a", "us-east-1b", "us-west-2a"}
@@ -164,4 +176,5 @@ func addPodAntiAffinity(pod *v1.Pod) {
 func getRandom(options []string) string {
 	return options[rand.Intn(len(options))]
 }
+
 */

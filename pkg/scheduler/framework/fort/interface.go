@@ -8,9 +8,11 @@ updated as data changes, and are easily fast cloneable.
 */
 package fort
 
+import "k8s.io/client-go/tools/cache"
+
 // A state spec defines a set of sources and derived maps.
 type StateSpec interface {
-	New(name string, spec SourceSpec) error
+	New(name string, spec *SourceSpec) error
 }
 
 // Create a new empty spec
@@ -21,9 +23,12 @@ func NewSpec() StateSpec {
 // Add a source to the spec. A source is a map
 // that is updated by external logic. Everything in fort
 // is derived from a source (or a map derived from a source, etc)
-func NewExternalSource[K comparable]() SourceSpec {
-	return func(s State, name string, isClone bool) any {
-		return makeOrCloneMap[K](s.(*state), name, isClone)
+func NewExternalSource[K comparable]() *SourceSpec {
+	return &SourceSpec{
+		Create: func(s State, name string, isClone bool) (any, error) {
+			return makeOrCloneMap[K](s.(*state), name, isClone), nil
+		},
+		Dependencies: []string{},
 	}
 }
 
@@ -35,10 +40,19 @@ type ExternalSource[K comparable] interface {
 	Delete(key K)
 }
 
+func WrapInformer(informer cache.SharedInformer) *SourceSpec {
+	return &SourceSpec{
+		Create: func(s State, name string, isClone bool) (any, error) {
+			return wrapInformer(informer)
+		},
+		Dependencies: []string{},
+	}
+}
+
 // Define a new map created by joining two source maps on the given spec.
 // This will create a new map with one entry for each pair of entries in the source maps.
 // The keys of the resulting map will be a JoinKey, the values will be a JoinValue.
-func FullJoin[LK, RK comparable](left, right string) SourceSpec {
+func FullJoin[LK, RK comparable](left, right string) *SourceSpec {
 	return fullJoinFactory[LK, RK](left, right)
 }
 
@@ -49,7 +63,7 @@ type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
 // It will create a new map with one entry for each item in left with the corresponding
 // entry given by the key returned from the lookup function provided.
 // The keys of the resulting map will be the keys from the left map, the values will be a JoinValue.
-func LookupJoin[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) SourceSpec {
+func LookupJoin[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) *SourceSpec {
 	return lookupJoinFactory(left, right, lookupFunc)
 }
 
@@ -61,11 +75,11 @@ func LookupJoin[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK,
 //   - aggregate the results of all the mapper calls by key.
 //   - call the reducer function on the set of values with a given key.
 //   - save the reducer output in the result map with the given key.
-func MapReduce[I, O comparable](mapper Mapper[I, O], reducer Reducer, source string) SourceSpec {
+func MapReduce[I, O comparable](mapper Mapper[I, O], reducer Reducer, source string) *SourceSpec {
 	return newMapReduceFactory(mapper, reducer, source)
 }
 
-func Materialize[K comparable](source string) SourceSpec {
+func Materialize[K comparable](source string) *SourceSpec {
 	return newMaterializer[K](source)
 }
 
