@@ -112,7 +112,7 @@ func ifNodeMatchesDomainReturnNodeNameAndTermKey(kv *fort.KeyValue[fort.JoinKey[
 func setupState(spec fort.Spec) {
 	spec.New(
 		"nodeInfos",
-		fort.NewExternalSource[string](),
+		fort.NewExternalView[string](),
 	)
 
 	// Collect all the unique affinity terms across all of the pods in the system.

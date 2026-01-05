@@ -9,7 +9,7 @@ import (
 
 func TestSource(t *testing.T) {
 	spec := NewSpec()
-	spec.New("src", NewExternalSource[string]())
+	spec.New("src", NewExternalView[string]())
 	state := New(spec)
 	src := GetItem[ExternalView[string]](state, "src")
 	src.Update("foo", "bar")
@@ -32,8 +32,8 @@ func TestSource(t *testing.T) {
 
 func setupSources() Spec {
 	spec := NewSpec()
-	spec.New("a", NewExternalSource[string]())
-	spec.New("b", NewExternalSource[string]())
+	spec.New("a", NewExternalView[string]())
+	spec.New("b", NewExternalView[string]())
 	return spec
 }
 
