@@ -60,6 +60,15 @@ func newMaterializer[K comparable](source string) *SourceSpec {
 	}
 }
 
+func newExternalView[KeyType comparable]() *SourceSpec {
+	return &SourceSpec{
+		Create: func(s DataFort, name string, isClone bool) (any, error) {
+			return makeOrCloneMap[KeyType](s.(*dataFort), name, isClone), nil
+		},
+		Dependencies: []string{},
+	}
+}
+
 type wrappedInformer struct {
 	lock sync.Mutex
 	keyValueConnector[string]
