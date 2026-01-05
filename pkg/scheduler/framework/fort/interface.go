@@ -12,14 +12,16 @@ package fort
 // A spec is then used to create a DataFort object.
 
 type Spec interface {
-	// Create a new item, either a view or a map, from
-	// a given source spec.
+	// Create a new item from a given source spec.
+	// Only one item can exist with a given name.
 	//
-	// Most items are "views" which are derived from some operator and can be then used as the
-	// input to other operators but are not directly queryable.
+	// Most items are "views" which are derived from some operator
+	// and can be then used as the input to other operators.
+	// Views are not directly queryable because they are not materialized.
 	//
-	// A view can be converted into a "map" using Materialize.
-	// Maps can be queried directly by getting a handle to them as a KeyValueMap[KeyType].
+	// The Materialize operation turns a view into a "map".
+	// Maps can be queried directly by getting a handle to them as a
+	// KeyValueMap.
 	New(name string, source *SourceSpec) error
 }
 
@@ -50,7 +52,7 @@ func MapReduce[InputKeyType, OutputKeyType comparable](mapper Mapper[InputKeyTyp
 }
 
 // Used with the spec "New" call. Define a new view created by joining two source views.
-// This will create a new view with one entry for each pair of entries in the sources.
+// Logically FullJoin will create a new view with one entry for each pair of entries in the sources.
 // The keys of the resulting view will be a JoinKey, the values will be a JoinValue.
 func FullJoin[LeftKeyType, RightKeyType comparable](left, right string) *SourceSpec {
 	return fullJoinFactory[LeftKeyType, RightKeyType](left, right)
@@ -73,7 +75,7 @@ func NewSpec() Spec {
 type DataFort interface {
 	// Get returns the view or map associated with the given name.
 	// The return value will either be an ExternalView, a KeyValueMap, or
-	// an internal view which is not directly manipulatable externally.
+	// an internal view which is not manipulatable externally.
 	Get(mapName string) (any, bool)
 
 	// Clone the current version of the DataFort.
@@ -104,17 +106,6 @@ type KeyValue[KeyType comparable] struct {
 	Value any
 }
 
-type KeyValueMap[KeyType comparable] interface {
-	// Get the value associated with the given key.
-	// The boolean is true if a value was found, false otherwise.
-	Get(key KeyType) (any, bool)
-
-	// Get an iterator over all of the key values
-	// in the given map. This can be used in
-	// "range" operations.
-	All() KeyValueIterator[KeyType]
-}
-
 // A view to mirror state from an external source.
 type ExternalView[KeyType comparable] interface {
 	// Add or update a given key value.
@@ -124,6 +115,18 @@ type ExternalView[KeyType comparable] interface {
 
 	// Delete the given key from the map.
 	Delete(key KeyType)
+}
+
+// A map of key value pairs.
+type KeyValueMap[KeyType comparable] interface {
+	// Get the value associated with the given key.
+	// The boolean is true if a value was found, false otherwise.
+	Get(key KeyType) (any, bool)
+
+	// Get an iterator over all of the key values
+	// in the given map. This can be used in
+	// "range" operations.
+	All() KeyValueIterator[KeyType]
 }
 
 // An iterator returned from maps. Note that these iterators can be used
