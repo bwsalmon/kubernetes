@@ -36,7 +36,7 @@ func (m *keyValueConnector[K]) Delete(key K, value any) {
 	}
 }
 
-func (c *keyValueConnector[K]) Clone(owner any) Cloneable {
+func (c *keyValueConnector[K]) CloneIfNotOwned(owner any) any {
 	return &keyValueConnector[K]{
 		targets: append([]KeyValueTarget{}, c.targets...),
 	}
@@ -44,8 +44,8 @@ func (c *keyValueConnector[K]) Clone(owner any) Cloneable {
 
 func newMaterializer[K comparable](source string) *SourceSpec {
 	return &SourceSpec{
-		Create: func(s State, name string, isClone bool) (any, error) {
-			st := s.(*state)
+		Create: func(s DataFort, name string, isClone bool) (any, error) {
+			st := s.(*dataFort)
 			v, _ := st.root.Get(source)
 			if mapValue, isMap := v.(*CloneMap[K]); isMap {
 				return mapValue, nil

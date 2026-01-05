@@ -17,6 +17,7 @@ type CloneMap[K comparable] struct {
 
 var _ KeyValueMap[string] = &CloneMap[string]{}
 var _ KeyValueSource = &CloneMap[string]{}
+var _ ExternalView[string] = &CloneMap[string]{}
 
 func newCloneMap[K comparable](data map[K]any, base *CloneMap[K], root any, references int64) *CloneMap[K] {
 	newMap := &CloneMap[K]{
@@ -140,7 +141,7 @@ func (m *CloneMap[K]) deleteNoCallback(key K, callback *KeyValue[K]) bool {
 	return false
 }
 
-func (m *CloneMap[K]) Clone(root any) Cloneable {
+func (m *CloneMap[K]) CloneIfNotOwned(root any) any {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 

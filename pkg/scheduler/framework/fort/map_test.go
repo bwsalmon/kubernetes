@@ -256,7 +256,7 @@ func TestCloneMap_Clone(t *testing.T) {
 	rootA := "rootA"
 
 	// 1. First Clone
-	mCloneable := m.Clone(rootA)
+	mCloneable := m.CloneIfNotOwned(rootA)
 	clone, ok := mCloneable.(*CloneMap[string])
 	if !ok {
 		t.Fatalf("Clone did not return a *CloneMap[string]")
@@ -288,7 +288,7 @@ func TestCloneMap_Clone(t *testing.T) {
 	}
 
 	// 2. Second Clone with Same Root (should return the same map)
-	mCloneable2 := m.Clone(rootA)
+	mCloneable2 := m.CloneIfNotOwned(rootA)
 	if mCloneable2 != m {
 		t.Errorf("Cloning with the same root should return the original map instance.")
 	}
@@ -381,7 +381,7 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	rootA := "rootA"
 
 	// Clone 1
-	clone1 := m.Clone(rootA).(*CloneMap[string])
+	clone1 := m.CloneIfNotOwned(rootA).(*CloneMap[string])
 
 	// State after clone:
 	// m: data={}, base -> m_old (ref=2), root=rootA
@@ -441,7 +441,7 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	m_root := newTestCloneMap(map[string]any{"A": 1}) // ref=1
 
 	// 2. Clone 1 (m_child)
-	m_child := m_root.Clone("rootX").(*CloneMap[string])
+	m_child := m_root.CloneIfNotOwned("rootX").(*CloneMap[string])
 	//m_base := m_root.base // This is the old state of m_root (ref=2)
 
 	// m_root: data={}, base=m_base (ref=2), root="rootX"
@@ -559,7 +559,7 @@ func TestCloneMap_Concurrency(t *testing.T) {
 			}
 
 			// Test Clone concurrently
-			m.Clone(fmt.Sprintf("root%d", id))
+			m.CloneIfNotOwned(fmt.Sprintf("root%d", id))
 		}(i)
 	}
 

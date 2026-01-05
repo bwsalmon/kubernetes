@@ -11,10 +11,10 @@ func TestSource(t *testing.T) {
 	spec := NewSpec()
 	spec.New("src", NewExternalSource[string]())
 	state := New(spec)
-	src := GetExternalSource[string](state, "src")
+	src := GetItem[ExternalView[string]](state, "src")
 	src.Update("foo", "bar")
 
-	m := GetMap[string](state, "src")
+	m := GetItem[KeyValueMap[string]](state, "src")
 	v, found := m.Get("foo")
 	if !found {
 		t.Fatal("not found")
@@ -30,7 +30,7 @@ func TestSource(t *testing.T) {
 	}
 }
 
-func setupSources() StateSpec {
+func setupSources() Spec {
 	spec := NewSpec()
 	spec.New("a", NewExternalSource[string]())
 	spec.New("b", NewExternalSource[string]())
@@ -54,9 +54,9 @@ func TestFullJoin(t *testing.T) {
 	spec.New("c", Materialize[JoinKey[string, string]]("ci"))
 
 	state := New(spec)
-	a := GetExternalSource[string](state, "a")
-	b := GetExternalSource[string](state, "b")
-	c := GetMap[JoinKey[string, string]](state, "c")
+	a := GetItem[ExternalView[string]](state, "a")
+	b := GetItem[ExternalView[string]](state, "b")
+	c := GetItem[KeyValueMap[JoinKey[string, string]]](state, "c")
 
 	a.Update("foo", "fab")
 
@@ -173,9 +173,9 @@ func TestLookupJoin(t *testing.T) {
 	spec.New("c", Materialize[string]("ci"))
 
 	state := New(spec)
-	a := GetExternalSource[string](state, "a")
-	b := GetExternalSource[string](state, "b")
-	c := GetMap[string](state, "c")
+	a := GetItem[ExternalView[string]](state, "a")
+	b := GetItem[ExternalView[string]](state, "b")
+	c := GetItem[KeyValueMap[string]](state, "c")
 
 	a.Update("foo", "fab")
 	expectMap(t, c,

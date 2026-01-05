@@ -4,13 +4,13 @@ import "k8s.io/apimachinery/pkg/util/sets"
 
 func fullJoinFactory[LK, RK comparable](left, right string) *SourceSpec {
 	return &SourceSpec{
-		Create: func(s State, name string, clonedState bool) (any, error) {
-			st := s.(*state)
+		Create: func(s DataFort, name string, clonedState bool) (any, error) {
+			st := s.(*dataFort)
 			j := &fullJoiner[LK, RK]{
 				target:      newKeyValueConnector[JoinKey[LK, RK]](),
-				leftSource:  GetSource(st, left),
+				leftSource:  getSource(st, left),
 				left:        makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
-				rightSource: GetSource(st, right),
+				rightSource: getSource(st, right),
 				right:       makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
 			}
 
@@ -85,15 +85,21 @@ func (j *fullJoiner[LK, RK]) joinDelete(left KeyValueIterator[LK], right KeyValu
 	}
 }
 
+type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
+
+func LookupJoin[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) *SourceSpec {
+	return lookupJoinFactory(left, right, lookupFunc)
+}
+
 func lookupJoinFactory[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) *SourceSpec {
 	return &SourceSpec{
-		Create: func(s State, name string, clonedState bool) (any, error) {
-			st := s.(*state)
+		Create: func(s DataFort, name string, clonedState bool) (any, error) {
+			st := s.(*dataFort)
 			j := &lookupJoiner[LK, RK]{
 				target:       makeOrCloneMap[LK](st, name, clonedState),
-				leftSource:   GetSource(st, left),
+				leftSource:   getSource(st, left),
 				left:         makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
-				rightSource:  GetSource(st, right),
+				rightSource:  getSource(st, right),
 				right:        makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
 				reverseIndex: makeOrCloneMap[RK](st, "@join_rindex_"+name, clonedState),
 				getTargetKey: lookupFunc,
@@ -218,6 +224,60 @@ func unionFactory[K comparable](sources ...string) *SourceSpec {
 			return target, nil
 		},
 		Dependencies: sources,
+	}
+}
+
+func fullJoinFactory(left, right string) *SourceSpec {
+	return &SourceSpec{
+		Create: func(s DataFort, name string, clonedState bool) (any, error) {
+			st := s.(*state)
+			j := &fullJoiner[LK, RK]{
+				target:      newKeyValueConnector[JoinKey[LK, RK]](),
+				leftSource:  GetSource(st, left),
+				left:        makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
+				rightSource: GetSource(st, right),
+				right:       makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
+			}
+
+			j.leftSource.addTarget(j)
+			j.rightSource.addTarget(j)
+
+			return j.target, nil
+		},
+		Dependencies: []string{left, right},
+	}
+}
+
+type keyJoiner[K comparable] struct {
+	target      *keyValueConnector[K]
+	leftSource  KeyValueSource
+	left        *CloneMap[K]
+	rightSource KeyValueSource
+	right       *CloneMap[K]
+}
+
+var _ KeyValueTarget = &fullJoiner[string, int]{}
+
+func (j *fullJoiner[K]) onUpdate(key any, value any, source KeyValueSource) {
+	if source == j.leftSource {
+		kv := KeyValue[K]{Key: key.(K), Value: value}
+		j.joinUpdate(KeyValueSet[LK]{kv}.All(), j.right.All())
+		j.left.Update(key.(LK), value)
+	} else {
+		kv := KeyValue[RK]{Key: key.(RK), Value: value}
+		j.joinUpdate(j.left.All(), KeyValueSet[RK]{kv}.All())
+		j.right.Update(key.(RK), value)
+	}
+}
+
+func (j *fullJoiner[LK, RK]) onDelete(key any, value any, source KeyValueSource) {
+	//fmt.Printf("Join onDelete %s, %v\n", key, value)
+	if source == j.leftSource {
+		j.joinDelete(KeyValueSet[LK]{{Key: key.(LK), Value: value}}.All(), j.right.All())
+		j.left.Delete(key.(LK))
+	} else {
+		j.joinDelete(j.left.All(), KeyValueSet[RK]{{Key: key.(RK), Value: value}}.All())
+		j.right.Delete(key.(RK))
 	}
 }
 */

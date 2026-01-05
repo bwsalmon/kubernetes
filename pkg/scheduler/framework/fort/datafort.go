@@ -5,15 +5,24 @@ import (
 	"log"
 )
 
+type KeyValueTarget interface {
+	onUpdate(key any, value any, source KeyValueSource)
+	onDelete(key any, value any, source KeyValueSource)
+}
+
+type KeyValueSource interface {
+	addTarget(target KeyValueTarget)
+}
+
 type SourceSpec struct {
 	Create       SourceFactory
 	Dependencies []string
 }
 
-type SourceFactory func(s State, name string, clonedState bool) (any, error)
+type SourceFactory func(s DataFort, name string, clonedState bool) (any, error)
 
-func newState(spec StateSpec) State {
-	s := &state{
+func newDataFort(spec Spec) DataFort {
+	s := &dataFort{
 		spec: spec,
 		root: newCloneMap(map[string]any{}, nil, nil, 0),
 	}
@@ -21,20 +30,24 @@ func newState(spec StateSpec) State {
 	return s
 }
 
-type state struct {
-	spec StateSpec
+type dataFort struct {
+	spec Spec
 	root *CloneMap[string]
 }
 
-func (s *state) Clone() State {
-	newState := &state{
+type Cloneable interface {
+	CloneIfNotOwned(owner any) any
+}
+
+func (s *dataFort) Clone() DataFort {
+	newState := &dataFort{
 		spec: s.spec,
 		root: newCloneMap(map[string]any{}, nil, nil, 0),
 	}
 	newState.root.root = newState.root
 
 	for key, value := range s.root.data {
-		cloned := value.(Cloneable).Clone(newState.root)
+		cloned := value.(Cloneable).CloneIfNotOwned(newState.root)
 		newState.root.Update(key, cloned)
 	}
 
@@ -44,7 +57,19 @@ func (s *state) Clone() State {
 	return newState
 }
 
-func makeOrCloneMap[K comparable](s *state, name string, isClone bool) *CloneMap[K] {
+func (s *dataFort) Get(name string) (any, bool) {
+	return s.root.Get(name)
+}
+
+func getSource(d *dataFort, name string) KeyValueSource {
+	s, found := d.Get(name)
+	if !found {
+		log.Fatalf("Couldn't find source %s", name)
+	}
+	return s.(KeyValueSource)
+}
+
+func makeOrCloneMap[K comparable](s *dataFort, name string, isClone bool) *CloneMap[K] {
 	if isClone {
 		if v, found := s.root.Get(name); found {
 			return v.(*CloneMap[K])
@@ -57,7 +82,7 @@ func makeOrCloneMap[K comparable](s *state, name string, isClone bool) *CloneMap
 	return nm
 }
 
-func (s *state) Print() {
+func (s *dataFort) Print() {
 	fmt.Printf("State{\n")
 	for name, cmap := range s.root.All() {
 		fmt.Printf("  %s:\n", name)
@@ -104,7 +129,7 @@ func (s *stateSpec) New(name string, spec *SourceSpec) error {
 	return nil
 }
 
-func (s *stateSpec) Update(st *state, clonedState bool) error {
+func (s *stateSpec) Update(st *dataFort, clonedState bool) error {
 	for _, spec := range s.specs {
 		newSource, err := spec.spec.Create(st, spec.name, clonedState)
 		if err != nil {
@@ -113,4 +138,22 @@ func (s *stateSpec) Update(st *state, clonedState bool) error {
 		st.root.Update(spec.name, newSource)
 	}
 	return nil
+}
+
+func (s KeyValueSet[K]) All() KeyValueIterator[K] {
+	return func(yield func(key K, value any) bool) {
+		for _, kv := range s {
+			if !yield(kv.Key, kv.Value) {
+				return
+			}
+		}
+	}
+}
+
+func GetItem[T any](d DataFort, name string) T {
+	m, found := d.Get(name)
+	if !found {
+		log.Fatalf("Couldn't find item %s", name)
+	}
+	return m.(T)
 }

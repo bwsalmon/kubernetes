@@ -1,5 +1,6 @@
 package fastpodspread
 
+/*
 import (
 	"context"
 	"encoding/json"
@@ -16,13 +17,8 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 )
 
-type ConstraintWId struct {
-	Id         string
-	Constraint Constraint
-}
-
 type Constraint struct {
-	Selector        map[string]string
+	Owner           *metav1.OwnerReference
 	TopoConstraints []v1.TopologySpreadConstraint
 }
 
@@ -35,180 +31,83 @@ func podMatchesSelector(pod *v1.Pod, selector map[string]string) bool {
 	return selectorObj.Matches(labels.Set(pod.Labels))
 }
 
-func SetupState(informerFactory informers.SharedInformerFactory, spec fort.StateSpec, defaultConstraints []v1.TopologySpreadConstraint) {
+func getPodConstraint(pod *v1.Pod, defaultConstraints []v1.TopologySpreadConstraint) (string, Constraint) {
+	topo := defaultConstraints
+	if len(pod.Spec.TopologySpreadConstraints) > 0 {
+		topo = pod.Spec.TopologySpreadConstraints
+	}
+
+	constraint := Constraint{
+		Owner:           metav1.GetControllerOf(pod),
+		TopoConstraints: topo,
+	}
+
+	constraintSerial, _ := json.Marshal(constraint)
+	constraintId := string(constraintSerial)
+
+	return constraintId, constraint
+}
+
+func SetupState(informerFactory informers.SharedInformerFactory, spec fort.Spec, defaultConstraints []v1.TopologySpreadConstraint) {
 	spec.New(
-		"pods",
-		fort.WrapInformer(informerFactory.Core().V1().Pods().Informer()),
-	)
-	spec.New(
-		"services",
-		fort.WrapInformer(informerFactory.Core().V1().Services().Informer()),
-	)
-	spec.New(
-		"nodes",
+		"nodeInfos",
 		fort.WrapInformer(informerFactory.Core().V1().Nodes().Informer()),
 	)
+
 	spec.New(
-		"rcs",
-		fort.WrapInformer(informerFactory.Core().V1().ReplicationControllers().Informer()),
-	)
-
-	spec.New("_podServices",
-		fort.FullJoin[string, string](
-			"pods",
-			"services",
-		),
-	)
-
-	spec.New("_selectorConstraints",
+		"constraintDomainPodCounts",
 		fort.MapReduce(
-			func(kv *fort.KeyValue[fort.JoinKey[string, string]]) fort.KeyValueSet[string] {
-				podInfo := kv.Value.(fort.JoinValue).Left.(fwk.PodInfo)
-				service := kv.Value.(fort.JoinValue).Right.(*v1.Service)
-				pod := podInfo.GetPod()
+			func(kv *fort.KeyValue[string]) fort.KeyValueSet[fort.StrTriple] {
+				nodeInfo := kv.Value.(fwk.NodeInfo)
 
-				ret := fort.KeyValueSet[string]{}
+				ret := fort.KeyValueSet[fort.StrTriple]{}
 
-				if podMatchesSelector(podInfo.GetPod(), service.Spec.Selector) {
-					topo := defaultConstraints
-					if len(pod.Spec.TopologySpreadConstraints) > 0 {
-						topo = pod.Spec.TopologySpreadConstraints
-					}
+				for _, podInfo := range nodeInfo.GetPods() {
+					pod := podInfo.GetPod()
 
-					constraint := &ConstraintWId{
-						Constraint: Constraint{
-							Selector:        service.Spec.Selector,
-							TopoConstraints: topo,
-						},
-					}
+					constraintId, constraint := getPodConstraint(pod, defaultConstraints)
 
-					constraintId, _ := json.Marshal(constraint.Constraint)
-					constraint.Id = string(constraintId)
-
-					ret = append(ret, fort.KeyValue[string]{
-						Key:   pod.Name,
-						Value: constraint,
-					})
-				}
-				return ret
-			},
-			fort.AnyValue,
-			"_podServices",
-		),
-	)
-
-	spec.New("_podRcs",
-		fort.LookupJoin(
-			"pods",
-			"rcs",
-			func(kv *fort.KeyValue[string]) string {
-				pod := kv.Value.(*v1.Pod)
-				owner := metav1.GetControllerOfNoCopy(pod)
-				if owner != nil {
-					return owner.Name
-				}
-				return ""
-			},
-		),
-	)
-
-	spec.New("_rcConstraints",
-		fort.MapReduce(
-			func(kv *fort.KeyValue[fort.JoinKey[string, string]]) fort.KeyValueSet[string] {
-				podInfo := kv.Value.(fort.JoinValue).Left.(fwk.PodInfo)
-				rc := kv.Value.(fort.JoinValue).Right.(*v1.ReplicationController)
-				pod := podInfo.GetPod()
-
-				ret := fort.KeyValueSet[string]{}
-
-				topo := defaultConstraints
-				if len(pod.Spec.TopologySpreadConstraints) > 0 {
-					topo = pod.Spec.TopologySpreadConstraints
-				}
-
-				constraint := &ConstraintWId{
-					Constraint: Constraint{
-						Selector:        rc.Spec.Selector,
-						TopoConstraints: topo,
-					},
-				}
-
-				constraintId, _ := json.Marshal(constraint.Constraint)
-				constraint.Id = string(constraintId)
-
-				ret = append(ret, fort.KeyValue[string]{
-					Key:   pod.Name,
-					Value: constraint,
-				})
-				return ret
-			},
-			fort.AnyValue,
-			"_podRcs",
-		),
-	)
-
-	spec.New("_allConstraints",
-		fort.Union(map[string]string{
-			"rc":       "_rcConstraints",
-			"selector": "_selectorConstraints",
-		}),
-	)
-
-	spec.New("_constraints",
-		fort.MapReduce(
-			func(kv *fort.KeyValue[string]) fort.KeyValueSet[string] {
-				constraint := kv.Value.(ConstraintWId)
-				return fort.KeyValueSet[string]{{Key: constraint.Id, Value: constraint}}
-			},
-			fort.AnyValue,
-			"_allConstraints",
-		),
-	)
-
-	spec.New("_topoKeys",
-		fort.MapReduce(
-			func(kv *fort.KeyValue[string]) fort.KeyValueSet[string] {
-				constraint := kv.Value.(Constraint)
-				ret := fort.KeyValueSet[string]{}
-				for _, c := range constraint.TopoConstraints {
-					ret = append(ret, fort.KeyValue[string]{Key: c.TopologyKey, Value: true})
-				}
-				return ret
-			},
-			fort.AnyValue,
-			"_constraints",
-		),
-	)
-
-	spec.New("_nodeTopoKeys",
-		fort.FullJoin[string, string](
-			"nodes",
-			"_topoKeys",
-		),
-	)
-
-	spec.New("_topoDomains",
-		fort.MapReduce(
-			func(kv *fort.KeyValue[fort.JoinKey[string, string]]) fort.KeyValueSet[fort.StrTuple] {
-				joined := kv.Value.(fort.JoinValue)
-				node := joined.Left.(*v1.Node)
-				topoKey := joined.Right.(string)
-				if topoDomain, hasValue := node.Labels[topoKey]; hasValue {
-					return fort.KeyValueSet[fort.StrTuple]{
-						{
-							Key:   fort.StrTuple{topoKey, topoDomain},
+					for _, t := range constraint.TopoConstraints {
+						domain := nodeInfo.Node().Labels[t.TopologyKey]
+						ret = append(ret, fort.KeyValue[fort.StrTriple]{
+							Key:   fort.StrTriple{constraintId, t.TopologyKey, domain},
 							Value: true,
-						},
+						})
 					}
 				}
-				return fort.KeyValueSet[fort.StrTuple]{}
+				return ret
 			},
-			fort.AnyValue,
-			"_nodeTopoKeys",
+			fort.Count,
+			"nodeInfos",
 		),
 	)
 
-	spec.New("_topoKeyNumDomains",
+	spec.New(
+		"constraintCounts",
+		fort.MapReduce(
+			func(kv *fort.KeyValue[fort.StrTriple]) fort.KeyValueSet[string] {
+				return fort.KeyValueSet[string]{{Key: kv.Key[0], Value: kv.Value}}
+			},
+			fort.Sum,
+			"constraintDomainPodCounts",
+		),
+	)
+
+	spec.New(
+		"topoDomains",
+		fort.MapReduce(
+			func(kv *fort.KeyValue[fort.StrTriple]) fort.KeyValueSet[fort.StrTuple] {
+				return fort.KeyValueSet[fort.StrTuple]{{
+					Key:   fort.StrTuple{kv.Key[1], kv.Key[2]},
+					Value: true,
+				}}
+			},
+			fort.AnyValue,
+			"constraintDomainPodCounts",
+		),
+	)
+
+	spec.New("topoKeyNumDomains",
 		fort.MapReduce(
 			func(kv *fort.KeyValue[fort.StrTuple]) fort.KeyValueSet[string] {
 				return fort.KeyValueSet[string]{
@@ -219,78 +118,18 @@ func SetupState(informerFactory informers.SharedInformerFactory, spec fort.State
 				}
 			},
 			fort.Count,
-			"_topoDomains",
-		),
-	)
-
-	spec.New("_podNodes",
-		fort.LookupJoin(
-			"pods",
-			"nodes",
-			func(kv *fort.KeyValue[string]) string {
-				pod := kv.Value.(fwk.PodInfo).GetPod()
-				return pod.Spec.NodeName
-			},
-		),
-	)
-
-	spec.New("_constraintPodNodes",
-		fort.FullJoin[string, string](
-			"_constraints",
-			"_podNodes",
-		),
-	)
-
-	spec.New("_constraintDomainPodCounts",
-		fort.MapReduce(
-			func(kv *fort.KeyValue[fort.JoinKey[string, string]]) fort.KeyValueSet[fort.StrTriple] {
-				constraints := kv.Value.(fort.JoinValue).Left.(ConstraintWId)
-				podInfo := kv.Value.(fort.JoinValue).Right.(fort.JoinValue).Left.(fwk.PodInfo)
-				node := kv.Value.(fort.JoinValue).Right.(fort.JoinValue).Right.(*v1.Node)
-				pod := podInfo.GetPod()
-
-				ret := fort.KeyValueSet[fort.StrTriple]{}
-				if podMatchesSelector(pod, constraints.Constraint.Selector) {
-					for _, c := range constraints.Constraint.TopoConstraints {
-						topoValue := node.Labels[c.TopologyKey]
-						ret = append(ret, fort.KeyValue[fort.StrTriple]{
-							Key:   fort.StrTriple{constraints.Id, c.TopologyKey, topoValue},
-							Value: true,
-						})
-					}
-				}
-				return ret
-			},
-			fort.Count,
-			"_constraintPodNodes",
-		),
-	)
-
-	spec.New("_constraintPodCounts",
-		fort.MapReduce(
-			func(kv *fort.KeyValue[fort.JoinKey[string, string]]) fort.KeyValueSet[string] {
-				constraints := kv.Value.(fort.JoinValue).Left.(ConstraintWId)
-				podInfo := kv.Value.(fort.JoinValue).Right.(fort.JoinValue).Left.(fwk.PodInfo)
-				pod := podInfo.GetPod()
-
-				if podMatchesSelector(pod, constraints.Constraint.Selector) {
-					return fort.KeyValueSet[string]{{Key: constraints.Id, Value: true}}
-				}
-				return fort.KeyValueSet[string]{}
-			},
-			fort.Count,
-			"_constraintPodNodes",
+			"topoDomains",
 		),
 	)
 
 	spec.New("constraintDomainPodCounts", fort.Materialize[fort.StrTriple]("_constraintDomainPodCounts"))
 	spec.New("constraintPodCounts", fort.Materialize[string]("_constraintPodCounts"))
-	spec.New("constraints", fort.Materialize[string]("_constraints"))
 	spec.New("topoKeyNumDomains", fort.Materialize[string]("_topoKeyNumDomains"))
 }
 
 type FastPodSpreadPodState struct {
-	Constraints         *ConstraintWId
+	ConstraintsId       string
+	Constraints         Constraint
 	NumDomains          map[string]int
 	PodCount            int
 	ConstraintPodCounts fort.KeyValueMap[fort.StrTriple]
@@ -301,7 +140,7 @@ func (s *FastPodSpreadPodState) Clone() fwk.StateData {
 }
 
 type FastPodSpreadPlugin struct {
-	state fort.State
+	state fort.DataFort
 }
 
 var _ fwk.PreFilterPlugin = &FastPodSpreadPlugin{}
@@ -336,28 +175,23 @@ func (p *FastPodSpreadPlugin) Name() string {
 
 func (p *FastPodSpreadPlugin) PreFilter(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodes []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {
 	podState := p.state //p.state.Clone()
-	constraintsMap := fort.GetMap[string](podState, "constraints")
 	constraintPodCountsMap := fort.GetMap[string](podState, "constraintPodCounts")
 	topoKeyDomainCountsMap := fort.GetMap[string](podState, "topoKeyNumDomains")
 	constraintDomainPodCounts := fort.GetMap[fort.StrTriple](podState, "constraintDomainPodCounts")
 
-	id := string(pod.UID)
-	thisPodConstraints, found := constraintsMap.Get(id)
-	if !found {
-		return nil, nil
-	}
+	constraintsId, constraints := getPodConstraint(pod, systemDefaultConstraints)
 
-	constraints := thisPodConstraints.(*ConstraintWId)
-	podCountVal, _ := constraintPodCountsMap.Get(constraints.Id)
+	podCountVal, _ := constraintPodCountsMap.Get(constraintsId)
 	podCount := podCountVal.(int)
 
 	numDomains := map[string]int{}
-	for _, c := range constraints.Constraint.TopoConstraints {
+	for _, c := range constraints.TopoConstraints {
 		val, _ := topoKeyDomainCountsMap.Get(c.TopologyKey)
 		numDomains[c.TopologyKey] = val.(int)
 	}
 
 	st := &FastPodSpreadPodState{
+		ConstraintsId:       constraintsId,
 		Constraints:         constraints,
 		NumDomains:          numDomains,
 		PodCount:            podCount,
@@ -383,9 +217,9 @@ func (p *FastPodSpreadPlugin) Filter(ctx context.Context, cycleState fwk.CycleSt
 
 	state := stateHandle.(*FastPodSpreadPodState)
 	domainCounts := map[string]int{}
-	for _, c := range state.Constraints.Constraint.TopoConstraints {
+	for _, c := range state.Constraints.TopoConstraints {
 		domain := nodeInfo.Node().Labels[c.TopologyKey]
-		val, _ := state.ConstraintPodCounts.Get(fort.StrTriple{state.Constraints.Id, c.TopologyKey, domain})
+		val, _ := state.ConstraintPodCounts.Get(fort.StrTriple{state.ConstraintsId, c.TopologyKey, domain})
 		domainCounts[c.TopologyKey] = val.(int)
 	}
 
@@ -397,3 +231,4 @@ func (p *FastPodSpreadPlugin) Filter(ctx context.Context, cycleState fwk.CycleSt
 
 	return nil
 }
+*/
