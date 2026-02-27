@@ -5,21 +5,19 @@ import (
 	"log"
 )
 
-type KeyValueTarget interface {
-	onUpdate(key any, value any, source KeyValueSource)
-	onDelete(key any, value any, source KeyValueSource)
-}
-
 type KeyValueSource interface {
 	addTarget(target KeyValueTarget)
 }
 
-type SourceSpec struct {
-	Create       SourceFactory
+type EntitySpec []*EntityDef
+
+type EntityDef struct {
+	Name         string
+	Create       EnitityFactory
 	Dependencies []string
 }
 
-type SourceFactory func(s DataFort, name string, clonedState bool) (any, error)
+type EnitityFactory func(s DataFort, name string, clonedState bool) (any, error)
 
 func newDataFort(spec Spec) DataFort {
 	s := &dataFort{
@@ -37,6 +35,7 @@ type dataFort struct {
 
 type Cloneable interface {
 	CloneIfNotOwned(owner any) any
+	Release()
 }
 
 func (s *dataFort) Clone() DataFort {
@@ -91,51 +90,52 @@ func (s *dataFort) Print() {
 	fmt.Printf("}\n")
 }
 
-type specName struct {
-	name string
-	spec *SourceSpec
-}
-
 type stateSpec struct {
 	specMap map[string]bool
-	specs   []specName
+	specs   []*EntityDef
 }
 
 func newSpec() *stateSpec {
 	return &stateSpec{
 		specMap: map[string]bool{},
-		specs:   []specName{},
+		specs:   []*EntityDef{},
 	}
 }
 
-func (s *stateSpec) New(name string, spec *SourceSpec) error {
-	if name[0] == '@' {
-		return fmt.Errorf("Names beginning with @ are reserved for internal use")
+func (s *stateSpec) New(spec EntitySpec) error {
+	for _, def := range spec {
+		if err := s.newInternal(def); err != nil {
+			return err
+		}
 	}
-	if _, exists := s.specMap[name]; exists {
-		log.Fatalf("A source named %s already exists", name)
-		return fmt.Errorf("A source named %s already exists", name)
+	return nil
+}
+
+func (s *stateSpec) newInternal(spec *EntityDef) error {
+	if _, exists := s.specMap[spec.Name]; exists {
+		log.Fatalf("A source named %s already exists", spec.Name)
+		return fmt.Errorf("A source named %s already exists", spec.Name)
 	}
 
 	for _, dep := range spec.Dependencies {
 		if _, found := s.specMap[dep]; !found {
-			log.Fatalf("Missing dependency %s for new source %s", dep, name)
-			return fmt.Errorf("Missing dependency %s for new source %s", dep, name)
+			log.Fatalf("Missing dependency %s for new source %s", dep, spec.Name)
+			return fmt.Errorf("Missing dependency %s for new source %s", dep, spec.Name)
 		}
 	}
 
-	s.specMap[name] = true
-	s.specs = append(s.specs, specName{name: name, spec: spec})
+	s.specMap[spec.Name] = true
+	s.specs = append(s.specs, spec)
 	return nil
 }
 
 func (s *stateSpec) Update(st *dataFort, clonedState bool) error {
 	for _, spec := range s.specs {
-		newSource, err := spec.spec.Create(st, spec.name, clonedState)
+		newSource, err := spec.Create(st, spec.Name, clonedState)
 		if err != nil {
 			return err
 		}
-		st.root.Update(spec.name, newSource)
+		st.root.Update(spec.Name, newSource)
 	}
 	return nil
 }
@@ -156,4 +156,10 @@ func GetItem[T any](d DataFort, name string) T {
 		log.Fatalf("Couldn't find item %s", name)
 	}
 	return m.(T)
+}
+
+func (f *dataFort) Release() {
+	for _, value := range f.root.data {
+		value.(Cloneable).Release()
+	}
 }

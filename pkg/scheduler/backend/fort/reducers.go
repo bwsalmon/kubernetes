@@ -187,3 +187,42 @@ func (s *sumReducer) CloneIfNotOwned(owner any) ReducerEntry {
 	}
 	return s
 }
+
+func Map[InnerKeyType comparable](owner any) ReducerEntry {
+	return &innerMapReducer[InnerKeyType]{
+		owner:  owner,
+		values: make(map[InnerKeyType]any),
+	}
+}
+
+type innerMapReducer[KeyType comparable] struct {
+	owner  any
+	values map[KeyType]any
+}
+
+func (s *innerMapReducer[K]) Add(value any) bool {
+	kv := value.(KeyValue[K])
+	s.values[kv.Key] = kv.Value
+	return true
+}
+
+func (s *innerMapReducer[K]) Remove(value any) (changed, empty bool) {
+	kv := value.(KeyValue[K])
+	delete(s.values, kv.Key)
+	return true, len(s.values) == 0
+}
+
+func (s *innerMapReducer[K]) Value() any {
+	ret := map[K]any{}
+	maps.Copy(ret, s.values)
+	return ret
+}
+
+func (s *innerMapReducer[K]) CloneIfNotOwned(owner any) ReducerEntry {
+	if owner != s.owner {
+		ret := &innerMapReducer[K]{values: map[K]any{}}
+		maps.Copy(ret.values, s.values)
+		return ret
+	}
+	return s
+}

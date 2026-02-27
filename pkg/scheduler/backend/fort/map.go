@@ -2,7 +2,6 @@ package fort
 
 import (
 	"fmt"
-	"runtime"
 	"sync"
 )
 
@@ -17,19 +16,16 @@ type CloneMap[K comparable] struct {
 
 var _ KeyValueMap[string] = &CloneMap[string]{}
 var _ KeyValueSource = &CloneMap[string]{}
-var _ ExternalView[string] = &CloneMap[string]{}
+var _ InputView[string] = &CloneMap[string]{}
+var _ Cloneable = &CloneMap[string]{}
 
 func newCloneMap[K comparable](data map[K]any, base *CloneMap[K], root any, references int64) *CloneMap[K] {
-	newMap := &CloneMap[K]{
+	return &CloneMap[K]{
 		references: references,
 		data:       data,
 		base:       base,
 		root:       root,
 	}
-
-	runtime.SetFinalizer(newMap, cloneMapFinalizer[K])
-
-	return newMap
 }
 
 func Get[K comparable, T any](m *CloneMap[K], key K) T {
@@ -158,9 +154,7 @@ func (m *CloneMap[K]) CloneIfNotOwned(root any) any {
 	return m
 }
 
-// Merging logic. We keep refernce counts for each map in the chain.
-// Whan a map is finalized decrease the ref count on its base.
-func cloneMapFinalizer[K comparable](m *CloneMap[K]) {
+func (m *CloneMap[K]) Release() {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
@@ -225,21 +219,21 @@ func (m *CloneMap[K]) addTarget(target KeyValueTarget) {
 
 func (m *CloneMap[K]) callOnUpdate(kv *KeyValue[K]) {
 	for _, target := range m.targets {
-		target.onUpdate(kv.Key, kv.Value, m)
+		target.OnUpdate(kv.Key, kv.Value, m)
 	}
 }
 
 func (m *CloneMap[K]) callOnDelete(kv *KeyValue[K]) {
 	for _, target := range m.targets {
-		target.onDelete(kv.Key, kv.Value, m)
+		target.OnDelete(kv.Key, kv.Value, m)
 	}
 }
 
-func (m *CloneMap[K]) onUpdate(key any, value any, _ KeyValueSource) {
+func (m *CloneMap[K]) OnUpdate(key any, value any, _ KeyValueSource) {
 	m.Update(key.(K), value)
 }
 
-func (m *CloneMap[K]) onDelete(key any, value any, _ KeyValueSource) {
+func (m *CloneMap[K]) OnDelete(key any, value any, _ KeyValueSource) {
 	m.Delete(key.(K))
 }
 

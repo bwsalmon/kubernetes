@@ -26,13 +26,13 @@ func (m *keyValueConnector[K]) addTarget(target KeyValueTarget) {
 
 func (m *keyValueConnector[K]) Update(key K, value any) {
 	for _, target := range m.targets {
-		target.onUpdate(key, value, m)
+		target.OnUpdate(key, value, m)
 	}
 }
 
 func (m *keyValueConnector[K]) Delete(key K, value any) {
 	for _, target := range m.targets {
-		target.onDelete(key, value, m)
+		target.OnDelete(key, value, m)
 	}
 }
 
@@ -42,31 +42,69 @@ func (c *keyValueConnector[K]) CloneIfNotOwned(owner any) any {
 	}
 }
 
-func newMaterializer[K comparable](source string) *SourceSpec {
-	return &SourceSpec{
-		Create: func(s DataFort, name string, isClone bool) (any, error) {
-			st := s.(*dataFort)
-			v, _ := st.root.Get(source)
-			if mapValue, isMap := v.(*CloneMap[K]); isMap {
-				return mapValue, nil
-			}
+func (c *keyValueConnector[K]) Release() {}
 
-			sourceValue := v.(KeyValueSource)
-			newMap := makeOrCloneMap[K](st, name, isClone)
-			sourceValue.addTarget(newMap)
-			return newMap, nil
+func newMaterializer[K comparable](name string, source string) EntitySpec {
+	return EntitySpec{
+		{
+			Name: name,
+			Create: func(s DataFort, name string, isClone bool) (any, error) {
+				st := s.(*dataFort)
+				v, _ := st.root.Get(source)
+				if mapValue, isMap := v.(*CloneMap[K]); isMap {
+					return mapValue, nil
+				}
+
+				sourceValue := v.(KeyValueSource)
+				newMap := makeOrCloneMap[K](st, name, isClone)
+				sourceValue.addTarget(newMap)
+				return newMap, nil
+			},
+			Dependencies: []string{source},
 		},
-		Dependencies: []string{source},
 	}
 }
 
-func newExternalView[KeyType comparable]() *SourceSpec {
-	return &SourceSpec{
-		Create: func(s DataFort, name string, isClone bool) (any, error) {
-			return makeOrCloneMap[KeyType](s.(*dataFort), name, isClone), nil
+func newInputView[KeyType comparable](name string) EntitySpec {
+	return EntitySpec{
+		{
+			Name: name,
+			Create: func(s DataFort, name string, isClone bool) (any, error) {
+				return makeOrCloneMap[KeyType](s.(*dataFort), name, isClone), nil
+			},
+			Dependencies: []string{},
 		},
-		Dependencies: []string{},
 	}
+}
+
+func listenerFactory(name string, listener KeyValueTarget, source string) EntitySpec {
+	return EntitySpec{
+		{
+			Name: name,
+			Create: func(s DataFort, name string, isClone bool) (any, error) {
+				st := s.(*dataFort)
+				store := &storer{
+					output: listener,
+				}
+				src, _ := st.root.Get(source)
+				src.(KeyValueSource).addTarget(store)
+				return store, nil
+			},
+			Dependencies: []string{source},
+		},
+	}
+}
+
+type storer struct {
+	output KeyValueTarget
+}
+
+func (s *storer) OnUpdate(key, value any, source KeyValueSource) {
+	s.output.OnUpdate(key, value, source)
+}
+
+func (s *storer) OnDelete(key, value any, source KeyValueSource) {
+	s.output.OnDelete(key, value, source)
 }
 
 type wrappedInformer struct {

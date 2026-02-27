@@ -1,25 +1,34 @@
 package fort
 
-import "k8s.io/apimachinery/pkg/util/sets"
+import (
+	"fmt"
+	"maps"
+	"slices"
 
-func fullJoinFactory[LK, RK comparable](left, right string) *SourceSpec {
-	return &SourceSpec{
-		Create: func(s DataFort, name string, clonedState bool) (any, error) {
-			st := s.(*dataFort)
-			j := &fullJoiner[LK, RK]{
-				target:      newKeyValueConnector[JoinKey[LK, RK]](),
-				leftSource:  getSource(st, left),
-				left:        makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
-				rightSource: getSource(st, right),
-				right:       makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
-			}
+	"k8s.io/apimachinery/pkg/util/sets"
+)
 
-			j.leftSource.addTarget(j)
-			j.rightSource.addTarget(j)
+func fullJoinFactory[LK, RK comparable](name, left, right string) EntitySpec {
+	return EntitySpec{
+		{
+			Name: name,
+			Create: func(s DataFort, name string, clonedState bool) (any, error) {
+				st := s.(*dataFort)
+				j := &fullJoiner[LK, RK]{
+					target:      newKeyValueConnector[JoinKey[LK, RK]](),
+					leftSource:  getSource(st, left),
+					left:        makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
+					rightSource: getSource(st, right),
+					right:       makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
+				}
 
-			return j.target, nil
+				j.leftSource.addTarget(j)
+				j.rightSource.addTarget(j)
+
+				return j.target, nil
+			},
+			Dependencies: []string{left, right},
 		},
-		Dependencies: []string{left, right},
 	}
 }
 
@@ -33,7 +42,7 @@ type fullJoiner[LK, RK comparable] struct {
 
 var _ KeyValueTarget = &fullJoiner[string, int]{}
 
-func (j *fullJoiner[LK, RK]) onUpdate(key any, value any, source KeyValueSource) {
+func (j *fullJoiner[LK, RK]) OnUpdate(key any, value any, source KeyValueSource) {
 	if source == j.leftSource {
 		kv := KeyValue[LK]{Key: key.(LK), Value: value}
 		j.joinUpdate(KeyValueSet[LK]{kv}.All(), j.right.All())
@@ -45,7 +54,7 @@ func (j *fullJoiner[LK, RK]) onUpdate(key any, value any, source KeyValueSource)
 	}
 }
 
-func (j *fullJoiner[LK, RK]) onDelete(key any, value any, source KeyValueSource) {
+func (j *fullJoiner[LK, RK]) OnDelete(key any, value any, source KeyValueSource) {
 	//fmt.Printf("Join onDelete %s, %v\n", key, value)
 	if source == j.leftSource {
 		j.joinDelete(KeyValueSet[LK]{{Key: key.(LK), Value: value}}.All(), j.right.All())
@@ -87,30 +96,33 @@ func (j *fullJoiner[LK, RK]) joinDelete(left KeyValueIterator[LK], right KeyValu
 
 type LookupFunc[LK, RK comparable] func(kv *KeyValue[LK]) RK
 
-func LookupJoin[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) *SourceSpec {
-	return lookupJoinFactory(left, right, lookupFunc)
+func LookupJoin[LK, RK comparable](name, left, right string, lookupFunc LookupFunc[LK, RK]) EntitySpec {
+	return lookupJoinFactory(name, left, right, lookupFunc)
 }
 
-func lookupJoinFactory[LK, RK comparable](left, right string, lookupFunc LookupFunc[LK, RK]) *SourceSpec {
-	return &SourceSpec{
-		Create: func(s DataFort, name string, clonedState bool) (any, error) {
-			st := s.(*dataFort)
-			j := &lookupJoiner[LK, RK]{
-				target:       makeOrCloneMap[LK](st, name, clonedState),
-				leftSource:   getSource(st, left),
-				left:         makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
-				rightSource:  getSource(st, right),
-				right:        makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
-				reverseIndex: makeOrCloneMap[RK](st, "@join_rindex_"+name, clonedState),
-				getTargetKey: lookupFunc,
-			}
+func lookupJoinFactory[LK, RK comparable](name, left, right string, lookupFunc LookupFunc[LK, RK]) EntitySpec {
+	return EntitySpec{
+		{
+			Name: name,
+			Create: func(s DataFort, name string, clonedState bool) (any, error) {
+				st := s.(*dataFort)
+				j := &lookupJoiner[LK, RK]{
+					target:       makeOrCloneMap[LK](st, name, clonedState),
+					leftSource:   getSource(st, left),
+					left:         makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
+					rightSource:  getSource(st, right),
+					right:        makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
+					reverseIndex: makeOrCloneMap[RK](st, "@join_rindex_"+name, clonedState),
+					getTargetKey: lookupFunc,
+				}
 
-			j.leftSource.addTarget(j)
-			j.rightSource.addTarget(j)
+				j.leftSource.addTarget(j)
+				j.rightSource.addTarget(j)
 
-			return j.target, nil
+				return j.target, nil
+			},
+			Dependencies: []string{left, right},
 		},
-		Dependencies: []string{left, right},
 	}
 }
 
@@ -126,7 +138,7 @@ type lookupJoiner[LK, RK comparable] struct {
 
 var _ KeyValueTarget = &lookupJoiner[string, int]{}
 
-func (j *lookupJoiner[LK, RK]) onUpdate(inKey any, value any, source KeyValueSource) {
+func (j *lookupJoiner[LK, RK]) OnUpdate(inKey any, value any, source KeyValueSource) {
 	if source == j.leftSource {
 		key := inKey.(LK)
 		targetKey := j.getTargetKey(&KeyValue[LK]{Key: key, Value: value})
@@ -166,7 +178,7 @@ func (j *lookupJoiner[LK, RK]) onUpdate(inKey any, value any, source KeyValueSou
 	}
 }
 
-func (j *lookupJoiner[LK, RK]) onDelete(inKey any, value any, source KeyValueSource) {
+func (j *lookupJoiner[LK, RK]) OnDelete(inKey any, value any, source KeyValueSource) {
 	if source == j.leftSource {
 		key := inKey.(LK)
 		j.target.Delete(key)
@@ -207,77 +219,75 @@ func (m *lookupJoiner[LK, RK]) removeFromReverseIndex(sourceKey RK, targetKey LK
 	}
 }
 
-/*
-type unioner[K comparable] struct {
-	target  *keyValueConnector[K]
-	sources []KeyValueSource
-}
+func newUnion[KeyType comparable](name string, sources map[string]string) EntitySpec {
+	return EntitySpec{
+		{
+			Name: name,
+			Create: func(s DataFort, name string, clonedState bool) (any, error) {
+				st := s.(*dataFort)
 
-func unionFactory[K comparable](sources ...string) *SourceSpec {
-	return &SourceSpec{
-		Create: func(s State, name string, clonedState bool) (any, error) {
-			target := newKeyValueConnector[K]()
-			for _, srcName := range sources {
-				src := GetSource(s, srcName)
-				src.addTarget(target)
-			}
-			return target, nil
+				union := &unioner[KeyType]{
+					sources: map[KeyValueSource]string{},
+				}
+
+				for sourceAlias, sourceName := range sources {
+					val, found := st.Get(sourceName)
+					if !found {
+						return nil, fmt.Errorf("Couldn't find source %s", sourceName)
+					}
+					source := val.(KeyValueSource)
+					union.sources[source] = sourceAlias
+
+					source.addTarget(union)
+				}
+
+				return union, nil
+			},
+			Dependencies: slices.Collect(maps.Keys(sources)),
 		},
-		Dependencies: sources,
 	}
 }
 
-func fullJoinFactory(left, right string) *SourceSpec {
-	return &SourceSpec{
-		Create: func(s DataFort, name string, clonedState bool) (any, error) {
-			st := s.(*state)
-			j := &fullJoiner[LK, RK]{
-				target:      newKeyValueConnector[JoinKey[LK, RK]](),
-				leftSource:  GetSource(st, left),
-				left:        makeOrCloneMap[LK](st, "@join_left_"+name, clonedState),
-				rightSource: GetSource(st, right),
-				right:       makeOrCloneMap[RK](st, "@join_right_"+name, clonedState),
+type unioner[KeyType comparable] struct {
+	keyValueConnector[UnionKey[KeyType]]
+	sources map[KeyValueSource]string
+}
+
+func (u *unioner[K]) OnUpdate(key any, value any, source KeyValueSource) {
+	u.keyValueConnector.Update(UnionKey[K]{
+		SourceName: u.sources[source],
+		Key:        key.(K),
+	}, value)
+}
+
+func (u *unioner[K]) OnDelete(key any, value any, source KeyValueSource) {
+	u.keyValueConnector.Delete(UnionKey[K]{
+		SourceName: u.sources[source],
+		Key:        key.(K),
+	}, value)
+}
+
+func mergeJoinFactory[KeyType comparable](name string, sources map[string]string) EntitySpec {
+	unionName := "@mergeJoin_" + name
+
+	allSources := newUnion[KeyType](unionName, sources)
+
+	join := newMapReduceFactory(
+		name,
+		func(kv *KeyValue[UnionKey[KeyType]]) KeyValueSet[KeyType] {
+			return KeyValueSet[KeyType]{
+				KeyValue[KeyType]{
+					Key: kv.Key.Key,
+					Value: KeyValue[string]{
+						Key:   kv.Key.SourceName,
+						Value: kv.Value,
+					},
+				},
 			}
-
-			j.leftSource.addTarget(j)
-			j.rightSource.addTarget(j)
-
-			return j.target, nil
 		},
-		Dependencies: []string{left, right},
-	}
-}
+		Map[string],
+		unionName,
+	)
 
-type keyJoiner[K comparable] struct {
-	target      *keyValueConnector[K]
-	leftSource  KeyValueSource
-	left        *CloneMap[K]
-	rightSource KeyValueSource
-	right       *CloneMap[K]
+	return slices.Concat(allSources, join)
 }
-
-var _ KeyValueTarget = &fullJoiner[string, int]{}
-
-func (j *fullJoiner[K]) onUpdate(key any, value any, source KeyValueSource) {
-	if source == j.leftSource {
-		kv := KeyValue[K]{Key: key.(K), Value: value}
-		j.joinUpdate(KeyValueSet[LK]{kv}.All(), j.right.All())
-		j.left.Update(key.(LK), value)
-	} else {
-		kv := KeyValue[RK]{Key: key.(RK), Value: value}
-		j.joinUpdate(j.left.All(), KeyValueSet[RK]{kv}.All())
-		j.right.Update(key.(RK), value)
-	}
-}
-
-func (j *fullJoiner[LK, RK]) onDelete(key any, value any, source KeyValueSource) {
-	//fmt.Printf("Join onDelete %s, %v\n", key, value)
-	if source == j.leftSource {
-		j.joinDelete(KeyValueSet[LK]{{Key: key.(LK), Value: value}}.All(), j.right.All())
-		j.left.Delete(key.(LK))
-	} else {
-		j.joinDelete(j.left.All(), KeyValueSet[RK]{{Key: key.(RK), Value: value}}.All())
-		j.right.Delete(key.(RK))
-	}
-}
-*/
