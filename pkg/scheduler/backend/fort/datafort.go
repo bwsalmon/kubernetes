@@ -22,7 +22,7 @@ type EnitityFactory func(s DataFort, name string, clonedState bool) (any, error)
 func newDataFort(spec Spec) DataFort {
 	s := &dataFort{
 		spec: spec,
-		root: newCloneMap(map[string]any{}, nil, nil, 0),
+		root: newCloneMap(map[string]any{}, nil, 0),
 	}
 	spec.(*stateSpec).Update(s, false)
 	return s
@@ -34,19 +34,18 @@ type dataFort struct {
 }
 
 type Cloneable interface {
-	CloneIfNotOwned(owner any) any
+	Clone() any
 	Release()
 }
 
 func (s *dataFort) Clone() DataFort {
 	newState := &dataFort{
 		spec: s.spec,
-		root: newCloneMap(map[string]any{}, nil, nil, 0),
+		root: newCloneMap(map[string]any{}, nil, 0),
 	}
-	newState.root.root = newState.root
 
 	for key, value := range s.root.data {
-		cloned := value.(Cloneable).CloneIfNotOwned(newState.root)
+		cloned := value.(Cloneable).Clone()
 		newState.root.Update(key, cloned)
 	}
 
@@ -76,7 +75,7 @@ func makeOrCloneMap[K comparable](s *dataFort, name string, isClone bool) *Clone
 		log.Fatalf("Couldn't find map %s", name)
 	}
 
-	nm := newCloneMap(map[K]any{}, nil, s.root, 0)
+	nm := newCloneMap(map[K]any{}, nil, 0)
 	s.root.Update(name, nm)
 	return nm
 }

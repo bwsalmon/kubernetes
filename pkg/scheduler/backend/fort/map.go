@@ -10,7 +10,6 @@ type CloneMap[K comparable] struct {
 	references int64
 	data       map[K]any
 	base       *CloneMap[K]
-	root       any
 	targets    []KeyValueTarget
 }
 
@@ -19,12 +18,11 @@ var _ KeyValueSource = &CloneMap[string]{}
 var _ InputView[string] = &CloneMap[string]{}
 var _ Cloneable = &CloneMap[string]{}
 
-func newCloneMap[K comparable](data map[K]any, base *CloneMap[K], root any, references int64) *CloneMap[K] {
+func newCloneMap[K comparable](data map[K]any, base *CloneMap[K], references int64) *CloneMap[K] {
 	return &CloneMap[K]{
 		references: references,
 		data:       data,
 		base:       base,
-		root:       root,
 	}
 }
 
@@ -40,6 +38,13 @@ func Get[K comparable, T any](m *CloneMap[K], key K) T {
 func (m *CloneMap[K]) Get(key K) (any, bool) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
+	v, found, _ := m.getLocked(key)
+	return v, found
+}
+
+func (m *CloneMap[K]) GetMutability(key K) (any, bool, bool) {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
 	return m.getLocked(key)
 }
 
@@ -48,18 +53,19 @@ func (m *CloneMap[K]) Has(key K) bool {
 	return found
 }
 
-func (m *CloneMap[K]) getLocked(key K) (any, bool) {
-	v, found := m.data[key]
+func (m *CloneMap[K]) getLocked(key K) (any, bool, bool) {
+	v, foundHere := m.data[key]
 
+	found := foundHere
 	if !found && m.base != nil {
 		v, found = m.base.Get(key)
 	}
 
 	if v == tombstone {
-		return nil, false
+		return nil, false, false
 	}
 
-	return v, found
+	return v, found, foundHere
 }
 
 func (m *CloneMap[K]) All() KeyValueIterator[K] {
@@ -118,7 +124,7 @@ func (m *CloneMap[K]) deleteNoCallback(key K, callback *KeyValue[K]) bool {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	val, found := m.getLocked(key)
+	val, found, _ := m.getLocked(key)
 	if found {
 		if m.base == nil {
 			delete(m.data, key)
@@ -137,21 +143,16 @@ func (m *CloneMap[K]) deleteNoCallback(key K, callback *KeyValue[K]) bool {
 	return false
 }
 
-func (m *CloneMap[K]) CloneIfNotOwned(root any) any {
+func (m *CloneMap[K]) Clone() any {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	if m.root != root {
-		newBase := newCloneMap(m.data, m.base, m.root, 2)
+	newBase := newCloneMap(m.data, m.base, 2)
 
-		m.data = map[K]any{}
-		m.base = newBase
-		m.root = root
+	m.data = map[K]any{}
+	m.base = newBase
 
-		return newCloneMap(map[K]any{}, newBase, root, 0)
-	}
-
-	return m
+	return newCloneMap(map[K]any{}, newBase, 0)
 }
 
 func (m *CloneMap[K]) Release() {

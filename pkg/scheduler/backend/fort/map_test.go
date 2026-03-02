@@ -14,7 +14,7 @@ func newTestCloneMap(initialData map[string]any) *CloneMap[string] {
 	}
 	// Note: We use the internal newCloneMap for simplicity in test setup,
 	// but normally a public constructor would be preferred.
-	return newCloneMap(initialData, nil, nil, 1)
+	return newCloneMap(initialData, nil, 1)
 }
 
 // ====================================================================
@@ -160,7 +160,7 @@ func TestCloneMap_Inheritance(t *testing.T) {
 
 	// Child map
 	childData := map[string]any{"k2": 20, "k3": 30} // Overrides k2, adds k3
-	childMap := newCloneMap(childData, baseMap, nil, 1)
+	childMap := newCloneMap(childData, baseMap, 1)
 
 	// 1. Get from child's data (override)
 	val, found := childMap.Get("k2")
@@ -212,7 +212,7 @@ func TestCloneMap_All(t *testing.T) {
 
 	// Child map: overrides k2, deletes k1 (with tombstone), adds k4
 	childData := map[string]any{"k2": 20, "k4": 40, "k1": tombstone}
-	childMap := newCloneMap(childData, baseMap, nil, 1)
+	childMap := newCloneMap(childData, baseMap, 1)
 
 	expectedKeys := map[string]any{"k2": 20, "k3": 3, "k4": 40}
 	actualKeys := make(map[string]any)
@@ -253,10 +253,9 @@ func TestCloneMap_All(t *testing.T) {
 
 func TestCloneMap_Clone(t *testing.T) {
 	m := newTestCloneMap(map[string]any{"k1": 10})
-	rootA := "rootA"
 
 	// 1. First Clone
-	mCloneable := m.CloneIfNotOwned(rootA)
+	mCloneable := m.Clone()
 	clone, ok := mCloneable.(*CloneMap[string])
 	if !ok {
 		t.Fatalf("Clone did not return a *CloneMap[string]")
@@ -272,9 +271,6 @@ func TestCloneMap_Clone(t *testing.T) {
 	if m.base.data["k1"] != 10 {
 		t.Errorf("Original map's base data missing old data. Got: %v", m.base.data)
 	}
-	if m.root != rootA {
-		t.Errorf("Original map root not set to new rootA. Got: %v", m.root)
-	}
 
 	// Check Clone Map (clone)
 	if len(clone.data) != 0 {
@@ -282,15 +278,6 @@ func TestCloneMap_Clone(t *testing.T) {
 	}
 	if clone.base != m.base {
 		t.Errorf("New clone map base should point to original map's old state.")
-	}
-	if clone.root != rootA {
-		t.Errorf("New clone map root not set to new rootA. Got: %v", clone.root)
-	}
-
-	// 2. Second Clone with Same Root (should return the same map)
-	mCloneable2 := m.CloneIfNotOwned(rootA)
-	if mCloneable2 != m {
-		t.Errorf("Cloning with the same root should return the original map instance.")
 	}
 
 	// 3. Update the clone (should not affect base map's data)
@@ -312,10 +299,10 @@ func TestCloneMap_Clone(t *testing.T) {
 
 func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	// Base map: references 1 (initial ref)
-	baseMap := newCloneMap(map[string]any{"k1": 1}, nil, nil, 2)
+	baseMap := newCloneMap(map[string]any{"k1": 1}, nil, 2)
 
 	// Child map: references 1 (initial ref)
-	childMap := newCloneMap(map[string]any{"k2": 20, "k1": tombstone}, baseMap, nil, 1)
+	childMap := newCloneMap(map[string]any{"k2": 20, "k1": tombstone}, baseMap, 1)
 
 	// Merge should not happen as baseMap.references is 1 (still referenced by childMap)
 	childMap.mergeBaseIfPossible()
@@ -336,9 +323,9 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	// Setup scenario for merge:
 	// A -> B (ref 1)
 	// B -> C (ref 1)
-	mapC := newCloneMap(map[string]any{"kc": "C"}, nil, nil, 1)
-	mapB := newCloneMap(map[string]any{"kb": "B"}, mapC, nil, 1)
-	mapA := newCloneMap(map[string]any{"ka": "A"}, mapB, nil, 1)
+	mapC := newCloneMap(map[string]any{"kc": "C"}, nil, 1)
+	mapB := newCloneMap(map[string]any{"kb": "B"}, mapC, 1)
+	mapA := newCloneMap(map[string]any{"ka": "A"}, mapB, 1)
 
 	// A is the map we are simulating a reference removal on.
 	// We want to test B merging into A.
@@ -348,8 +335,8 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	// the simplest scenario is:
 
 	// Parent (Base) -> Child (references = 1)
-	parent := newCloneMap(map[string]any{"k_parent": 1}, nil, nil, 2) // references > 1
-	child := newCloneMap(map[string]any{"k_child": 2}, parent, nil, 1)
+	parent := newCloneMap(map[string]any{"k_parent": 1}, nil, 2) // references > 1
+	child := newCloneMap(map[string]any{"k_child": 2}, parent, 1)
 
 	// Now we simulate the finalizer running on some *other* map that referenced 'parent'.
 	// This is too hard, so let's directly use a simple merge case on 'child'.
@@ -378,10 +365,9 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 
 	// Initial map
 	m := newTestCloneMap(map[string]any{"k1": 1})
-	rootA := "rootA"
 
 	// Clone 1
-	clone1 := m.CloneIfNotOwned(rootA).(*CloneMap[string])
+	clone1 := m.Clone().(*CloneMap[string])
 
 	// State after clone:
 	// m: data={}, base -> m_old (ref=2), root=rootA
@@ -441,7 +427,7 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	m_root := newTestCloneMap(map[string]any{"A": 1}) // ref=1
 
 	// 2. Clone 1 (m_child)
-	m_child := m_root.CloneIfNotOwned("rootX").(*CloneMap[string])
+	m_child := m_root.Clone().(*CloneMap[string])
 	//m_base := m_root.base // This is the old state of m_root (ref=2)
 
 	// m_root: data={}, base=m_base (ref=2), root="rootX"
@@ -469,9 +455,9 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	// MERGE TEST SCENARIO: A -> B (ref=1) -> C (ref=1)
 	// We want B to merge into C.
 
-	mapC = newCloneMap(map[string]any{"kc": 3}, nil, nil, 2)
-	mapB = newCloneMap(map[string]any{"kb": 2, "kc": 30}, mapC, nil, 1)        // B overrides C's kc
-	mapA = newCloneMap(map[string]any{"ka": 1, "kc": tombstone}, mapB, nil, 1) // A deletes kc from B/C
+	mapC = newCloneMap(map[string]any{"kc": 3}, nil, 2)
+	mapB = newCloneMap(map[string]any{"kb": 2, "kc": 30}, mapC, 1)        // B overrides C's kc
+	mapA = newCloneMap(map[string]any{"ka": 1, "kc": tombstone}, mapB, 1) // A deletes kc from B/C
 
 	// 1. Simulate mapA finalizer: Calls mapB.removeRef()
 	mapB.removeRef()
@@ -490,9 +476,9 @@ func TestCloneMap_MergeBaseIfPossible(t *testing.T) {
 	mapC.references = 1
 
 	// Reset the chain and references.
-	mapC = newCloneMap(map[string]any{"kc": 3, "k0": 0}, nil, nil, 1)                // Base for B (ref=1)
-	mapB = newCloneMap(map[string]any{"kb": 2, "kc": 30}, mapC, nil, 2)              // Base for A (ref=2)
-	mapA = newCloneMap(map[string]any{"ka": 1, "k_delete": tombstone}, mapB, nil, 1) // Child of B (ref=1)
+	mapC = newCloneMap(map[string]any{"kc": 3, "k0": 0}, nil, 1)                // Base for B (ref=1)
+	mapB = newCloneMap(map[string]any{"kb": 2, "kc": 30}, mapC, 2)              // Base for A (ref=2)
+	mapA = newCloneMap(map[string]any{"ka": 1, "k_delete": tombstone}, mapB, 1) // Child of B (ref=1)
 
 	// 1. Simulate mapA finalizer: Calls mapB.removeRef()
 	mapB.removeRef()
@@ -559,7 +545,7 @@ func TestCloneMap_Concurrency(t *testing.T) {
 			}
 
 			// Test Clone concurrently
-			m.CloneIfNotOwned(fmt.Sprintf("root%d", id))
+			m.Clone()
 		}(i)
 	}
 

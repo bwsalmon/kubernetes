@@ -36,7 +36,7 @@ func (m *keyValueConnector[K]) Delete(key K, value any) {
 	}
 }
 
-func (c *keyValueConnector[K]) CloneIfNotOwned(owner any) any {
+func (c *keyValueConnector[K]) Clone() any {
 	return &keyValueConnector[K]{
 		targets: append([]KeyValueTarget{}, c.targets...),
 	}
@@ -153,7 +153,7 @@ func (w *wrappedInformer) addTarget(target KeyValueTarget) {
 	w.keyValueConnector.addTarget(target)
 }
 
-func (w *wrappedInformer) Clone(owner any) Cloneable {
+func (w *wrappedInformer) Clone() any {
 	return newKeyValueConnector[string]()
 }
 

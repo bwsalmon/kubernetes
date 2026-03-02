@@ -72,11 +72,14 @@ func (m *mapReducer[I, O]) OnDelete(key any, value any, source KeyValueSource) {
 func (m *mapReducer[I, O]) addToResults(key O, value any) {
 	var mutable ReducerEntry
 
-	existing, found := m.reducerResults.Get(key)
+	existing, found, isMutable := m.reducerResults.GetMutability(key)
 	if found {
-		mutable = existing.(ReducerEntry).CloneIfNotOwned(m.owner)
+		mutable = existing.(ReducerEntry)
+		if !isMutable {
+			mutable = mutable.Clone()
+		}
 	} else {
-		mutable = m.reducer(m.owner)
+		mutable = m.reducer()
 	}
 
 	changed := mutable.Add(value)
@@ -90,8 +93,11 @@ func (m *mapReducer[I, O]) addToResults(key O, value any) {
 }
 
 func (m *mapReducer[I, O]) removeFromResults(key O, value any) {
-	if existing, found := m.reducerResults.Get(key); found {
-		mutable := existing.(ReducerEntry).CloneIfNotOwned(m.owner)
+	if existing, found, isMutable := m.reducerResults.GetMutability(key); found {
+		mutable := existing.(ReducerEntry)
+		if !isMutable {
+			mutable = mutable.Clone()
+		}
 		changed, empty := mutable.Remove(value)
 		if changed {
 			if empty {

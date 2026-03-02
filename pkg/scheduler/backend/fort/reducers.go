@@ -7,7 +7,7 @@ import (
 )
 
 // Create a new reducer entry owned by the given object.
-type Reducer func(owner any) ReducerEntry
+type Reducer func() ReducerEntry
 
 // An individual reducer entry.
 type ReducerEntry interface {
@@ -37,17 +37,16 @@ type ReducerEntry interface {
 	// it is owned by some other value, then
 	// return a new copy of the reducer that is now
 	// owned by the provided owner.
-	CloneIfNotOwned(owner any) ReducerEntry
+	Clone() ReducerEntry
 }
 
 // Common reducers
 
-func countReducerFactory(owner any) ReducerEntry {
-	return &counter{owner: owner}
+func countReducerFactory() ReducerEntry {
+	return &counter{}
 }
 
 type counter struct {
-	owner any
 	count int64
 }
 
@@ -65,19 +64,15 @@ func (c *counter) Value() any {
 	return c.count
 }
 
-func (c *counter) CloneIfNotOwned(owner any) ReducerEntry {
-	if owner != c.owner {
-		return &counter{owner: owner, count: c.count}
-	}
-	return c
+func (c *counter) Clone() ReducerEntry {
+	return &counter{count: c.count}
 }
 
-func anyValueReducerFactory(owner any) ReducerEntry {
-	return &anyValue{owner: owner}
+func anyValueReducerFactory() ReducerEntry {
+	return &anyValue{}
 }
 
 type anyValue struct {
-	owner any
 	value any
 	count int64
 }
@@ -101,22 +96,17 @@ func (s *anyValue) Value() any {
 	return s.value
 }
 
-func (s *anyValue) CloneIfNotOwned(owner any) ReducerEntry {
-	if owner != s.owner {
-		return &anyValue{owner: owner, count: s.count, value: s.value}
-	}
-	return s
+func (s *anyValue) Clone() ReducerEntry {
+	return &anyValue{count: s.count, value: s.value}
 }
 
-func setReducerFactory(owner any) ReducerEntry {
+func setReducerFactory() ReducerEntry {
 	return &setReducer{
-		owner:  owner,
 		values: make(map[any]int),
 	}
 }
 
 type setReducer struct {
-	owner  any
 	values map[any]int
 }
 
@@ -149,22 +139,18 @@ func (s *setReducer) Value() any {
 	return ret
 }
 
-func (s *setReducer) CloneIfNotOwned(owner any) ReducerEntry {
-	if owner != s.owner {
-		ret := &setReducer{values: map[any]int{}}
-		maps.Copy(ret.values, s.values)
-		return ret
-	}
-	return s
+func (s *setReducer) Clone() ReducerEntry {
+	ret := &setReducer{values: map[any]int{}}
+	maps.Copy(ret.values, s.values)
+	return ret
 }
 
-func sumReducerFactory(owner any) ReducerEntry {
-	return &sumReducer{owner: owner}
+func sumReducerFactory() ReducerEntry {
+	return &sumReducer{}
 }
 
 type sumReducer struct {
-	owner any
-	sum   int
+	sum int
 }
 
 func (s *sumReducer) Add(value any) bool {
@@ -181,22 +167,17 @@ func (s *sumReducer) Value() any {
 	return s.sum
 }
 
-func (s *sumReducer) CloneIfNotOwned(owner any) ReducerEntry {
-	if owner != s.owner {
-		return &sumReducer{owner: owner, sum: s.sum}
-	}
-	return s
+func (s *sumReducer) Clone() ReducerEntry {
+	return &sumReducer{sum: s.sum}
 }
 
-func Map[InnerKeyType comparable](owner any) ReducerEntry {
+func Map[InnerKeyType comparable]() ReducerEntry {
 	return &innerMapReducer[InnerKeyType]{
-		owner:  owner,
 		values: make(map[InnerKeyType]any),
 	}
 }
 
 type innerMapReducer[KeyType comparable] struct {
-	owner  any
 	values map[KeyType]any
 }
 
@@ -218,11 +199,8 @@ func (s *innerMapReducer[K]) Value() any {
 	return ret
 }
 
-func (s *innerMapReducer[K]) CloneIfNotOwned(owner any) ReducerEntry {
-	if owner != s.owner {
-		ret := &innerMapReducer[K]{values: map[K]any{}}
-		maps.Copy(ret.values, s.values)
-		return ret
-	}
-	return s
+func (s *innerMapReducer[K]) Clone() ReducerEntry {
+	ret := &innerMapReducer[K]{values: map[K]any{}}
+	maps.Copy(ret.values, s.values)
+	return ret
 }
