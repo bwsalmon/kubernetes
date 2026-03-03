@@ -3,18 +3,19 @@ package fort
 import (
 	"maps"
 
+	"golang.org/x/exp/constraints"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // Create a new reducer entry owned by the given object.
-type Reducer func() ReducerEntry
+type Reducer[I, O any] func() ReducerEntry[I, O]
 
 // An individual reducer entry.
-type ReducerEntry interface {
+type ReducerEntry[I, O any] interface {
 	// Add a value to the reducer. The result
 	// should be true if the Value() result has changed
 	// after the add, false if it has not.
-	Add(value any) bool
+	Add(value I) bool
 
 	// Remove a value from the reducer.
 	//
@@ -23,63 +24,56 @@ type ReducerEntry interface {
 	//
 	// The "empty" result should be true if the given reducer entry
 	// is now empty and can be removed from our maps, false otherwise.
-	Remove(value any) (changed, empty bool)
+	Remove(value I) (changed, empty bool)
 
 	// Return the current value of the reducer.
 	// Note that while the internal state of the reducer is mutable
 	// (Fort manages the state using CloneIfNotOwneed),
 	// the values returned by Value() must be immmutable,
 	// as with other values pased into the system.
-	Value() any
+	Value() O
 
 	// If the reducer value is owned by the given
 	// owner then return the current entry. If
 	// it is owned by some other value, then
 	// return a new copy of the reducer that is now
 	// owned by the provided owner.
-	Clone() ReducerEntry
+	Clone() ReducerEntry[I, O]
 }
 
 // Common reducers
 
-func countReducerFactory() ReducerEntry {
-	return &counter{}
-}
-
-type counter struct {
+type counter[I any] struct {
 	count int64
 }
 
-func (c *counter) Add(value any) bool {
+func (c *counter[I]) Add(value I) bool {
 	c.count++
 	return true
 }
 
-func (c *counter) Remove(value any) (changed, empty bool) {
+func (c *counter[I]) Remove(value I) (changed, empty bool) {
 	c.count--
 	return true, c.count == 0
 }
 
-func (c *counter) Value() any {
+func (c *counter[I]) Value() int64 {
 	return c.count
 }
 
-func (c *counter) Clone() ReducerEntry {
-	return &counter{count: c.count}
+func (c *counter[I]) Clone() ReducerEntry[I, int64] {
+	return &counter[I]{count: c.count}
 }
 
-func anyValueReducerFactory() ReducerEntry {
-	return &anyValue{}
-}
-
-type anyValue struct {
-	value any
+type anyValue[T comparable] struct {
+	value T
 	count int64
 }
 
-func (s *anyValue) Add(value any) bool {
+func (s *anyValue[T]) Add(value T) bool {
 	changed := false
-	if s.value == nil && value != nil {
+	var empty T
+	if s.value == empty && value != empty {
 		s.value = value
 		changed = true
 	}
@@ -87,30 +81,24 @@ func (s *anyValue) Add(value any) bool {
 	return changed
 }
 
-func (s *anyValue) Remove(value any) (changed, empty bool) {
+func (s *anyValue[T]) Remove(value T) (changed, empty bool) {
 	s.count--
 	return s.count == 0, s.count == 0
 }
 
-func (s *anyValue) Value() any {
+func (s *anyValue[T]) Value() T {
 	return s.value
 }
 
-func (s *anyValue) Clone() ReducerEntry {
-	return &anyValue{count: s.count, value: s.value}
+func (s *anyValue[T]) Clone() ReducerEntry[T, T] {
+	return &anyValue[T]{count: s.count, value: s.value}
 }
 
-func setReducerFactory() ReducerEntry {
-	return &setReducer{
-		values: make(map[any]int),
-	}
+type setReducer[T comparable] struct {
+	values map[T]int
 }
 
-type setReducer struct {
-	values map[any]int
-}
-
-func (s *setReducer) Add(value any) bool {
+func (s *setReducer[T]) Add(value T) bool {
 	if count, found := s.values[value]; found {
 		s.values[value] = count + 1
 		return false
@@ -119,7 +107,7 @@ func (s *setReducer) Add(value any) bool {
 	return true
 }
 
-func (s *setReducer) Remove(value any) (changed, empty bool) {
+func (s *setReducer[T]) Remove(value T) (changed, empty bool) {
 	if count, found := s.values[value]; found {
 		if count > 1 {
 			s.values[value] = count - 1
@@ -131,76 +119,103 @@ func (s *setReducer) Remove(value any) (changed, empty bool) {
 	return false, false
 }
 
-func (s *setReducer) Value() any {
-	ret := sets.New[any]()
+func (s *setReducer[T]) Value() sets.Set[T] {
+	ret := sets.New[T]()
 	for k := range s.values {
 		ret.Insert(k)
 	}
 	return ret
 }
 
-func (s *setReducer) Clone() ReducerEntry {
-	ret := &setReducer{values: map[any]int{}}
+func (s *setReducer[T]) Clone() ReducerEntry[T, sets.Set[T]] {
+	ret := &setReducer[T]{values: map[T]int{}}
 	maps.Copy(ret.values, s.values)
 	return ret
 }
 
-func sumReducerFactory() ReducerEntry {
-	return &sumReducer{}
+type sumReducer[T constraints.Integer] struct {
+	sum T
 }
 
-type sumReducer struct {
-	sum int
-}
-
-func (s *sumReducer) Add(value any) bool {
-	s.sum += value.(int)
+func (s *sumReducer[T]) Add(value T) bool {
+	s.sum += value
 	return true
 }
 
-func (s *sumReducer) Remove(value any) (changed, empty bool) {
-	s.sum -= value.(int)
+func (s *sumReducer[T]) Remove(value T) (changed, empty bool) {
+	s.sum -= value
 	return true, s.sum == 0
 }
 
-func (s *sumReducer) Value() any {
+func (s *sumReducer[T]) Value() T {
 	return s.sum
 }
 
-func (s *sumReducer) Clone() ReducerEntry {
-	return &sumReducer{sum: s.sum}
+func (s *sumReducer[T]) Clone() ReducerEntry[T, T] {
+	return &sumReducer[T]{sum: s.sum}
 }
 
-func Map[InnerKeyType comparable]() ReducerEntry {
-	return &innerMapReducer[InnerKeyType]{
-		values: make(map[InnerKeyType]any),
+func MapFromKeyValues[K, V comparable]() ReducerEntry[KeyValue[K, V], map[K]V] {
+	return &innerMapReducer[K, V]{
+		values: map[K]innerMapReducerEnt[V]{},
 	}
 }
 
-type innerMapReducer[KeyType comparable] struct {
-	values map[KeyType]any
+type innerMapReducer[K, V comparable] struct {
+	values map[K]innerMapReducerEnt[V]
 }
 
-func (s *innerMapReducer[K]) Add(value any) bool {
-	kv := value.(KeyValue[K])
-	s.values[kv.Key] = kv.Value
+type innerMapReducerEnt[V comparable] struct {
+	Value V
+	Count int64
+}
+
+func (s *innerMapReducer[K, V]) Add(value KeyValue[K, V]) bool {
+	if existing, found := s.values[value.Key]; found {
+		existing.Count++
+		if existing.Value != value.Value {
+			existing.Value = value.Value
+			return true
+		}
+		return false
+	}
+
+	s.values[value.Key] = innerMapReducerEnt[V]{
+		Value: value.Value,
+		Count: 1,
+	}
 	return true
 }
 
-func (s *innerMapReducer[K]) Remove(value any) (changed, empty bool) {
-	kv := value.(KeyValue[K])
-	delete(s.values, kv.Key)
-	return true, len(s.values) == 0
+func (s *innerMapReducer[K, V]) Remove(value KeyValue[K, V]) (changed, empty bool) {
+	if existing, found := s.values[value.Key]; found {
+		if existing.Count > 1 {
+			existing.Count--
+			return false, false
+		}
+		delete(s.values, value.Key)
+		return true, len(s.values) == 0
+	}
+	return false, false
 }
 
-func (s *innerMapReducer[K]) Value() any {
-	ret := map[K]any{}
-	maps.Copy(ret, s.values)
+func (s *innerMapReducer[K, V]) Value() map[K]V {
+	ret := map[K]V{}
+	for key, ent := range s.values {
+		ret[key] = ent.Value
+	}
 	return ret
 }
 
-func (s *innerMapReducer[K]) Clone() ReducerEntry {
-	ret := &innerMapReducer[K]{values: map[K]any{}}
-	maps.Copy(ret.values, s.values)
-	return ret
+func (s *innerMapReducer[K, V]) Clone() ReducerEntry[KeyValue[K, V], map[K]V] {
+	newEnt := &innerMapReducer[K, V]{
+		values: map[K]innerMapReducerEnt[V]{},
+	}
+	for key, ent := range s.values {
+		newEnt.values[key] = innerMapReducerEnt[V]{
+			Value: ent.Value,
+			Count: ent.Count,
+		}
+	}
+	return newEnt
 }

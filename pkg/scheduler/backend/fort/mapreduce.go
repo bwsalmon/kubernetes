@@ -1,80 +1,81 @@
 package fort
 
-import (
-	"log"
-)
+type mapReducer[IK comparable, IV any, OK comparable, MV any, OV any] struct {
+	mapper         Mapper[IK, IV, OK, MV]
+	mapperResults  *CloneMap[IK, KeyValueSet[OK, MV]]
+	reducer        Reducer[MV, OV]
+	reducerResults *CloneMap[OK, ReducerEntry[MV, OV]]
+	target         *keyValueConnector[OK, OV]
+}
 
-func newMapReduceFactory[I, O comparable](name string, mapper Mapper[I, O], reducer Reducer, source string) EntitySpec {
-	return EntitySpec{
-		{
-			Name: name,
-			Create: func(s DataFort, name string, isClone bool) (any, error) {
-				st := s.(*dataFort)
+var _ Target[uint32, int32] = &mapReducer[uint32, int32, uint64, int64, int16]{}
 
-				mr := &mapReducer[I, O]{
-					owner:          nil,
-					mapper:         mapper,
-					reducer:        reducer,
-					mapperResults:  makeOrCloneMap[I](st, "@mapper_"+name, isClone),
-					reducerResults: makeOrCloneMap[O](st, "@reducer_"+name, isClone),
-					results:        makeOrCloneMap[O](st, name, isClone),
-				}
-
-				sourceObj := getSource(st, source)
-				if sourceObj == nil {
-					log.Fatalf("Couldn't find source %s", source)
-				}
-				sourceObj.addTarget(mr)
-
-				return mr.results, nil
-			},
-			Dependencies: []string{source},
-		},
+func newMapReducer[
+	InputKeyType comparable,
+	InputValueType any,
+	OutputKeyType comparable,
+	MappedValueType any,
+	OutputValueType any,
+](
+	mapper Mapper[InputKeyType, InputValueType, OutputKeyType, MappedValueType],
+	reducer Reducer[MappedValueType, OutputValueType],
+	source Source[InputKeyType, InputValueType],
+	cloneFrom Source[OutputKeyType, OutputValueType],
+) *mapReducer[InputKeyType, InputValueType, OutputKeyType, MappedValueType, OutputValueType] {
+	newMr := &mapReducer[InputKeyType, InputValueType, OutputKeyType, MappedValueType, OutputValueType]{
+		mapper:  mapper,
+		reducer: reducer,
+		target:  newKeyValueConnector[OutputKeyType, OutputValueType](),
 	}
+
+	if cloneFrom == nil {
+		newMr.mapperResults = makeOrCloneMap[InputKeyType, KeyValueSet[OutputKeyType, MappedValueType]](nil)
+		newMr.reducerResults = makeOrCloneMap[OutputKeyType, ReducerEntry[MappedValueType, OutputValueType]](nil)
+	} else {
+		c := cloneFrom.(*mapReducer[InputKeyType, InputValueType, OutputKeyType, MappedValueType, OutputValueType])
+		newMr.mapperResults = c.mapperResults.Clone()
+		newMr.reducerResults = c.reducerResults.Clone()
+	}
+
+	source.addTarget(newMr)
+
+	return newMr
 }
 
-type mapReducer[I, O comparable] struct {
-	owner          any
-	mapper         Mapper[I, O]
-	mapperResults  *CloneMap[I]
-	reducer        Reducer
-	reducerResults *CloneMap[O]
-	results        *CloneMap[O]
-}
+func (m *mapReducer[IK, IV, OK, MV, OV]) OnUpdate(key IK, value IV, source Source[IK, IV]) error {
+	existingResults, foundExistingResults := m.mapperResults.Get(key)
 
-var _ KeyValueTarget = &mapReducer[string, string]{}
-
-func (m *mapReducer[I, O]) OnUpdate(key any, value any, source KeyValueSource) {
-	existingResults, foundExistingResults := m.mapperResults.Get(key.(I))
-
-	results := m.mapper(&KeyValue[I]{Key: key.(I), Value: value})
+	results := m.mapper(&KeyValue[IK, IV]{Key: key, Value: value})
 	for _, res := range results {
 		m.addToResults(res.Key, res.Value)
 	}
-	m.mapperResults.Update(key.(I), results)
+	m.mapperResults.Update(key, results)
 
 	if foundExistingResults {
-		for _, kv := range existingResults.(KeyValueSet[O]) {
+		for _, kv := range existingResults {
 			m.removeFromResults(kv.Key, kv.Value)
 		}
 	}
+
+	return nil
 }
 
-func (m *mapReducer[I, O]) OnDelete(key any, value any, source KeyValueSource) {
-	if existing, found := m.mapperResults.Get(key.(I)); found {
-		for _, kv := range existing.(KeyValueSet[O]) {
+func (m *mapReducer[IK, IV, OK, MV, OV]) OnDelete(key IK, value IV, source Source[IK, IV]) error {
+	if existing, found := m.mapperResults.Get(key); found {
+		for _, kv := range existing {
 			m.removeFromResults(kv.Key, kv.Value)
 		}
 	}
-	m.mapperResults.Delete(key.(I))
+	m.mapperResults.Delete(key)
+	return nil
 }
 
-func (m *mapReducer[I, O]) addToResults(key O, value any) {
-	var mutable ReducerEntry
+func (m *mapReducer[IK, IV, OK, MV, OV]) addToResults(key OK, value MV) {
+	var mutable ReducerEntry[MV, OV]
 
 	existing, found, isMutable := m.reducerResults.GetMutability(key)
 	if found {
-		mutable = existing.(ReducerEntry)
+		mutable = existing.(ReducerEntry[MV, OV])
 		if !isMutable {
 			mutable = mutable.Clone()
 		}
@@ -82,19 +83,20 @@ func (m *mapReducer[I, O]) addToResults(key O, value any) {
 		mutable = m.reducer()
 	}
 
-	changed := mutable.Add(value)
 	if existing != mutable {
 		m.reducerResults.Update(key, mutable)
 	}
 
+	changed := mutable.Add(value)
 	if changed {
-		m.results.Update(key, mutable.Value())
+		v := mutable.Value()
+		m.target.Update(key, v)
 	}
 }
 
-func (m *mapReducer[I, O]) removeFromResults(key O, value any) {
+func (m *mapReducer[IK, IV, OK, MV, OV]) removeFromResults(key OK, value MV) {
 	if existing, found, isMutable := m.reducerResults.GetMutability(key); found {
-		mutable := existing.(ReducerEntry)
+		mutable := existing.(ReducerEntry[MV, OV])
 		if !isMutable {
 			mutable = mutable.Clone()
 		}
@@ -102,11 +104,24 @@ func (m *mapReducer[I, O]) removeFromResults(key O, value any) {
 		if changed {
 			if empty {
 				m.reducerResults.Delete(key)
-				m.results.Delete(key)
+				var emptyVal OV
+				m.target.Delete(key, emptyVal)
 			} else {
+				v := mutable.Value()
 				m.reducerResults.Update(key, mutable)
-				m.results.Update(key, mutable.Value())
+				m.target.Update(key, v)
 			}
 		}
 	}
+}
+
+func (m *mapReducer[IK, IV, OK, MV, OV]) addTarget(t Target[OK, OV]) {
+	m.target.addTarget(t)
+}
+
+func (m *mapReducer[IK, IV, OK, MV, OV]) Print() {
+	print("Mapper")
+	m.mapperResults.Print()
+	print("Reducer")
+	m.reducerResults.Print()
 }

@@ -1,6 +1,7 @@
 /*
-Fort is almost a database (it's a datafort!). It is an in-memory engine for map-reduce and
-join operations. All data in Fort is represented as memory key-value maps.
+Fort is almost a database (it's a datafort!).
+
+It is an in-memory engine for map-reduce and join operations. All data in Fort is represented as memory key-value maps.
 All the results of map-reduce and join are automatically updated as source data is updated.
 All of the maps are fast cloneable so the entire "db" can be cloned quickly.
 This makes it simple to generate complex data structures that are automatically
@@ -8,119 +9,197 @@ updated as data changes, and are easily fast cloneable.
 */
 package fort
 
-// A spec defines a set of views and maps that are constructed by Fort.
-// A spec is then used to create a DataFort object.
+import (
+	"golang.org/x/exp/constraints"
+	"k8s.io/apimachinery/pkg/util/sets"
+)
 
-type Spec interface {
-	// Create a new entity in Fort. Each entity must have a unique name.
+/*
+A DataFort is a user defined object containing Fort objects. All related objects must
+be contained in the same Fort object.
+
+	 For example, a trivial DataFort might look like:
+
+		type HelloWorldFort struct {
+			Input fort.WriteMap[string, string]
+			Output fort.ReadMap[string, string]
+		}
+
+		func (f *HelloWorldFort) InitOrClone(cloneFrom *HelloWorldFort) {
+		    // A place for user input.
+			f.Input = fort.NewWriteMap(cloneFrom.Input)
+		    // Record the user input into a readable map.
+			f.Output = fort.NewReadMap(f.Input, cloneFrom.Output)
+		}
+
+		func testStuff() {
+		   // Create a new HelloWorldFort.
+		   myFort := fort.New[HelloWorldFort]()
+
+		   // Add data.
+		   myFort.Input.Update("hello", "world")
+
+		   // Should get "world".
+		   myFort.Output.Get("hello")
+
+		   // Clone the fort.
+		   myClone := fort.Clone(myFort)
+
+		   // Should get "world".
+		   myClone.Output.Get("hello")
+		}
+
+Immutable data:
+
+Fort assumes that keys and values passed in by the user are immutable. Once a value is given to Fort (and
+when it is read out), the user must not edit it. If the user wishes to store complex objects they are
+responsible for creating new copies when editing them, and then passing them in using Updates to WriteMaps.
+
+Cloning:
+
+Clones act like deep clones of the data, but they are actually implemented using copy-on-write mechanisms
+internally, making clones very fast.
+
+Concurrency:
+
+Note that while Fort ensures that Clones of the same fort can be safely used concurrently, it does not
+ensure that a given clone can be used concurrently in a consistent fashion. If the user
+needs concurrent access to individual clones, they must add locking in the fort itself for updates / reads.
+*/
+type DataFort[T any] interface {
+	// Initialize a currently empty DataFort. Don't call directly,
+	// use fort.New and fort.Clone instead.
 	//
-	// There are three types of entities in Fort:
+	// If this is a new DataFort then an empty struct
+	// will be passed into cloneFrom.
 	//
-	// InputView: An input view is a logical key value map that mirrors an
-	// external data source. InputView's are kept up to date by external
-	// code. All data in Fort is eventually derived from one or more input views.
+	// If this is a clone, the struct from which to clone
+	// will be passed into cloneFrom.
 	//
-	// DerivedView: A derived view is a logical key value map that is computed
-	// from one or more source views (either InputViews or DerivedViews). Fort
-	// keeps derived views in sync with input views. There are a variety of
-	// types of derived views in Fort (map-reduce, join, etc).
-	//
-	// Output: An output represents an external key value map.
-	// For convenience in aggregating multiple derived views into a single
-	// output, we represent external views as two layer maps with an
-	// "attributeName" key for the second layer.
-	//
-	// Store: A store object mirrors the data from a view to an output.
-	New(entity EntitySpec) error
+	// In general the implementer should only need to pass the appropriate field
+	// from cloneFrom into the operator call (NewReadMap, etc).
+	// They can then treat initialization and cloning as identical.
+	InitOrClone(cloneFrom *T)
 }
 
-// Create a new input view.
-// This view starts empty, but the user can add and remove entries
-// by getting a handle to it as an ExternalView object and calling
-// update methods. All state in Fort is eventually derived from
-// some input view.
-func NewInputView[KeyType comparable](name string) EntitySpec {
-	return newInputView[KeyType](name)
+// All data in Fort eventually derives from WriteMaps. A
+// WriteMap starts empty, but the user can update and delete
+// entries using the interface.
+//
+// Note that WriteMaps are not readable directly.
+//
+// WriteMaps can them be used as Sources for other
+// transformations.
+type WriteMap[K comparable, V any] interface {
+	// Update the given key to point to the given value.
+	// Note that values passed into Fort are then owned by
+	// Fort, the caller must not edit them.
+	//
+	// Calling this function will update all of the dependent objects
+	// so when it returns the other data structures will be consistent.
+	Update(key K, value V) error
+
+	// Delete the given key from the map. Note that we require the
+	// caller to pass in the deleted item so we don't have to actually
+	// keep a physical map internally.
+	//
+	// Calling this function will update all of the dependent objects
+	// so when it returns the other data structures will be consistent.
+	Delete(key K, value V) error
+
+	Source[K, V]
 }
 
-// Define a new derived view generated by running map reduce on the given source view.
+// Create a new WriteMap. If cloneFrom is nil, create a new empty WriteMap.
+// If cloneFrom is not nil, create a new WriteMap that is a clone
+// of the cloneFrom map.
+func NewWriteMap[K comparable, V any](cloneFrom WriteMap[K, V]) WriteMap[K, V] {
+	return newWriteMap[K, V]()
+}
+
+// ReadMaps are the way to get data out of Fort.
+// A ReadMap materializes a source so that the user
+// can query items from it as needed.
+type ReadMap[K comparable, V any] interface {
+	// Get the value for the given key. The boolean
+	// is true if the key was found, false otherwise.
+	Get(key K) (V, bool)
+
+	// Return an iterator for the entire map.
+	// Can be used like:
+	// for k, v := range myMap.All() { }
+	All() KeyValueIterator[K, V]
+
+	// Print the map, used in debugging.
+	Print()
+
+	Target[K, V]
+}
+
+// Create a new ReadMap that captures data from the source.
+// If cloneFrom is nil, this creates a new map, if cloneFrom is not
+// nil the ReadMap will be a clone of the source ReadMap.
+func NewReadMap[K comparable, V any](source Source[K, V], cloneFrom ReadMap[K, V]) ReadMap[K, V] {
+	var newMap *readMap[K, V]
+	if cloneFrom == nil {
+		newMap = newReadMap[K, V]()
+	} else {
+		newMap = cloneFrom.(*readMap[K, V]).Clone()
+	}
+	source.addTarget(newMap)
+	return newMap
+}
+
+// Define a new derived source generated by running map reduce on the given source.
+// This can in turn be used as a source for other transforms.
 //
 // Logically map reduce will:
 //   - call the mapper function on each key value pair in the original source. The mapper
 //     function returns one or more key value pairs generated from the source key value pair.
 //   - aggregate the results of all the mapper calls by key.
 //   - call the reducer function on the set of values with a given key.
-//   - save the reducer output in the result view with the given key.
-func MapReduce[InputKeyType, OutputKeyType comparable](name string, mapper Mapper[InputKeyType, OutputKeyType], reducer Reducer, source string) EntitySpec {
-	return newMapReduceFactory(name, mapper, reducer, source)
+//   - save the reducer output with the given key.
+//
+// If cloneFrom is nil, then this creates a new empty MapReduce. If cloneFrom is not nil,
+// it will be cloned from cloneFrom.
+//
+// Note that the input arguments should define all of the necessary template parameters
+// automatically.
+func MapReduce[
+	InputKeyType comparable,
+	InputValueType any,
+	OutputKeyType comparable,
+	MappedValueType any,
+	OutputValueType any,
+](
+	source Source[InputKeyType, InputValueType],
+	mapper Mapper[InputKeyType, InputValueType, OutputKeyType, MappedValueType],
+	reducer Reducer[MappedValueType, OutputValueType],
+	cloneFrom Source[OutputKeyType, OutputValueType],
+) Source[OutputKeyType, OutputValueType] {
+	return newMapReducer(mapper, reducer, source, cloneFrom)
 }
 
-// Define a new derived view created by joining two source views.
-// Logically FullJoin will create a new view with one entry for each pair of entries in the sources.
-// The keys of the resulting view will be a JoinKey, the values will be a JoinValue.
-func FullJoin[LeftKeyType, RightKeyType comparable](name, left, right string) EntitySpec {
-	return fullJoinFactory[LeftKeyType, RightKeyType](name, left, right)
+// Define a new derived source created by joining two sources.
+// Logically FullJoin will create a new source with one entry for each pair of entries in the sources.
+// The keys of the result will be JoinKeys, the values will be JoinValues.
+//
+// If cloneFrom is nil, then this creates a new empty join. If cloneFrom is not nil,
+// it will be cloned from cloneFrom.
+//
+// Note that the input arguments should define all of the necessary template parameters
+// automatically.
+func FullJoin[LeftKeyType comparable, LeftValueType any, RightKeyType comparable, RightValueType any](
+	left Source[LeftKeyType, LeftValueType],
+	right Source[RightKeyType, RightValueType],
+	cloneFrom Source[JoinKey[LeftKeyType, RightKeyType], JoinValue[LeftValueType, RightValueType]],
+) Source[JoinKey[LeftKeyType, RightKeyType], JoinValue[LeftValueType, RightValueType]] {
+	return newFullJoiner(left, right, cloneFrom)
 }
 
-// Define a new derived view created by merging the given source maps.
-// Logically, MergeJoin will create a new view with one entry for each entry in each source.
-// The keys of the results map will be KeyType,. The input sources are a map from
-// source name to source alias, which is used as the SourceName in the UnionKeys from that
-// source.
-func MergeJoin[KeyType comparable](name string, sources map[string]string) EntitySpec {
-	return mergeJoinFactory[KeyType](name, sources)
-}
+// Interfaces for key value pairs.
 
-// Create a new derived view that is the union of the given sources. The resulting view has
-// keys that are NestedKey structs, where the InnerKey is set to the name of the source view
-// and the key is set to the key from the view.
-func Union[KeyType comparable](name string, sources map[string]string) EntitySpec {
-	return newUnion[KeyType](name, sources)
-}
-
-func Materialize[KeyType comparable](name string, source string) EntitySpec {
-	return newMaterializer[KeyType](name, source)
-}
-
-// Wrap a user provided output. Stores the results from
-// the given source view to the given output.
-func Listen(name string, listener KeyValueTarget, source string) EntitySpec {
-	return listenerFactory(name, listener, source)
-}
-
-// Create a new empty spec.
-func NewSpec() Spec {
-	return newSpec()
-}
-
-// A datafort materializes all of the views and maps defined in a spec.
-// External views' contents are managed directly by the user, but all other
-// views and maps are automatically updated by Fort.
-type DataFort interface {
-	// Get returns the view or map associated with the given name.
-	// The return value will either be an ExternalView, a KeyValueMap, or
-	// an internal view which is not manipulatable externally.
-	Get(mapName string) (any, bool)
-
-	// Clone the current version of the DataFort.
-	// The result is a copy of the DataFort that can be independently
-	// updated.
-	Clone() DataFort
-
-	// Release a reference to a data fort.
-	Release()
-}
-
-// Create a new DataFort from a spec.
-// Note that once a spec is used to create a DataFort, it should
-// no longer be modified.
-func New(spec Spec) DataFort {
-	return newDataFort(spec)
-}
-
-// Interfaces for keys and maps.
-
-type KeyValue[KeyType comparable] struct {
+type KeyValue[KeyType comparable, ValueType any] struct {
 	// Note that we use generics for keys because the number
 	// of lookup and manipulation operations we do on keys
 	// makes using interfaces expensive. Values are generally
@@ -130,99 +209,91 @@ type KeyValue[KeyType comparable] struct {
 	// Note that values in Fort must be immutable. Once a value
 	// is passed in using Update or from the result of a mapper,
 	// it cannot be changed.
-	Value any
+	Value ValueType
 }
 
-// A view to mirror state from an external source.
-type InputView[KeyType comparable] interface {
-	// Add or update a given key value.
-	// Note that the value passed in must be immutable;
-	// once passed in it is owned by Fort and cannot be changed.
-	Update(key KeyType, value any)
-
-	// Delete the given key from the map.
-	Delete(key KeyType)
-}
-
-// A map of key value pairs.
-type KeyValueMap[KeyType comparable] interface {
-	// Get the value associated with the given key.
-	// The boolean is true if a value was found, false otherwise.
-	Get(key KeyType) (any, bool)
-
-	// Get an iterator over all of the key values
-	// in the given map. This can be used in
-	// "range" operations.
-	All() KeyValueIterator[KeyType]
-}
-
-// An iterator returned from maps. Note that these iterators can be used
+// An iterator over KeyValue sets. Note that these iterators can be used
 // in range operations.
-type KeyValueIterator[KeyType comparable] func(yield func(key KeyType, value any) bool)
+type KeyValueIterator[KeyType comparable, ValueType any] func(yield func(key KeyType, value ValueType) bool)
 
 // Convenience wrapper for a list of key value pairs.
-type KeyValueSet[KeyType comparable] []KeyValue[KeyType]
+type KeyValueSet[KeyType comparable, ValueType any] []KeyValue[KeyType, ValueType]
 
 // MapReduce types.
 
 // Map from an input key value pair to a set of output key value pairs.
 // Note that the values used in the output key value pairs must be immutable;
 // once returned they are owned by Fort and cannot be changed.
-type Mapper[InputKeyType, OutputKeyType comparable] func(kv *KeyValue[InputKeyType]) KeyValueSet[OutputKeyType]
+
+type Mapper[InputKey comparable, InputValue any, OutputKey comparable, OutputValue any] func(kv *KeyValue[InputKey, InputValue]) KeyValueSet[OutputKey, OutputValue]
 
 // Common reducers.
 // To define a custom reducer, see the interfaces in reducers.go.
 
-var (
-	// Store some value for each mapper key currently in the system. This assumes that the
-	// value for a given key is either always the same or irrelevant, so getting any value
-	// that has had this key at some point is acceptable.
-	AnyValue = anyValueReducerFactory
+// Count the number of entries with the given key.
+func Count[I any]() ReducerEntry[I, int64] {
+	return &counter[I]{}
+}
 
-	// Count the number of key value pairs that have the given key. Note this counts
-	// the number of key value pairs with this key, not the number of distinct values
-	// with this key. For distinct values use the "Set" reducer instead.
-	Count = countReducerFactory
+// Return some value for a given key. Useful for scenarios where
+// only the key matters or the value is always the same for a given key.
+// Note that this will return some value that has *at some point* in the
+// past been assigned to this key. The value may not currently exist in the
+// data set.
+func AnyValue[T comparable]() ReducerEntry[T, T] {
+	return &anyValue[T]{}
+}
 
-	// Assumes values are ints. Keeps a sum of all the values with a given key.
-	Sum = sumReducerFactory
+// Return the set of unique objects with a given key.
+func Distinct[T comparable]() ReducerEntry[T, sets.Set[T]] {
+	return &setReducer[T]{
+		values: make(map[T]int),
+	}
+}
 
-	// Construct a set of distinct mapper values that have the given mapper key.
-	// The result for each mapper key is a sets.Set[any], where the values are all
-	// of the values associated with the given mapper key.
-	Set = setReducerFactory
-
-	// Assumes the values in the mapper returns are themselves KeyValue[InnerKeyType]. For
-	// each outer key (the key to the mapper key values) it will construct a map made up of the
-	// inner KeyValue pairs (i.e. the values of the mapper key value returns). This assumes
-	// that the inner keys are unique; i.e. it assumes no duplicate entries.
-	// Map[InnerKeyType comparable]
-)
+// Return the sum of all values with a given key.
+// Note that this currently works only on Integer types.
+func Sum[T constraints.Integer]() ReducerEntry[T, T] {
+	return &sumReducer[T]{}
+}
 
 // Types used in join.
 
-// The key type used in the result from FullJoin.
+// The key type used in the result from Joins.
 type JoinKey[LeftKeyType, RightKeyType comparable] struct {
 	Left  LeftKeyType
 	Right RightKeyType
 }
 
 // The value type used in the results from Joins.
-type JoinValue struct {
-	Left  any
-	Right any
+type JoinValue[L, R any] struct {
+	Left  L
+	Right R
 }
 
-type UnionKey[KeyType comparable] struct {
-	// Name of the source view for this key value.
-	SourceName string
-
-	// The key from the source map.
-	Key KeyType
+// Create a new DataFort of type T.
+// The generics syntax is funky, but is called like:
+//
+//	newFort := fort.New[MyFortType]()
+func New[T any, PT interface {
+	*T
+	DataFort[T]
+}]() *T {
+	newFort := new(T)
+	var emptyFort T
+	PT(newFort).InitOrClone(&emptyFort)
+	return newFort
 }
 
-// A target to store the results from a view.
-type KeyValueTarget interface {
-	OnUpdate(key any, value any, source KeyValueSource)
-	OnDelete(key any, value any, source KeyValueSource)
+// Clone a DataFort.
+// The generics syntax is funky, but is called like:
+//
+//	clonedFort := fort.Clone(existingFort)
+func Clone[T any, PT interface {
+	*T
+	DataFort[T]
+}](toClone *T) *T {
+	newFort := new(T)
+	PT(newFort).InitOrClone(toClone)
+	return newFort
 }

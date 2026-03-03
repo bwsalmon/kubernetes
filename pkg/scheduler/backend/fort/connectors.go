@@ -1,175 +1,137 @@
 package fort
 
-import (
-	"sync"
-
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/cache"
-)
-
-type keyValueConnector[K comparable] struct {
-	targets []KeyValueTarget
+// A target to store the results from a view.
+// Only relevant externally for creating new operators.
+type Target[K comparable, V any] interface {
+	OnUpdate(key K, value V, source Source[K, V]) error
+	OnDelete(key K, value V, source Source[K, V]) error
 }
 
-var _ KeyValueSource = &keyValueConnector[string]{}
-var _ Cloneable = &keyValueConnector[string]{}
+// Sources should be opaque externally. They are only used
+// to link sources to one another using the operators.
+type Source[K comparable, V any] interface {
+	addTarget(t Target[K, V])
+	Print()
+}
 
-func newKeyValueConnector[K comparable]() *keyValueConnector[K] {
-	return &keyValueConnector[K]{
-		targets: []KeyValueTarget{},
+func (s KeyValueSet[K, V]) All() KeyValueIterator[K, V] {
+	return func(yield func(key K, value V) bool) {
+		for _, kv := range s {
+			if !yield(kv.Key, kv.Value) {
+				return
+			}
+		}
 	}
 }
 
-func (m *keyValueConnector[K]) addTarget(target KeyValueTarget) {
+type keyValueConnector[K comparable, V any] struct {
+	targets []Target[K, V]
+}
+
+var _ Source[string, int] = &keyValueConnector[string, int]{}
+
+func newKeyValueConnector[K comparable, V any]() *keyValueConnector[K, V] {
+	return &keyValueConnector[K, V]{
+		targets: []Target[K, V]{},
+	}
+}
+
+func (m *keyValueConnector[K, V]) addTarget(target Target[K, V]) {
 	m.targets = append(m.targets, target)
 }
 
-func (m *keyValueConnector[K]) Update(key K, value any) {
+func (m *keyValueConnector[K, V]) Update(key K, value V) {
 	for _, target := range m.targets {
 		target.OnUpdate(key, value, m)
 	}
 }
 
-func (m *keyValueConnector[K]) Delete(key K, value any) {
+func (m *keyValueConnector[K, V]) Delete(key K, value V) {
 	for _, target := range m.targets {
 		target.OnDelete(key, value, m)
 	}
 }
 
-func (c *keyValueConnector[K]) Clone() any {
-	return &keyValueConnector[K]{
-		targets: append([]KeyValueTarget{}, c.targets...),
+func (c *keyValueConnector[K, V]) Clone() any {
+	return &keyValueConnector[K, V]{
+		targets: append([]Target[K, V]{}, c.targets...),
 	}
 }
 
-func (c *keyValueConnector[K]) Release() {}
+func (c *keyValueConnector[K, V]) Release() {}
 
-func newMaterializer[K comparable](name string, source string) EntitySpec {
-	return EntitySpec{
-		{
-			Name: name,
-			Create: func(s DataFort, name string, isClone bool) (any, error) {
-				st := s.(*dataFort)
-				v, _ := st.root.Get(source)
-				if mapValue, isMap := v.(*CloneMap[K]); isMap {
-					return mapValue, nil
-				}
+func (c *keyValueConnector[K, V]) Print() {}
 
-				sourceValue := v.(KeyValueSource)
-				newMap := makeOrCloneMap[K](st, name, isClone)
-				sourceValue.addTarget(newMap)
-				return newMap, nil
-			},
-			Dependencies: []string{source},
-		},
+type writeMap[K comparable, V any] struct {
+	targets []Target[K, V]
+}
+
+var _ WriteMap[string, int] = &writeMap[string, int]{}
+
+func newWriteMap[K comparable, V any]() *writeMap[K, V] {
+	return &writeMap[K, V]{targets: []Target[K, V]{}}
+}
+
+func (w *writeMap[K, V]) addTarget(t Target[K, V]) {
+	w.targets = append(w.targets, t)
+}
+
+func (w *writeMap[K, V]) Update(key K, value V) error {
+	for _, t := range w.targets {
+		if err := t.OnUpdate(key, value, w); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *writeMap[K, V]) Delete(key K, value V) error {
+	for _, t := range w.targets {
+		if err := t.OnDelete(key, value, w); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *writeMap[K, V]) Print() {}
+
+type readMap[K comparable, V any] struct {
+	data *CloneMap[K, V]
+}
+
+var _ ReadMap[string, int] = &readMap[string, int]{}
+
+func newReadMap[K comparable, V any]() *readMap[K, V] {
+	return &readMap[K, V]{
+		data: newCloneMap[K, V](map[K]any{}, nil, 0),
 	}
 }
 
-func newInputView[KeyType comparable](name string) EntitySpec {
-	return EntitySpec{
-		{
-			Name: name,
-			Create: func(s DataFort, name string, isClone bool) (any, error) {
-				return makeOrCloneMap[KeyType](s.(*dataFort), name, isClone), nil
-			},
-			Dependencies: []string{},
-		},
+func (r *readMap[K, V]) Get(key K) (V, bool) {
+	return r.data.Get(key)
+}
+
+func (r *readMap[K, V]) All() KeyValueIterator[K, V] {
+	return r.data.All()
+}
+
+func (r *readMap[K, V]) OnUpdate(key K, value V, source Source[K, V]) error {
+	r.data.Update(key, value)
+	return nil
+}
+
+func (r *readMap[K, V]) OnDelete(key K, value V, source Source[K, V]) error {
+	r.data.Delete(key)
+	return nil
+}
+
+func (r *readMap[K, V]) Clone() *readMap[K, V] {
+	return &readMap[K, V]{
+		data: r.data.Clone(),
 	}
 }
 
-func listenerFactory(name string, listener KeyValueTarget, source string) EntitySpec {
-	return EntitySpec{
-		{
-			Name: name,
-			Create: func(s DataFort, name string, isClone bool) (any, error) {
-				st := s.(*dataFort)
-				store := &storer{
-					output: listener,
-				}
-				src, _ := st.root.Get(source)
-				src.(KeyValueSource).addTarget(store)
-				return store, nil
-			},
-			Dependencies: []string{source},
-		},
-	}
-}
-
-type storer struct {
-	output KeyValueTarget
-}
-
-func (s *storer) OnUpdate(key, value any, source KeyValueSource) {
-	s.output.OnUpdate(key, value, source)
-}
-
-func (s *storer) OnDelete(key, value any, source KeyValueSource) {
-	s.output.OnDelete(key, value, source)
-}
-
-type wrappedInformer struct {
-	lock sync.Mutex
-	keyValueConnector[string]
-	informer     cache.SharedInformer
-	registration cache.ResourceEventHandlerRegistration
-}
-
-var _ cache.ResourceEventHandler = &wrappedInformer{}
-var _ KeyValueSource = &wrappedInformer{}
-var _ Cloneable = &wrappedInformer{}
-
-type hasUID interface {
-	GetUID() types.UID
-}
-
-type hasName interface {
-	GetName() string
-}
-
-func (w *wrappedInformer) OnAdd(obj interface{}, isInInitialList bool) {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	key := string(obj.(hasName).GetName())
-	w.keyValueConnector.Update(key, obj)
-}
-
-func (w *wrappedInformer) OnUpdate(oldObj, newObj interface{}) {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	key := string(newObj.(hasName).GetName())
-	w.keyValueConnector.Update(key, newObj)
-}
-
-func (w *wrappedInformer) OnDelete(obj interface{}) {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	key := string(obj.(hasName).GetName())
-	w.keyValueConnector.Delete(key, obj)
-}
-
-func (w *wrappedInformer) addTarget(target KeyValueTarget) {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-	w.keyValueConnector.addTarget(target)
-}
-
-func (w *wrappedInformer) Clone() any {
-	return newKeyValueConnector[string]()
-}
-
-func wrapInformer(informer cache.SharedInformer) (*wrappedInformer, error) {
-	w := &wrappedInformer{
-		keyValueConnector: keyValueConnector[string]{
-			targets: []KeyValueTarget{},
-		},
-		informer: informer,
-	}
-
-	var err error
-	w.registration, err = informer.AddEventHandler(w)
-	if err != nil {
-		return nil, err
-	}
-
-	return w, nil
+func (r *readMap[K, V]) Print() {
+	r.data.Print()
 }

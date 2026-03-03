@@ -5,55 +5,47 @@ import (
 	"sync"
 )
 
-type CloneMap[K comparable] struct {
+type CloneMap[K comparable, V any] struct {
 	lock       sync.RWMutex
 	references int64
 	data       map[K]any
-	base       *CloneMap[K]
-	targets    []KeyValueTarget
+	base       *CloneMap[K, V]
 }
 
-var _ KeyValueMap[string] = &CloneMap[string]{}
-var _ KeyValueSource = &CloneMap[string]{}
-var _ InputView[string] = &CloneMap[string]{}
-var _ Cloneable = &CloneMap[string]{}
+func makeOrCloneMap[K comparable, V any](from *CloneMap[K, V]) *CloneMap[K, V] {
+	if from == nil {
+		return newCloneMap[K, V](map[K]any{}, nil, 0)
+	}
+	return from.Clone()
+}
 
-func newCloneMap[K comparable](data map[K]any, base *CloneMap[K], references int64) *CloneMap[K] {
-	return &CloneMap[K]{
+func newCloneMap[K comparable, V any](data map[K]any, base *CloneMap[K, V], references int64) *CloneMap[K, V] {
+	return &CloneMap[K, V]{
 		references: references,
 		data:       data,
 		base:       base,
 	}
 }
 
-func Get[K comparable, T any](m *CloneMap[K], key K) T {
-	v, found := m.Get(key)
-	if found && v != nil {
-		return v.(T)
-	}
-	var empty T
-	return empty
-}
-
-func (m *CloneMap[K]) Get(key K) (any, bool) {
+func (m *CloneMap[K, V]) Get(key K) (V, bool) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 	v, found, _ := m.getLocked(key)
 	return v, found
 }
 
-func (m *CloneMap[K]) GetMutability(key K) (any, bool, bool) {
+func (m *CloneMap[K, V]) GetMutability(key K) (any, bool, bool) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 	return m.getLocked(key)
 }
 
-func (m *CloneMap[K]) Has(key K) bool {
+func (m *CloneMap[K, V]) Has(key K) bool {
 	_, found := m.Get(key)
 	return found
 }
 
-func (m *CloneMap[K]) getLocked(key K) (any, bool, bool) {
+func (m *CloneMap[K, V]) getLocked(key K) (V, bool, bool) {
 	v, foundHere := m.data[key]
 
 	found := foundHere
@@ -61,21 +53,22 @@ func (m *CloneMap[K]) getLocked(key K) (any, bool, bool) {
 		v, found = m.base.Get(key)
 	}
 
-	if v == tombstone {
-		return nil, false, false
+	var empty V
+	if !found || v == tombstone {
+		return empty, false, false
 	}
 
-	return v, found, foundHere
+	return v.(V), found, foundHere
 }
 
-func (m *CloneMap[K]) All() KeyValueIterator[K] {
-	return func(yield func(key K, value any) bool) {
+func (m *CloneMap[K, V]) All() KeyValueIterator[K, V] {
+	return func(yield func(key K, value V) bool) {
 		m.lock.RLock()
 		defer m.lock.RUnlock()
 
 		for key, value := range m.data {
 			if value != tombstone {
-				if !yield(key, value) {
+				if !yield(key, value.(V)) {
 					return
 				}
 			}
@@ -92,58 +85,33 @@ func (m *CloneMap[K]) All() KeyValueIterator[K] {
 	}
 }
 
-func (m *CloneMap[K]) Update(key K, value any) {
-	if m.updateNoCallback(key, value) {
-		m.callOnUpdate(&KeyValue[K]{Key: key, Value: value})
-	}
-}
-
-func (m *CloneMap[K]) updateNoCallback(key K, value any) bool {
+func (m *CloneMap[K, V]) Update(key K, value V) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-
-	if value != m.data[key] {
-		m.data[key] = value
-		return true
-	}
-
-	return false
+	m.data[key] = value
 }
 
 var tombstone = &struct{}{}
 
-func (m *CloneMap[K]) Delete(key K) {
-	kv := KeyValue[K]{}
-	if m.deleteNoCallback(key, &kv) {
-		//fmt.Printf("Deleted %s, %v\n", kv.Key, kv.Value)
-		m.callOnDelete(&kv)
-	}
-}
-
-func (m *CloneMap[K]) deleteNoCallback(key K, callback *KeyValue[K]) bool {
+func (m *CloneMap[K, V]) Delete(key K) V {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	val, found, _ := m.getLocked(key)
+	v, found, _ := m.getLocked(key)
 	if found {
 		if m.base == nil {
 			delete(m.data, key)
 		} else {
-			// Note that if the key doesn't exist in our base map
-			// we are adding an unnecessary entry, but we will remove it
-			// when we do the merge later, so we avoid doing a
-			// lookup in the base map here.
 			m.data[key] = tombstone
 		}
-
-		*callback = KeyValue[K]{Key: key, Value: val}
-		return true
+		return v
 	}
 
-	return false
+	var empty V
+	return empty
 }
 
-func (m *CloneMap[K]) Clone() any {
+func (m *CloneMap[K, V]) Clone() *CloneMap[K, V] {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -155,7 +123,7 @@ func (m *CloneMap[K]) Clone() any {
 	return newCloneMap(map[K]any{}, newBase, 0)
 }
 
-func (m *CloneMap[K]) Release() {
+func (m *CloneMap[K, V]) Release() {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
@@ -167,7 +135,7 @@ func (m *CloneMap[K]) Release() {
 // Down the ref count on the map
 // Use this as an opportunity to check for
 // merging opportunites.
-func (m *CloneMap[K]) removeRef() {
+func (m *CloneMap[K, V]) removeRef() {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -182,7 +150,7 @@ func (m *CloneMap[K]) removeRef() {
 }
 
 // Assumes that the map lock is held.
-func (m *CloneMap[K]) mergeBaseIfPossible() {
+func (m *CloneMap[K, V]) mergeBaseIfPossible() {
 	if m.base != nil {
 		m.base.lock.Lock()
 		defer m.base.lock.Unlock()
@@ -214,31 +182,7 @@ func updateLockedMaps[K comparable](dest map[K]any, src map[K]any) {
 	}
 }
 
-func (m *CloneMap[K]) addTarget(target KeyValueTarget) {
-	m.targets = append(m.targets, target)
-}
-
-func (m *CloneMap[K]) callOnUpdate(kv *KeyValue[K]) {
-	for _, target := range m.targets {
-		target.OnUpdate(kv.Key, kv.Value, m)
-	}
-}
-
-func (m *CloneMap[K]) callOnDelete(kv *KeyValue[K]) {
-	for _, target := range m.targets {
-		target.OnDelete(kv.Key, kv.Value, m)
-	}
-}
-
-func (m *CloneMap[K]) OnUpdate(key any, value any, _ KeyValueSource) {
-	m.Update(key.(K), value)
-}
-
-func (m *CloneMap[K]) OnDelete(key any, value any, _ KeyValueSource) {
-	m.Delete(key.(K))
-}
-
-func (m *CloneMap[K]) Print() {
+func (m *CloneMap[K, V]) Print() {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 	fmt.Print("  CloneMap{\n")
