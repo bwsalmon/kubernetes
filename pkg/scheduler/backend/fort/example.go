@@ -85,8 +85,8 @@ func NewPodSpreadLiteInfo(podInformer, serviceInformer, nodeInformer cache.Share
 
 		// Group by service and node, and count the number of pods
 		// for eaach service / node pair.
-		GroupBy: func(pod *TPod, service *TService) ([]string, []GroupField) {
-			return []string{service.Name, pod.NodeName},
+		GroupBy: func(pod *TPod, service *TService) (any, []GroupField) {
+			return [2]string{service.Name, pod.NodeName},
 				[]GroupField{
 					AnyValue(service.Name),
 					AnyValue(pod.NodeName),
@@ -121,18 +121,18 @@ func NewPodSpreadLiteInfo(podInformer, serviceInformer, nodeInformer cache.Share
 		},
 		From: d.ServiceNodes,
 		Join: d.NodeDomains,
-		On: func(service *TServiceNode, node *TNodeDomain) []string {
+		On: func(service *TServiceNode, node *TNodeDomain) any {
 			if service != nil {
-				return []string{service.Node}
+				return [1]string{service.Node}
 			} else {
-				return []string{node.Name}
+				return [1]string{node.Name}
 			}
 		},
 		Where: func(service *TServiceNode, node *TNodeDomain) bool {
 			return service.Node == node.Name
 		},
-		GroupBy: func(service *TServiceNode, node *TNodeDomain) ([]string, []GroupField) {
-			return []string{service.Service, node.Domain},
+		GroupBy: func(service *TServiceNode, node *TNodeDomain) (any, []GroupField) {
+			return [2]string{service.Service, node.Domain},
 				[]GroupField{
 					AnyValue(service.Service),
 					AnyValue(node.Domain),
@@ -150,8 +150,8 @@ func NewPodSpreadLiteInfo(podInformer, serviceInformer, nodeInformer cache.Share
 			}, nil
 		},
 		From: d.ServiceDomains,
-		GroupBy: func(serviceDomain *TServiceDomain) ([]string, []GroupField) {
-			return []string{serviceDomain.Service},
+		GroupBy: func(serviceDomain *TServiceDomain) (any, []GroupField) {
+			return [1]string{serviceDomain.Service},
 				[]GroupField{
 					AnyValue(serviceDomain.Service),
 					Distinct(DomainCount{Domain: serviceDomain.Domain, Count: serviceDomain.Count}),

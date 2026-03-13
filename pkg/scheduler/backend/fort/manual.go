@@ -25,6 +25,8 @@ type manualInformer struct {
 	lastSyncResourceVersion string
 
 	transform cache.TransformFunc
+
+	keyFunc cache.KeyFunc
 }
 
 var _ ManualSharedInformer = &manualInformer{}
@@ -42,7 +44,7 @@ type manualInformerDoneChecker struct {
 var _ cache.ResourceEventHandlerRegistration = &manualInformerRegistration{}
 
 func (r *manualInformerRegistration) HasSynced() bool {
-	return r.informer.hasSynced
+	return r.informer.HasSynced()
 }
 
 func (r *manualInformerRegistration) HasSyncedChecker() cache.DoneChecker {
@@ -55,6 +57,10 @@ func (c *manualInformerDoneChecker) Name() string {
 
 func (c *manualInformerDoneChecker) Done() <-chan struct{} {
 	return c.synced
+}
+
+func (p *manualInformer) Lock() *sync.Mutex {
+	return &p.lock
 }
 
 func (p *manualInformer) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
@@ -147,10 +153,15 @@ func (p *manualInformer) SetHasSynced() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
+	if p.hasSynced {
+		return
+	}
+
 	p.hasSynced = true
 	for _, d := range p.doneCheckers {
-		d.synced <- struct{}{}
+		close(d.synced)
 	}
+	p.doneCheckers = nil
 }
 
 func (p *manualInformer) SetIsStopped() {
@@ -160,14 +171,26 @@ func (p *manualInformer) SetIsStopped() {
 	p.isStopped = true
 }
 
+func (p *manualInformer) GetKeyFunc() cache.KeyFunc {
+	return p.keyFunc
+}
+
 func (i *manualInformer) HasSyncedChecker() cache.DoneChecker {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
-	return &manualInformerDoneChecker{
-		informer: i,
-		synced:   make(chan struct{}),
+	ch := make(chan struct{})
+	if i.hasSynced {
+		close(ch)
 	}
+	checker := &manualInformerDoneChecker{
+		informer: i,
+		synced:   ch,
+	}
+	if !i.hasSynced {
+		i.doneCheckers = append(i.doneCheckers, checker)
+	}
+	return checker
 }
 
 func (p *manualInformer) OnAdd(obj any, isInInitialList bool) {
@@ -237,6 +260,7 @@ func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformer
 		isStopped:               p.isStopped,
 		hasSynced:               p.hasSynced,
 		lastSyncResourceVersion: p.lastSyncResourceVersion,
+		keyFunc:                 p.keyFunc,
 	}
 
 	return newInformer

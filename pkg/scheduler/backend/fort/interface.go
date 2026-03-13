@@ -1,6 +1,10 @@
 package fort
 
-import "k8s.io/client-go/tools/cache"
+import (
+	"sync"
+
+	"k8s.io/client-go/tools/cache"
+)
 
 // A shared informer defined by query that is also cloneable.
 type CloneableSharedInformerQuery interface {
@@ -63,7 +67,7 @@ type JoinFilterFunc[Left, Right any] func(left Left, right Right) bool
 // If a join is too expensive to do as a full join, the caller
 // can define a JoinOnFunc. Only one of the left and right arguments
 // will be non-nil, the function returns the key for that element.
-type JoinOnFunc[Left, Right any] func(left Left, right Right) []string
+type JoinOnFunc[Left, Right any] func(left Left, right Right) any
 
 type GroupBy[Out, In any] struct {
 	Select  GroupSelectFunc[Out]
@@ -73,7 +77,7 @@ type GroupBy[Out, In any] struct {
 }
 
 type GroupSelectFunc[Out any] func(fields []GroupField) (Out, error)
-type SingleGroupByFunc[In any] func(in In) ([]string, []GroupField)
+type SingleGroupByFunc[In any] func(in In) (any, []GroupField)
 
 type GroupByJoin[Out, Left, Right any] struct {
 	Select  GroupSelectFunc[Out]
@@ -84,38 +88,41 @@ type GroupByJoin[Out, Left, Right any] struct {
 	GroupBy JoinGroupByFunc[Left, Right]
 }
 
-type JoinGroupByFunc[Left, Right any] func(left Left, right Right) ([]string, []GroupField)
+type JoinGroupByFunc[Left, Right any] func(left Left, right Right) (any, []GroupField)
 
 type GroupField interface{}
 
-// A group key defined by the given array of strings.
-func GroupKey(key []string) GroupField {
-	// XXX FILL ME
-	return nil
+type groupField struct {
+	key      any
+	count    bool
+	sum      *int64
+	distinct any
+	anyValue any
+}
+
+// A group key defined by the given value.
+func GroupKey(key any) GroupField {
+	return &groupField{key: key}
 }
 
 // Converts to the count of the number of tuples in this group.
 func Count() GroupField {
-	// XXX FILL ME
-	return nil
+	return &groupField{count: true}
 }
 
 // Converts to the sum of the values for all the tuples in this group.
 func Sum(val int64) GroupField {
-	// XXX FILL ME
-	return nil
+	return &groupField{sum: &val}
 }
 
 // Converts to a list of distinct values for all the tuples in this group.
 func Distinct(val any) GroupField {
-	// XXX FILL ME
-	return nil
+	return &groupField{distinct: val}
 }
 
 // Returns one of the values passed in for all the tuples in this group.
 func AnyValue(val any) GroupField {
-	// XXX FILL ME
-	return nil
+	return &groupField{anyValue: val}
 }
 
 type FlatMap[Out, In any] struct {
@@ -135,20 +142,44 @@ type ManualSharedInformer interface {
 
 	SetIsStopped()
 	SetHasSynced()
+	GetKeyFunc() cache.KeyFunc
 }
 
 func NewManualSharedInformer() ManualSharedInformer {
-	// XXX FILL ME
-	return nil
+	return NewManualSharedInformerWithKeyFunc(cache.MetaNamespaceKeyFunc)
+}
+
+func NewManualSharedInformerWithKeyFunc(keyFunc cache.KeyFunc) ManualSharedInformer {
+	return &manualInformer{
+		handlers: map[int]cache.ResourceEventHandler{},
+		keyFunc:  keyFunc,
+	}
 }
 
 // Lock multiple informers together to ensure we can snapshot them
 // consistently.
 func LockInformerSet(informers []CloneableSharedInformerQuery) InformerLockSet {
-	// XXX FILL ME
-	return nil
+	ls := &informerLockSet{}
+	for _, inf := range informers {
+		if m, ok := inf.(interface{ Lock() *sync.Mutex }); ok {
+			lock := m.Lock()
+			lock.Lock()
+			ls.locks = append(ls.locks, lock)
+		}
+	}
+	return ls
 }
 
 type InformerLockSet interface {
 	Unlock()
+}
+
+type informerLockSet struct {
+	locks []*sync.Mutex
+}
+
+func (ls *informerLockSet) Unlock() {
+	for i := len(ls.locks) - 1; i >= 0; i-- {
+		ls.locks[i].Unlock()
+	}
 }

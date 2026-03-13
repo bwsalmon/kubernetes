@@ -41,7 +41,7 @@ func (q *GroupByJoin[Out, Left, Right]) Build() CloneableSharedInformerQuery {
 	g := &GroupBy[Out, JoinValue[Left, Right]]{
 		Select: q.Select,
 		From:   newJoiner[Left, Right](q.From, q.Join, q.On),
-		GroupBy: func(joined JoinValue[Left, Right]) ([]string, []GroupField) {
+		GroupBy: func(joined JoinValue[Left, Right]) (any, []GroupField) {
 			return q.GroupBy(joined.Left, joined.Right)
 		},
 	}
