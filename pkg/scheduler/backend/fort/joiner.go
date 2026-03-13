@@ -9,6 +9,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+// joiner implements a many-to-many join between two source informers.
+// It maintains internal maps of objects from both sources, indexed by a join key.
 type joiner[L, R any] struct {
 	handler ManualSharedInformer
 	on      JoinOnFunc[L, R]
@@ -20,6 +22,7 @@ type joiner[L, R any] struct {
 	rightRegistration cache.ResourceEventHandlerRegistration
 
 	lock sync.Mutex
+	// Indexed by the join key. Supports multiple objects per key (many-to-many).
 	left  map[any][]L
 	right map[any][]R
 }
@@ -37,6 +40,7 @@ func newJoiner[L, R any](leftSource, rightSource cache.SharedInformer, on JoinOn
 	j.leftRegistration, _ = leftSource.AddEventHandler(leftHandler[L, R]{j})
 	j.rightRegistration, _ = rightSource.AddEventHandler(rightHandler[L, R]{j})
 
+	// Joint sync checker: wait for BOTH sources to sync before reporting synced.
 	go func() {
 		lCheck := j.leftRegistration.HasSyncedChecker()
 		rCheck := j.rightRegistration.HasSyncedChecker()
@@ -48,6 +52,7 @@ func newJoiner[L, R any](leftSource, rightSource cache.SharedInformer, on JoinOn
 	return j
 }
 
+// leftHandler handles events from the 'From' (left) informer.
 type leftHandler[L, R any] struct {
 	j *joiner[L, R]
 }
@@ -59,6 +64,7 @@ func (h leftHandler[L, R]) OnAdd(obj any, isInitial bool) {
 	left := obj.(L)
 	key := h.j.on(left, *new(R))
 	h.j.left[key] = append(h.j.left[key], left)
+	// For every matching item on the right, emit a join notification.
 	if rights, ok := h.j.right[key]; ok {
 		for _, right := range rights {
 			h.j.handler.OnAdd(JoinValue[L, R]{Left: left, Right: right}, isInitial)
@@ -75,13 +81,14 @@ func (h leftHandler[L, R]) OnUpdate(oldObj, newObj any) {
 	oldKey := h.j.on(oldLeft, *new(R))
 	newKey := h.j.on(newLeft, *new(R))
 
+	// If the join key hasn't changed, we can just emit an Update for all joined pairs.
 	if oldKey == newKey {
 		if rights, ok := h.j.right[oldKey]; ok {
 			for _, right := range rights {
 				h.j.handler.OnUpdate(JoinValue[L, R]{Left: oldLeft, Right: right}, JoinValue[L, R]{Left: newLeft, Right: right})
 			}
 		}
-		// Update oldLeft to newLeft in h.j.left[oldKey]
+		// Update the stored object in the left map.
 		slice := h.j.left[oldKey]
 		for i, v := range slice {
 			if any(v) == any(oldLeft) {
@@ -90,7 +97,7 @@ func (h leftHandler[L, R]) OnUpdate(oldObj, newObj any) {
 			}
 		}
 	} else {
-		// Old key
+		// Key changed: perform a Delete for the old key and an Add for the new one.
 		if rights, ok := h.j.right[oldKey]; ok {
 			for _, right := range rights {
 				h.j.handler.OnDelete(JoinValue[L, R]{Left: oldLeft, Right: right})
@@ -104,7 +111,6 @@ func (h leftHandler[L, R]) OnUpdate(oldObj, newObj any) {
 			}
 		}
 
-		// New key
 		h.j.left[newKey] = append(h.j.left[newKey], newLeft)
 		if rights, ok := h.j.right[newKey]; ok {
 			for _, right := range rights {
@@ -134,6 +140,8 @@ func (h leftHandler[L, R]) OnDelete(obj any) {
 	}
 }
 
+// rightHandler handles events from the 'Join' (right) informer.
+// Symmetric to leftHandler.
 type rightHandler[L, R any] struct {
 	j *joiner[L, R]
 }
@@ -167,7 +175,6 @@ func (h rightHandler[L, R]) OnUpdate(oldObj, newObj any) {
 				h.j.handler.OnUpdate(JoinValue[L, R]{Left: left, Right: oldRight}, JoinValue[L, R]{Left: left, Right: newRight})
 			}
 		}
-		// Update oldRight to newRight in h.j.right[oldKey]
 		slice := h.j.right[oldKey]
 		for i, v := range slice {
 			if any(v) == any(oldRight) {
@@ -176,7 +183,6 @@ func (h rightHandler[L, R]) OnUpdate(oldObj, newObj any) {
 			}
 		}
 	} else {
-		// Old key
 		if lefts, ok := h.j.left[oldKey]; ok {
 			for _, left := range lefts {
 				h.j.handler.OnDelete(JoinValue[L, R]{Left: left, Right: oldRight})
@@ -190,7 +196,6 @@ func (h rightHandler[L, R]) OnUpdate(oldObj, newObj any) {
 			}
 		}
 
-		// New key
 		h.j.right[newKey] = append(h.j.right[newKey], newRight)
 		if lefts, ok := h.j.left[newKey]; ok {
 			for _, left := range lefts {

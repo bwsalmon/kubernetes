@@ -9,6 +9,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+// manualInformer implements ManualSharedInformer and provides a mechanism to manually
+// trigger informer events. It acts as the "leaf" source in many simulation or test chains.
 type manualInformer struct {
 	name string
 
@@ -36,6 +38,7 @@ type manualInformerRegistration struct {
 	id       int
 }
 
+// manualInformerDoneChecker implementation for DoneChecker interface.
 type manualInformerDoneChecker struct {
 	informer *manualInformer
 	synced   chan struct{}
@@ -59,6 +62,7 @@ func (c *manualInformerDoneChecker) Done() <-chan struct{} {
 	return c.synced
 }
 
+// Lock returns the underlying mutex. Used by LockInformerSet for consistent snapshoting.
 func (p *manualInformer) Lock() *sync.Mutex {
 	return &p.lock
 }
@@ -149,6 +153,7 @@ func (p *manualInformer) IsStopped() bool {
 	return p.isStopped
 }
 
+// SetHasSynced marks the informer as synced and notifies all waiting checkers.
 func (p *manualInformer) SetHasSynced() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -175,6 +180,7 @@ func (p *manualInformer) GetKeyFunc() cache.KeyFunc {
 	return p.keyFunc
 }
 
+// HasSyncedChecker returns a checker that completes when SetHasSynced is called.
 func (i *manualInformer) HasSyncedChecker() cache.DoneChecker {
 	i.lock.Lock()
 	defer i.lock.Unlock()
@@ -193,6 +199,7 @@ func (i *manualInformer) HasSyncedChecker() cache.DoneChecker {
 	return checker
 }
 
+// OnAdd triggers the Add event for all registered handlers.
 func (p *manualInformer) OnAdd(obj any, isInInitialList bool) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -211,6 +218,7 @@ func (p *manualInformer) OnAdd(obj any, isInInitialList bool) {
 	}
 }
 
+// OnUpdate triggers the Update event for all registered handlers.
 func (p *manualInformer) OnUpdate(oldObj, newObj any) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -231,6 +239,7 @@ func (p *manualInformer) OnUpdate(oldObj, newObj any) {
 	}
 }
 
+// OnDelete triggers the Delete event for all registered handlers.
 func (p *manualInformer) OnDelete(oldObj any) {
 	p.lock.Lock()
 	defer p.lock.Unlock()

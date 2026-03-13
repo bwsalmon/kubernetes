@@ -9,6 +9,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+// flatMapper implements FlatMap query by applying a mapping function to each object
+// from a source informer. The mapping function returns a slice, allowing one input
+// object to generate zero or more output objects.
 type flatMapper[Out, In any] struct {
 	handler      ManualSharedInformer
 	mapper       FlatMapFunc[Out, In]
@@ -23,6 +26,8 @@ func newFlatMapper[Out, In any](mapper FlatMapFunc[Out, In], from cache.SharedIn
 	return newFlatMapperWithHandler(mapper, from, NewManualSharedInformer())
 }
 
+// newFlatMapperWithHandler creates a flatMapper with a specific handler.
+// This is useful in tests where a custom KeyFunc is needed for matching.
 func newFlatMapperWithHandler[Out, In any](mapper FlatMapFunc[Out, In], from cache.SharedInformer, handler ManualSharedInformer) *flatMapper[Out, In] {
 	m := &flatMapper[Out, In]{
 		handler: handler,
@@ -56,6 +61,10 @@ func (m *flatMapper[O, I]) OnAdd(obj any, isInitial bool) {
 	}
 }
 
+// OnUpdate handles updates from the source informer by re-evaluating the mapping.
+// It uses the handler's KeyFunc to surgically match old and new results,
+// emitting OnUpdate for existing objects, OnDelete for removed ones,
+// and OnAdd for new ones.
 func (m *flatMapper[O, I]) OnUpdate(oldObj, newObj any) {
 	oldInput := oldObj.(I)
 	newInput := newObj.(I)
@@ -75,6 +84,7 @@ func (m *flatMapper[O, I]) OnUpdate(oldObj, newObj any) {
 		newKeys[key] = r
 	}
 
+	// Match old results against new results to minimize downstream churn.
 	for key, oldR := range oldKeys {
 		if newR, ok := newKeys[key]; ok {
 			m.handler.OnUpdate(oldR, newR)
@@ -83,6 +93,7 @@ func (m *flatMapper[O, I]) OnUpdate(oldObj, newObj any) {
 			m.handler.OnDelete(oldR)
 		}
 	}
+	// Remaining new keys were not in the old result set.
 	for _, newR := range newKeys {
 		m.handler.OnAdd(newR, false)
 	}

@@ -9,6 +9,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
+// grouper implements GroupBy query. It aggregates objects from a source informer
+// into groups identified by a comparable key and evaluates aggregate fields.
 type grouper[Out, In any] struct {
 	handler ManualSharedInformer
 	sel     GroupSelectFunc[Out]
@@ -22,10 +24,11 @@ type grouper[Out, In any] struct {
 	groups map[any]*groupState[Out]
 }
 
+// groupState maintains the current aggregation state for a single group.
 type groupState[Out any] struct {
 	count   int
 	fields  []any
-	lastOut Out
+	lastOut Out // The last object emitted for this group, used for OnUpdate.
 }
 
 func newGrouper[Out, In any](sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In]) *grouper[Out, In] {
@@ -49,11 +52,13 @@ func newGrouper[Out, In any](sel GroupSelectFunc[Out], groupBy SingleGroupByFunc
 	return g
 }
 
+// evaluateFields calculates or updates the values of aggregate fields for a group.
 func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState[Out], input In, adding bool) []GroupField {
 	if state.fields == nil {
 		state.fields = make([]any, len(fields))
 	}
 
+	// Always track the number of items in the group to handle deletions correctly.
 	if adding {
 		state.count++
 	} else {
@@ -135,6 +140,9 @@ func (g *grouper[Out, In]) OnAdd(obj any, isInitial bool) {
 	}
 }
 
+// OnUpdate handles item updates. If the group key is the same, it incrementally
+// updates the aggregation. If the key changed, it performs a delete from the old
+// group and an add to the new group.
 func (g *grouper[Out, In]) OnUpdate(oldObj, newObj any) {
 	g.lock.Lock()
 	defer g.lock.Unlock()
@@ -148,7 +156,6 @@ func (g *grouper[Out, In]) OnUpdate(oldObj, newObj any) {
 	if oldKey == newKey {
 		state, ok := g.groups[oldKey]
 		if !ok {
-			// This shouldn't happen if everything is consistent, but let's be safe.
 			g.lock.Unlock()
 			g.OnAdd(newObj, false)
 			g.lock.Lock()
@@ -156,8 +163,7 @@ func (g *grouper[Out, In]) OnUpdate(oldObj, newObj any) {
 		}
 
 		oldOut := state.lastOut
-		// To update correctly, we should subtract oldFields and add newFields.
-		// Our evaluateFields only takes one input. Let's subtract then add.
+		// To update aggregate fields correctly: subtract old values then add new values.
 		g.evaluateFields(oldFields, state, oldInput, false)
 		resFields := g.evaluateFields(newFields, state, newInput, true)
 		
@@ -165,6 +171,7 @@ func (g *grouper[Out, In]) OnUpdate(oldObj, newObj any) {
 		state.lastOut = newOut
 		g.handler.OnUpdate(oldOut, newOut)
 	} else {
+		// Key changed: move object between groups.
 		g.lock.Unlock()
 		g.OnDelete(oldObj)
 		g.OnAdd(newObj, false)
