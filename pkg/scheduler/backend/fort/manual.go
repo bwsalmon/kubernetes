@@ -29,6 +29,9 @@ type manualInformer struct {
 	transform cache.TransformFunc
 
 	keyFunc cache.KeyFunc
+
+	watchErrorHandler            cache.WatchErrorHandler
+	watchErrorHandlerWithContext cache.WatchErrorHandlerWithContext
 }
 
 var _ ManualSharedInformer = &manualInformer{}
@@ -121,11 +124,32 @@ func (p *manualInformer) LastSyncResourceVersion() string {
 }
 
 func (p *manualInformer) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.watchErrorHandler = handler
 	return nil
 }
 
 func (p *manualInformer) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.watchErrorHandlerWithContext = handler
 	return nil
+}
+
+// TriggerWatchError manually triggers the registered watch error handlers.
+func (p *manualInformer) TriggerWatchError(err error) {
+	p.lock.Lock()
+	h := p.watchErrorHandler
+	hc := p.watchErrorHandlerWithContext
+	p.lock.Unlock()
+
+	if h != nil {
+		h(nil, err) // We don't have a Reflector here
+	}
+	if hc != nil {
+		hc(context.TODO(), nil, err)
+	}
 }
 
 func (p *manualInformer) SetTransform(handler cache.TransformFunc) error {

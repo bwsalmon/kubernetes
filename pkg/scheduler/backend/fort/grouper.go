@@ -257,11 +257,11 @@ func (g *grouper[Out, In]) LastSyncResourceVersion() string {
 }
 
 func (g *grouper[Out, In]) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
-	return nil
+	return g.source.SetWatchErrorHandler(handler)
 }
 
 func (g *grouper[Out, In]) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
-	return nil
+	return g.source.SetWatchErrorHandlerWithContext(handler)
 }
 
 func (g *grouper[Out, In]) SetTransform(handler cache.TransformFunc) error {

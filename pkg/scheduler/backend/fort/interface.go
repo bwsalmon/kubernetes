@@ -128,6 +128,7 @@ type ManualSharedInformer interface {
 	SetIsStopped()
 	SetHasSynced()
 	GetKeyFunc() cache.KeyFunc
+	TriggerWatchError(err error)
 }
 
 // NewManualSharedInformer creates a ManualSharedInformer using the default MetaNamespaceKeyFunc.

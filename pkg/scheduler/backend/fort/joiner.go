@@ -274,10 +274,14 @@ func (j *joiner[L, R]) LastSyncResourceVersion() string {
 }
 
 func (j *joiner[L, R]) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
+	_ = j.leftSource.SetWatchErrorHandler(handler)
+	_ = j.rightSource.SetWatchErrorHandler(handler)
 	return nil
 }
 
 func (j *joiner[L, R]) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
+	_ = j.leftSource.SetWatchErrorHandlerWithContext(handler)
+	_ = j.rightSource.SetWatchErrorHandlerWithContext(handler)
 	return nil
 }
 
