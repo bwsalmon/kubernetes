@@ -256,6 +256,12 @@ func (p *manualInformer) OnUpdateLocked(oldObj, newObj any) {
 		newTransformed, _ = p.transform(newObj)
 	}
 
+	// Detect key change and perform surgical update in the indexer.
+	oldKey, _ := p.keyFunc(oldTransformed)
+	newKey, _ := p.keyFunc(newTransformed)
+	if oldKey != newKey {
+		p.indexer.Delete(oldTransformed)
+	}
 	p.indexer.Update(newTransformed)
 
 	for _, h := range p.handlers {

@@ -233,6 +233,16 @@ func (ls *domainLock) Unlock() {
 // The memo map should initially contain leaf replacements (Source -> ClonedSource)
 // and will be populated with cloned intermediate stages to handle shared query branches (Diamond DAGs).
 func ClonePipeline(root cache.SharedInformer, memo map[cache.SharedInformer]cache.SharedInformer) cache.SharedInformer {
+	return clonePipelineRecursive(root, memo, 0)
+}
+
+const maxCloneDepth = 100
+
+func clonePipelineRecursive(root cache.SharedInformer, memo map[cache.SharedInformer]cache.SharedInformer, depth int) cache.SharedInformer {
+	if depth > maxCloneDepth {
+		panic(fmt.Sprintf("Recursive clone depth exceeded %d (possible cycle in query DAG)", maxCloneDepth))
+	}
+
 	if repl, ok := memo[root]; ok {
 		return repl
 	}
@@ -250,7 +260,7 @@ func ClonePipeline(root cache.SharedInformer, memo map[cache.SharedInformer]cach
 
 	newSources := make([]cache.SharedInformer, len(sources))
 	for i, s := range sources {
-		newSources[i] = ClonePipeline(s, memo)
+		newSources[i] = clonePipelineRecursive(s, memo, depth+1)
 	}
 
 	res := q.Clone(newSources)
