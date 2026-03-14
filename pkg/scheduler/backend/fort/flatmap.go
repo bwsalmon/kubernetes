@@ -149,7 +149,13 @@ func (m *flatMapper[Out, In]) HasSyncedChecker() cache.DoneChecker {
 // Clone creates a new instance of the flatMapper.
 // REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
 func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
-	newSource := newSources[0]
+	var newSource cache.SharedInformer
+	if len(newSources) > 0 {
+		newSource = newSources[0]
+	} else {
+		newSource = m.source
+	}
+
 	var newLock LockGroup
 	if q, ok := newSource.(CloneableSharedInformerQuery); ok {
 		newLock = q.GetLockGroup()

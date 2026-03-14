@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -85,6 +86,10 @@ func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, rep
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
+	if p.isStopped {
+		return nil, fmt.Errorf("was not added to shared informer because it has stopped already")
+	}
+
 	p.nextHandlerId++
 	r := &manualInformerRegistration{
 		informer: p,
@@ -109,6 +114,7 @@ func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, rep
 // dispatchEvent selects the appropriate handler method based on whether the handler
 // supports the Locked interface (to avoid re-entrant deadlocks on the shared LockGroup).
 func (p *manualInformer) dispatchEvent(h cache.ResourceEventHandler, std func(cache.ResourceEventHandler), locked func(LockedResourceEventHandler)) {
+	defer utilruntime.HandleCrash()
 	if m, ok := h.(LockedResourceEventHandler); ok {
 		locked(m)
 	} else {
