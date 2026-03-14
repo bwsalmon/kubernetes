@@ -125,6 +125,22 @@ func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
 	oldInput := oldObj.(In)
 	newInput := newObj.(In)
 
+	oldPass := g.where == nil || g.where(oldInput)
+	newPass := g.where == nil || g.where(newInput)
+
+	if !oldPass && !newPass {
+		return
+	}
+	if !oldPass && newPass {
+		g.OnAddLocked(newObj, false)
+		return
+	}
+	if oldPass && !newPass {
+		g.OnDeleteLocked(oldObj)
+		return
+	}
+
+	// Both pass filter
 	oldKey, oldFields := g.groupBy(oldInput)
 	newKey, newFields := g.groupBy(newInput)
 

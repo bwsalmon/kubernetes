@@ -192,6 +192,47 @@ func TestGrouper_AnyValueConsistency(t *testing.T) {
 	}
 }
 
+func TestGrouper_FilterTransitions(t *testing.T) {
+	lock := NewLockGroup()
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+
+	grouper := QueryInformer(&GroupBy[int64, int]{
+		Lock:   lock,
+		Select: func(fields []GroupField) (int64, error) { return fields[0].(int64), nil },
+		From:   source,
+		Where:  func(i int) bool { return i > 0 }, // Only positive
+		GroupBy: func(i int) (any, []GroupField) {
+			return 0, []GroupField{Sum(int64(i))}
+		},
+	})
+
+	var latestSum int64
+	var count int
+	grouper.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { latestSum = obj.(int64); count++ },
+		UpdateFunc: func(old, new any) { latestSum = new.(int64) },
+		DeleteFunc: func(obj any) { count-- },
+	})
+
+	// 1. Add item that fails filter
+	source.OnAdd(-10, true)
+	if count != 0 {
+		t.Errorf("Expected 0 groups, got %d", count)
+	}
+
+	// 2. Update item to pass filter (-10 -> 5)
+	source.OnUpdate(-10, 5)
+	if count != 1 || latestSum != 5 {
+		t.Errorf("Expected 1 group with sum 5, got count %d sum %d", count, latestSum)
+	}
+
+	// 3. Update item to fail filter (5 -> -5)
+	source.OnUpdate(5, -5)
+	if count != 0 {
+		t.Errorf("Expected 0 groups after item filtered out, got %d", count)
+	}
+}
+
 func TestClone_Unsynced(t *testing.T) {
 	lock := NewLockGroup()
 	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
