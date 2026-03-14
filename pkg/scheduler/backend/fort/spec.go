@@ -35,12 +35,16 @@ func (q *Select[Out, In]) Build() CloneableSharedInformerQuery {
 
 func (q *Join[Out, Left, Right]) Build() CloneableSharedInformerQuery {
 	lock := getLock(q.Lock, q.From)
+	on := q.On
+	if on == nil {
+		on = func(l Left, r Right) any { return 0 }
+	}
 	sq := &Select[Out, JoinValue[Left, Right]]{
 		Lock: lock,
 		Select: func(joined JoinValue[Left, Right]) (Out, error) {
 			return q.Select(joined.Left, joined.Right)
 		},
-		From: newJoiner[Left, Right](lock, q.From, q.Join, q.On),
+		From: newJoiner[Left, Right](lock, q.From, q.Join, on),
 		Where: func(joined JoinValue[Left, Right]) bool {
 			if q.Where == nil {
 				return true
@@ -62,10 +66,14 @@ func (q *GroupBy[Out, In]) Build() CloneableSharedInformerQuery {
 
 func (q *GroupByJoin[Out, Left, Right]) Build() CloneableSharedInformerQuery {
 	lock := getLock(q.Lock, q.From)
+	on := q.On
+	if on == nil {
+		on = func(l Left, r Right) any { return 0 }
+	}
 	g := &GroupBy[Out, JoinValue[Left, Right]]{
 		Lock:   lock,
 		Select: q.Select,
-		From:   newJoiner[Left, Right](lock, q.From, q.Join, q.On),
+		From:   newJoiner[Left, Right](lock, q.From, q.Join, on),
 		Where: func(joined JoinValue[Left, Right]) bool {
 			if q.Where == nil {
 				return true

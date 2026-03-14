@@ -89,10 +89,6 @@ func NewPodSpreadLiteInfo(podInformer, serviceInformer, nodeInformer ManualShare
 		From: podInformer,
 		Join: serviceInformer,
 
-		On: func(pod *TPod, service *TService) any {
-			return 0 // Full join
-		},
-
 		Where: func(pod *TPod, service *TService) bool {
 			return service.Matches(pod)
 		},
