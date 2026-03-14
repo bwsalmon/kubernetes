@@ -472,3 +472,7 @@ func (j *joiner[L, R]) TriggerWatchError(err error) {
 func (j *joiner[L, R]) SetName(name string) {
 	j.handler.SetName(name)
 }
+
+func (j *joiner[L, R]) GetSources() []cache.SharedInformer {
+	return []cache.SharedInformer{j.leftSource, j.rightSource}
+}

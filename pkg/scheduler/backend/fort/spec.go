@@ -66,6 +66,12 @@ func (q *GroupByJoin[Out, Left, Right]) Build() CloneableSharedInformerQuery {
 		Lock:   lock,
 		Select: q.Select,
 		From:   newJoiner[Left, Right](lock, q.From, q.Join, q.On),
+		Where: func(joined JoinValue[Left, Right]) bool {
+			if q.Where == nil {
+				return true
+			}
+			return q.Where(joined.Left, joined.Right)
+		},
 		GroupBy: func(joined JoinValue[Left, Right]) (any, []GroupField) {
 			return q.GroupBy(joined.Left, joined.Right)
 		},

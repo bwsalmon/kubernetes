@@ -331,3 +331,7 @@ func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformer
 func (p *manualInformer) SetName(name string) {
 	p.name = name
 }
+
+func (p *manualInformer) GetSources() []cache.SharedInformer {
+	return nil
+}

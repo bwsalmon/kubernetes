@@ -42,6 +42,8 @@ type CloneableSharedInformerQuery interface {
 	GetLockGroup() LockGroup
 	// SetName sets the name for debug logging.
 	SetName(name string)
+	// GetSources returns the upstream informers.
+	GetSources() []cache.SharedInformer
 }
 
 // QueryInformer generates a new SharedInformer by running the given query spec.
@@ -211,4 +213,32 @@ func (ls *informerLockSet) Unlock() {
 	if ls.lock != nil {
 		ls.lock.RUnlock()
 	}
+}
+
+// ClonePipeline recursively clones a query DAG starting from root, replacing leaf sources.
+// The memo map should initially contain leaf replacements and will be populated with cloned intermediates.
+func ClonePipeline(root cache.SharedInformer, memo map[cache.SharedInformer]cache.SharedInformer) cache.SharedInformer {
+	if repl, ok := memo[root]; ok {
+		return repl
+	}
+
+	q, ok := root.(CloneableSharedInformerQuery)
+	if !ok {
+		return root
+	}
+
+	sources := q.GetSources()
+	if len(sources) == 0 {
+		// This is a leaf that was not in the initial memo map.
+		return root
+	}
+
+	newSources := make([]cache.SharedInformer, len(sources))
+	for i, s := range sources {
+		newSources[i] = ClonePipeline(s, memo)
+	}
+
+	res := q.Clone(newSources)
+	memo[root] = res
+	return res
 }

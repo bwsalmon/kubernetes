@@ -407,3 +407,7 @@ func (g *grouper[Out, In]) TriggerWatchError(err error) {
 func (g *grouper[Out, In]) SetName(name string) {
 	g.handler.SetName(name)
 }
+
+func (g *grouper[Out, In]) GetSources() []cache.SharedInformer {
+	return []cache.SharedInformer{g.source}
+}

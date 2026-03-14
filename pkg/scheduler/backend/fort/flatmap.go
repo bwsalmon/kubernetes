@@ -229,3 +229,7 @@ func (m *flatMapper[Out, In]) TriggerWatchError(err error) {
 func (m *flatMapper[Out, In]) SetName(name string) {
 	m.handler.SetName(name)
 }
+
+func (m *flatMapper[Out, In]) GetSources() []cache.SharedInformer {
+	return []cache.SharedInformer{m.source}
+}
