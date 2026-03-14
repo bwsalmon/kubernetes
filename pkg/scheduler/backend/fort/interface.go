@@ -18,6 +18,14 @@ func DefaultKeyFunc(obj any) (string, error) {
 	return fmt.Sprintf("%v", obj), nil
 }
 
+// UnwrapDeleted returns the underlying object if it's wrapped in a DeletedFinalStateUnknown container.
+func UnwrapDeleted(obj any) any {
+	if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		return d.Obj
+	}
+	return obj
+}
+
 // LockGroup manages a shared RWMutex for a connected set of query informers (a Domain).
 // In Fort, an entire query DAG (from sources to final aggregates) should share a single
 // LockGroup to ensure transactional consistency across the domain.

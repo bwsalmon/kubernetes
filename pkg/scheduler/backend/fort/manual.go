@@ -133,6 +133,7 @@ func (p *manualInformer) GetController() cache.Controller {
 	return nil
 }
 
+// Run starts the informer and unregisters from sources when stopCh is closed.
 func (p *manualInformer) Run(stopCh <-chan struct{}) {
 	defer p.SetIsStopped()
 	<-stopCh
@@ -267,12 +268,16 @@ func (p *manualInformer) OnUpdateLocked(oldObj, newObj any) {
 		newTransformed, _ = p.transform(newObj)
 	}
 
-	// Detect key change and perform surgical update in the indexer.
 	oldKey, _ := p.keyFunc(oldTransformed)
 	newKey, _ := p.keyFunc(newTransformed)
+
 	if oldKey != newKey {
-		p.indexer.Delete(oldTransformed)
+		// Identity changed: perform atomic Delete + Add to maintain consistency.
+		p.OnDeleteLocked(oldObj)
+		p.OnAddLocked(newObj, false)
+		return
 	}
+
 	p.indexer.Update(newTransformed)
 
 	for _, h := range p.handlers {
@@ -289,9 +294,10 @@ func (p *manualInformer) OnDelete(oldObj any) {
 }
 
 func (p *manualInformer) OnDeleteLocked(oldObj any) {
-	transformed := oldObj
+	unwrapped := UnwrapDeleted(oldObj)
+	transformed := unwrapped
 	if p.transform != nil {
-		transformed, _ = p.transform(oldObj)
+		transformed, _ = p.transform(unwrapped)
 	}
 
 	p.indexer.Delete(transformed)

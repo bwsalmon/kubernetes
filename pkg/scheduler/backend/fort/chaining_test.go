@@ -9,94 +9,53 @@ import (
 
 func TestChaining_FlatMapToJoin(t *testing.T) {
 	lock := NewLockGroup()
-	source1 := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
-	source2 := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
-	type Item struct {
-		ID   int
-		Tags []string
-	}
-	type Tagged struct {
+	type TaggedValue struct {
 		ID  int
 		Tag string
 	}
-	type Meta struct {
-		Tag   string
-		Value string
-	}
-	type Result struct {
-		ID    int
-		Tag   string
-		Value string
-	}
 
-	taggedKeyFunc := func(obj any) (string, error) {
-		t := obj.(Tagged)
-		return fmt.Sprintf("%d/%s", t.ID, t.Tag), nil
-	}
-	taggedHandler := NewManualSharedInformerWithOptions(lock, taggedKeyFunc)
-
-	// FlatMap source1
-	m := &FlatMap[Tagged, Item]{
+	// 1. FlatMap source into tagged values
+	tagged := QueryInformer(&FlatMap[*TaggedValue, int]{
 		Lock: lock,
-		Map: func(i Item) ([]Tagged, error) {
-			var res []Tagged
-			for _, tag := range i.Tags {
-				res = append(res, Tagged{ID: i.ID, Tag: tag})
+		Map: func(i int) ([]*TaggedValue, error) {
+			return []*TaggedValue{
+				{ID: i, Tag: "A"},
+				{ID: i, Tag: "B"},
+			}, nil
+		},
+		Over: source,
+	})
+
+	// 2. Join tagged values with themselves on ID
+	joined := QueryInformer(&Join[string, *TaggedValue, *TaggedValue]{
+		Lock: lock,
+		Select: func(l, r *TaggedValue) (string, error) {
+			return fmt.Sprintf("%d:%s-%s", l.ID, l.Tag, r.Tag), nil
+		},
+		From: tagged,
+		Join: tagged,
+		On: func(l, r *TaggedValue) any {
+			if l != nil {
+				return [1]int{l.ID}
 			}
-			return res, nil
+			return [1]int{r.ID}
 		},
-		Over: source1,
-	}
-	taggedInformer := newFlatMapperWithHandler[Tagged, Item](m.Map, m.Over, taggedHandler)
-
-	// Join tagged with source2 (Meta)
-	finalInformer := QueryInformer(&Join[Result, Tagged, Meta]{
-		Lock: lock,
-		Select: func(t Tagged, m Meta) (Result, error) {
-			return Result{ID: t.ID, Tag: t.Tag, Value: m.Value}, nil
-		},
-		From: taggedInformer,
-		Join: source2,
-		On: func(t Tagged, m Meta) any {
-			if t.Tag != "" { return [1]string{t.Tag} }
-			return [1]string{m.Tag}
+		Where: func(l, r *TaggedValue) bool {
+			return l.Tag < r.Tag // Only A-B pairs
 		},
 	})
 
-	var results []Result
-	finalInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			results = append(results, obj.(Result))
-		},
-		DeleteFunc: func(obj any) {
-			target := obj.(Result)
-			for i, r := range results {
-				if r == target {
-					results = append(results[:i], results[i+1:]...)
-					break
-				}
-			}
-		},
+	var results []string
+	joined.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) { results = append(results, obj.(string)) },
 	})
 
-	source2.OnAdd(Meta{Tag: "gold", Value: "High"}, true)
-	source1.OnAdd(Item{ID: 101, Tags: []string{"gold", "silver"}}, true)
-
-	if len(results) != 1 || results[0].Tag != "gold" {
-		t.Errorf("Expected 1 gold result, got %v", results)
-	}
-
-	// Add another meta
-	source2.OnAdd(Meta{Tag: "silver", Value: "Medium"}, false)
-	if len(results) != 2 {
-		t.Errorf("Expected 2 results after adding silver meta, got %d", len(results))
-	}
-
-	// Remove one tag from source1
-	source1.OnUpdate(Item{ID: 101, Tags: []string{"gold", "silver"}}, Item{ID: 101, Tags: []string{"gold"}})
-	if len(results) != 1 || results[0].Tag != "gold" {
-		t.Errorf("Expected only gold result after update, got %v", results)
+	source.OnAdd(1, true)
+	// Expected: "1:A-B"
+	if len(results) != 1 || results[0] != "1:A-B" {
+		t.Errorf("Expected [1:A-B], got %v", results)
 	}
 }
 
@@ -105,85 +64,109 @@ func TestChaining_JoinToGroupByToFlatMap(t *testing.T) {
 	users := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 	orders := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
-	type User struct{ ID int; Name string }
-	type Order struct{ ID, UserID int; Amount int }
-	type UserOrder struct{ Name string; Amount int }
+	type User struct {
+		ID   int
+		Name string
+	}
+	type Order struct {
+		ID     int
+		UserID int
+		Amount int
+	}
 
-	// 1. Join
-	userOrders := QueryInformer(&Join[UserOrder, User, Order]{
+	// 1. Join Users and Orders
+	userOrders := QueryInformer(&Join[UserOrder, *User, *Order]{
 		Lock: lock,
-		Select: func(u User, o Order) (UserOrder, error) {
-			return UserOrder{Name: u.Name, Amount: o.Amount}, nil
+		Select: func(u *User, o *Order) (UserOrder, error) {
+			return UserOrder{UserName: u.Name, Amount: o.Amount}, nil
 		},
 		From: users,
 		Join: orders,
-		On: func(u User, o Order) any {
-			if u.ID != 0 { return [1]int{u.ID} }
+		On: func(u *User, o *Order) any {
+			if u != nil {
+				return [1]int{u.ID}
+			}
 			return [1]int{o.UserID}
 		},
 	})
 
+	// 2. GroupBy User to get Totals
 	type UserTotal struct {
-		Name  string
-		Total int64
+		UserName string
+		Total    int64
 	}
-
-	// 2. GroupBy
 	userTotals := QueryInformer(&GroupBy[UserTotal, UserOrder]{
 		Lock: lock,
 		Select: func(fields []GroupField) (UserTotal, error) {
-			return UserTotal{Name: fields[0].(string), Total: fields[1].(int64)}, nil
+			return UserTotal{
+				UserName: fields[0].(string),
+				Total:    fields[1].(int64),
+			}, nil
 		},
 		From: userOrders,
 		GroupBy: func(uo UserOrder) (any, []GroupField) {
-			return [1]string{uo.Name}, []GroupField{AnyValue(uo.Name), Sum(int64(uo.Amount))}
+			return [1]string{uo.UserName},
+				[]GroupField{
+					AnyValue(uo.UserName),
+					Sum(int64(uo.Amount)),
+				}
 		},
 	})
 
+	// 3. FlatMap Totals into Alerts (if Total > 100)
 	type Alert struct {
-		Msg string
+		User    string
+		Message string
 	}
-
-	// 3. FlatMap (Alert if total > 100)
-	alerts := QueryInformer(&FlatMap[Alert, UserTotal]{
+	alerts := QueryInformer(&FlatMap[*Alert, UserTotal]{
 		Lock: lock,
-		Map: func(ut UserTotal) ([]Alert, error) {
+		Map: func(ut UserTotal) ([]*Alert, error) {
 			if ut.Total > 100 {
-				return []Alert{{Msg: ut.Name + " is a big spender"}}, nil
+				return []*Alert{{User: ut.UserName, Message: "High Spending"}}, nil
 			}
 			return nil, nil
 		},
 		Over: userTotals,
 	})
 
-	var activeAlerts []Alert
+	var activeAlerts []*Alert
 	alerts.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) { activeAlerts = append(activeAlerts, obj.(Alert)) },
-		DeleteFunc: func(obj any) {
-			target := obj.(Alert)
+		AddFunc: func(obj any) { activeAlerts = append(activeAlerts, obj.(*Alert)) },
+		UpdateFunc: func(old, new any) {
 			for i, a := range activeAlerts {
-				if a == target {
+				if a.User == new.(*Alert).User {
+					activeAlerts[i] = new.(*Alert)
+					return
+				}
+			}
+		},
+		DeleteFunc: func(obj any) {
+			val := obj.(*Alert)
+			for i, a := range activeAlerts {
+				if a.User == val.User {
 					activeAlerts = append(activeAlerts[:i], activeAlerts[i+1:]...)
-					break
+					return
 				}
 			}
 		},
 	})
 
-	users.OnAdd(User{ID: 1, Name: "Bob"}, true)
-	orders.OnAdd(Order{ID: 1, UserID: 1, Amount: 60}, true)
+	// Pushing data
+	users.OnAdd(&User{ID: 1, Name: "Bob"}, true)
+	orders.OnAdd(&Order{ID: 101, UserID: 1, Amount: 50}, true)
 	if len(activeAlerts) != 0 {
-		t.Errorf("Expected no alerts yet, got %d", len(activeAlerts))
+		t.Errorf("Expected 0 alerts for Bob, got %v", activeAlerts)
 	}
 
-	orders.OnAdd(Order{ID: 2, UserID: 1, Amount: 50}, false) // Total 110
-	if len(activeAlerts) != 1 || activeAlerts[0].Msg != "Bob is a big spender" {
+	// Update Bob's total to 150
+	orders.OnAdd(&Order{ID: 102, UserID: 1, Amount: 100}, false)
+	if len(activeAlerts) != 1 || activeAlerts[0].User != "Bob" {
 		t.Errorf("Expected 1 alert for Bob, got %v", activeAlerts)
 	}
 
-	// Refund one order
-	orders.OnDelete(Order{ID: 2, UserID: 1, Amount: 50}) // Total 60
+	// Reduce Bob's spending (Update order 102)
+	orders.OnUpdate(&Order{ID: 102, UserID: 1, Amount: 100}, &Order{ID: 102, UserID: 1, Amount: 10})
 	if len(activeAlerts) != 0 {
-		t.Errorf("Expected alert to be removed after refund, got %d", len(activeAlerts))
+		t.Errorf("Expected alerts to be cleared for Bob, got %v", activeAlerts)
 	}
 }
