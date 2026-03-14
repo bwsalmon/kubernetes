@@ -20,8 +20,8 @@ type joiner[L, R any] struct {
 	rightRegistration cache.ResourceEventHandlerRegistration
 
 	// Indexed by the join key. Supports multiple objects per key (many-to-many).
-	left  map[any][]L
-	right map[any][]R
+	left  BTreeMap[[]L]
+	right BTreeMap[[]R]
 }
 
 var _ ManualSharedInformer = &joiner[int, int]{}
@@ -38,8 +38,8 @@ func newJoinerWithHandler[L, R any](leftSource, rightSource cache.SharedInformer
 		on:          on,
 		leftSource:  leftSource,
 		rightSource: rightSource,
-		left:        make(map[any][]L),
-		right:       make(map[any][]R),
+		left:        NewBTreeMap[[]L](),
+		right:       NewBTreeMap[[]R](),
 	}
 
 	j.leftRegistration, _ = leftSource.AddEventHandler(leftHandler[L, R]{j})
@@ -99,8 +99,14 @@ func (h leftHandler[L, R]) OnAdd(obj any, isInitial bool) {
 func (h leftHandler[L, R]) OnAddLocked(obj any, isInitial bool) {
 	left := obj.(L)
 	key := h.j.on(left, *new(R))
-	h.j.left[key] = append(h.j.left[key], left)
-	if rights, ok := h.j.right[key]; ok {
+	keyStr, _ := DefaultKeyFunc(key)
+
+	// COW: Clone existing slice
+	items, _ := h.j.left.Get(keyStr)
+	newItems := append(append([]L(nil), items...), left)
+	h.j.left.Set(keyStr, newItems)
+
+	if rights, ok := h.j.right.Get(keyStr); ok {
 		for _, right := range rights {
 			h.j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: right}, isInitial)
 		}
@@ -120,34 +126,50 @@ func (h leftHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
 	newKey := h.j.on(newLeft, *new(R))
 
 	if oldKey == newKey {
-		if rights, ok := h.j.right[oldKey]; ok {
+		keyStr, _ := DefaultKeyFunc(oldKey)
+		if rights, ok := h.j.right.Get(keyStr); ok {
 			for _, right := range rights {
 				h.j.handler.OnUpdateLocked(JoinValue[L, R]{Left: oldLeft, Right: right}, JoinValue[L, R]{Left: newLeft, Right: right})
 			}
 		}
-		slice := h.j.left[oldKey]
-		for i, v := range slice {
+		// COW: Update the stored object in the left map.
+		slice, _ := h.j.left.Get(keyStr)
+		newSlice := append([]L(nil), slice...)
+		for i, v := range newSlice {
 			if any(v) == any(oldLeft) {
-				slice[i] = newLeft
+				newSlice[i] = newLeft
 				break
 			}
 		}
+		h.j.left.Set(keyStr, newSlice)
 	} else {
-		if rights, ok := h.j.right[oldKey]; ok {
+		oldKeyStr, _ := DefaultKeyFunc(oldKey)
+		if rights, ok := h.j.right.Get(oldKeyStr); ok {
 			for _, right := range rights {
 				h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: oldLeft, Right: right})
 			}
 		}
-		slice := h.j.left[oldKey]
-		for i, v := range slice {
-			if any(v) == any(oldLeft) {
-				h.j.left[oldKey] = append(slice[:i], slice[i+1:]...)
-				break
+		// COW: Remove from old slice
+		slice, _ := h.j.left.Get(oldKeyStr)
+		newSlice := make([]L, 0, len(slice))
+		for _, v := range slice {
+			if any(v) != any(oldLeft) {
+				newSlice = append(newSlice, v)
 			}
 		}
+		if len(newSlice) == 0 {
+			h.j.left.Delete(oldKeyStr)
+		} else {
+			h.j.left.Set(oldKeyStr, newSlice)
+		}
 
-		h.j.left[newKey] = append(h.j.left[newKey], newLeft)
-		if rights, ok := h.j.right[newKey]; ok {
+		newKeyStr, _ := DefaultKeyFunc(newKey)
+		// COW: Add to new slice
+		slice, _ = h.j.left.Get(newKeyStr)
+		newSlice = append(append([]L(nil), slice...), newLeft)
+		h.j.left.Set(newKeyStr, newSlice)
+
+		if rights, ok := h.j.right.Get(newKeyStr); ok {
 			for _, right := range rights {
 				h.j.handler.OnAddLocked(JoinValue[L, R]{Left: newLeft, Right: right}, false)
 			}
@@ -164,17 +186,25 @@ func (h leftHandler[L, R]) OnDelete(obj any) {
 func (h leftHandler[L, R]) OnDeleteLocked(obj any) {
 	left := obj.(L)
 	key := h.j.on(left, *new(R))
-	if rights, ok := h.j.right[key]; ok {
+	keyStr, _ := DefaultKeyFunc(key)
+
+	if rights, ok := h.j.right.Get(keyStr); ok {
 		for _, right := range rights {
 			h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: right})
 		}
 	}
-	slice := h.j.left[key]
-	for i, v := range slice {
-		if any(v) == any(left) {
-			h.j.left[key] = append(slice[:i], slice[i+1:]...)
-			break
+	// COW: Remove from slice
+	slice, _ := h.j.left.Get(keyStr)
+	newSlice := make([]L, 0, len(slice))
+	for _, v := range slice {
+		if any(v) != any(left) {
+			newSlice = append(newSlice, v)
 		}
+	}
+	if len(newSlice) == 0 {
+		h.j.left.Delete(keyStr)
+	} else {
+		h.j.left.Set(keyStr, newSlice)
 	}
 }
 
@@ -194,8 +224,14 @@ func (h rightHandler[L, R]) OnAdd(obj any, isInitial bool) {
 func (h rightHandler[L, R]) OnAddLocked(obj any, isInitial bool) {
 	right := obj.(R)
 	key := h.j.on(*new(L), right)
-	h.j.right[key] = append(h.j.right[key], right)
-	if lefts, ok := h.j.left[key]; ok {
+	keyStr, _ := DefaultKeyFunc(key)
+
+	// COW: Clone existing slice
+	items, _ := h.j.right.Get(keyStr)
+	newItems := append(append([]R(nil), items...), right)
+	h.j.right.Set(keyStr, newItems)
+
+	if lefts, ok := h.j.left.Get(keyStr); ok {
 		for _, left := range lefts {
 			h.j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: right}, isInitial)
 		}
@@ -215,34 +251,50 @@ func (h rightHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
 	newKey := h.j.on(*new(L), newRight)
 
 	if oldKey == newKey {
-		if lefts, ok := h.j.left[oldKey]; ok {
+		keyStr, _ := DefaultKeyFunc(oldKey)
+		if lefts, ok := h.j.left.Get(keyStr); ok {
 			for _, left := range lefts {
 				h.j.handler.OnUpdateLocked(JoinValue[L, R]{Left: left, Right: oldRight}, JoinValue[L, R]{Left: left, Right: newRight})
 			}
 		}
-		slice := h.j.right[oldKey]
-		for i, v := range slice {
+		// COW: Update the stored object in the right map.
+		slice, _ := h.j.right.Get(keyStr)
+		newSlice := append([]R(nil), slice...)
+		for i, v := range newSlice {
 			if any(v) == any(oldRight) {
-				slice[i] = newRight
+				newSlice[i] = newRight
 				break
 			}
 		}
+		h.j.right.Set(keyStr, newSlice)
 	} else {
-		if lefts, ok := h.j.left[oldKey]; ok {
+		oldKeyStr, _ := DefaultKeyFunc(oldKey)
+		if lefts, ok := h.j.left.Get(oldKeyStr); ok {
 			for _, left := range lefts {
 				h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: oldRight})
 			}
 		}
-		slice := h.j.right[oldKey]
-		for i, v := range slice {
-			if any(v) == any(oldRight) {
-				h.j.right[oldKey] = append(slice[:i], slice[i+1:]...)
-				break
+		// COW: Remove from old slice
+		slice, _ := h.j.right.Get(oldKeyStr)
+		newSlice := make([]R, 0, len(slice))
+		for _, v := range slice {
+			if any(v) != any(oldRight) {
+				newSlice = append(newSlice, v)
 			}
 		}
+		if len(newSlice) == 0 {
+			h.j.right.Delete(oldKeyStr)
+		} else {
+			h.j.right.Set(oldKeyStr, newSlice)
+		}
 
-		h.j.right[newKey] = append(h.j.right[newKey], newRight)
-		if lefts, ok := h.j.left[newKey]; ok {
+		newKeyStr, _ := DefaultKeyFunc(newKey)
+		// COW: Add to new slice
+		slice, _ = h.j.right.Get(newKeyStr)
+		newSlice = append(append([]R(nil), slice...), newRight)
+		h.j.right.Set(newKeyStr, newSlice)
+
+		if lefts, ok := h.j.left.Get(newKeyStr); ok {
 			for _, left := range lefts {
 				h.j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: newRight}, false)
 			}
@@ -259,17 +311,25 @@ func (h rightHandler[L, R]) OnDelete(obj any) {
 func (h rightHandler[L, R]) OnDeleteLocked(obj any) {
 	right := obj.(R)
 	key := h.j.on(*new(L), right)
-	if lefts, ok := h.j.left[key]; ok {
+	keyStr, _ := DefaultKeyFunc(key)
+
+	if lefts, ok := h.j.left.Get(keyStr); ok {
 		for _, left := range lefts {
 			h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: right})
 		}
 	}
-	slice := h.j.right[key]
-	for i, v := range slice {
-		if any(v) == any(right) {
-			h.j.right[key] = append(slice[:i], slice[i+1:]...)
-			break
+	// COW: Remove from slice
+	slice, _ := h.j.right.Get(keyStr)
+	newSlice := make([]R, 0, len(slice))
+	for _, v := range slice {
+		if any(v) != any(right) {
+			newSlice = append(newSlice, v)
 		}
+	}
+	if len(newSlice) == 0 {
+		h.j.right.Delete(keyStr)
+	} else {
+		h.j.right.Set(keyStr, newSlice)
 	}
 }
 
@@ -313,16 +373,8 @@ func (j *joiner[L, R]) Clone(newSources []cache.SharedInformer) CloneableSharedI
 		on:          j.on,
 		leftSource:  nl,
 		rightSource: nr,
-		left:        make(map[any][]L),
-		right:       make(map[any][]R),
-	}
-
-	// Deep copy internal maps
-	for k, v := range j.left {
-		nj.left[k] = append([]L(nil), v...)
-	}
-	for k, v := range j.right {
-		nj.right[k] = append([]R(nil), v...)
+		left:        j.left.Clone(),  // Fast O(1) B-Tree clone
+		right:       j.right.Clone(), // Fast O(1) B-Tree clone
 	}
 
 	nj.leftRegistration, _ = nl.AddEventHandler(leftHandler[L, R]{nj})

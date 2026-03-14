@@ -19,7 +19,7 @@ type grouper[Out, In any] struct {
 
 	registration cache.ResourceEventHandlerRegistration
 
-	groups map[any]*groupState[Out]
+	groups BTreeMap[*groupState[Out]]
 }
 
 var _ ManualSharedInformer = &grouper[int, int]{}
@@ -33,7 +33,6 @@ type groupState[Out any] struct {
 }
 
 func newGrouper[Out, In any](lock LockGroup, sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In]) *grouper[Out, In] {
-	// grouper emits Out. Assume MetaNamespaceKeyFunc for aggregates.
 	handler := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
 	handler.SetName("grouper-handler")
 	return newGrouperWithHandler(sel, groupBy, from, where, handler)
@@ -46,7 +45,7 @@ func newGrouperWithHandler[Out, In any](sel GroupSelectFunc[Out], groupBy Single
 		groupBy: groupBy,
 		where:   where,
 		source:  from,
-		groups:  make(map[any]*groupState[Out]),
+		groups:  NewBTreeMap[*groupState[Out]](),
 	}
 
 	g.registration, _ = from.AddEventHandler(g)
@@ -73,19 +72,25 @@ func (g *grouper[Out, In]) OnAddLocked(obj any, isInitial bool) {
 	}
 
 	key, fields := g.groupBy(input)
+	keyStr, _ := DefaultKeyFunc(key)
 
-	state, ok := g.groups[key]
+	state, ok := g.groups.Get(keyStr)
 	var oldOut Out
 	if ok {
 		oldOut = state.lastOut
-	} else {
-		state = &groupState[Out]{}
-		g.groups[key] = state
 	}
 
-	newFields := g.evaluateFields(fields, state, input, true)
+	// COW: Create a new state if modifying
+	var newState groupState[Out]
+	if ok {
+		newState = *state
+		newState.fields = append([]any(nil), state.fields...)
+	}
+
+	newFields := g.evaluateFields(fields, &newState, input, true)
 	newOut, _ := g.sel(newFields)
-	state.lastOut = newOut
+	newState.lastOut = newOut
+	g.groups.Set(keyStr, &newState)
 
 	if ok {
 		g.handler.OnUpdateLocked(oldOut, newOut)
@@ -108,18 +113,24 @@ func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
 	newKey, newFields := g.groupBy(newInput)
 
 	if oldKey == newKey {
-		state, ok := g.groups[oldKey]
+		keyStr, _ := DefaultKeyFunc(oldKey)
+		state, ok := g.groups.Get(keyStr)
 		if !ok {
 			g.OnAddLocked(newObj, false)
 			return
 		}
 
 		oldOut := state.lastOut
-		g.evaluateFields(oldFields, state, oldInput, false)
-		resFields := g.evaluateFields(newFields, state, newInput, true)
+		// COW: Create a new state
+		newState := *state
+		newState.fields = append([]any(nil), state.fields...)
+
+		g.evaluateFields(oldFields, &newState, oldInput, false)
+		resFields := g.evaluateFields(newFields, &newState, newInput, true)
 		
 		newOut, _ := g.sel(resFields)
-		state.lastOut = newOut
+		newState.lastOut = newOut
+		g.groups.Set(keyStr, &newState)
 		g.handler.OnUpdateLocked(oldOut, newOut)
 	} else {
 		g.OnDeleteLocked(oldObj)
@@ -140,21 +151,27 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 	}
 
 	key, fields := g.groupBy(input)
+	keyStr, _ := DefaultKeyFunc(key)
 
-	state, ok := g.groups[key]
+	state, ok := g.groups.Get(keyStr)
 	if !ok {
 		return
 	}
 
 	oldOut := state.lastOut
-	newFields := g.evaluateFields(fields, state, input, false)
+	// COW: Create a new state
+	newState := *state
+	newState.fields = append([]any(nil), state.fields...)
 
-	if state.count == 0 {
-		delete(g.groups, key)
+	newFields := g.evaluateFields(fields, &newState, input, false)
+
+	if newState.count == 0 {
+		g.groups.Delete(keyStr)
 		g.handler.OnDeleteLocked(oldOut)
 	} else {
 		newOut, _ := g.sel(newFields)
-		state.lastOut = newOut
+		newState.lastOut = newOut
+		g.groups.Set(keyStr, &newState)
 		g.handler.OnUpdateLocked(oldOut, newOut)
 	}
 }
@@ -191,17 +208,25 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			if state.fields[i] == nil {
 				state.fields[i] = make(map[any]int)
 			}
+			// COW for the distinct map
 			m := state.fields[i].(map[any]int)
+			newM := make(map[any]int, len(m))
+			for k, v := range m {
+				newM[k] = v
+			}
+			
 			if adding {
-				m[gf.distinct]++
+				newM[gf.distinct]++
 			} else {
-				m[gf.distinct]--
-				if m[gf.distinct] == 0 {
-					delete(m, gf.distinct)
+				newM[gf.distinct]--
+				if newM[gf.distinct] == 0 {
+					delete(newM, gf.distinct)
 				}
 			}
+			state.fields[i] = newM
+			
 			var distincts []any
-			for k := range m {
+			for k := range newM {
 				distincts = append(distincts, k)
 			}
 			res[i] = distincts
@@ -254,26 +279,7 @@ func (g *grouper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSha
 		groupBy: g.groupBy,
 		where:   g.where,
 		source:  ns,
-		groups:  make(map[any]*groupState[Out]),
-	}
-
-	// Deep copy groups
-	for k, v := range g.groups {
-		newGS := &groupState[Out]{
-			count:   v.count,
-			fields:  append([]any(nil), v.fields...),
-			lastOut: v.lastOut,
-		}
-		for i, f := range newGS.fields {
-			if m, ok := f.(map[any]int); ok {
-				nm := make(map[any]int)
-				for mk, mv := range m {
-					nm[mk] = mv
-				}
-				newGS.fields[i] = nm
-			}
-		}
-		ng.groups[k] = newGS
+		groups:  g.groups.Clone(), // Fast O(1) B-Tree clone
 	}
 
 	ng.registration, _ = ns.AddEventHandler(ng)

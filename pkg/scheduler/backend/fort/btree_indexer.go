@@ -14,18 +14,84 @@ type CloneableIndexer interface {
 	Clone() CloneableIndexer
 }
 
-type btreeItem struct {
-	key string
-	obj any
+// BTreeMap is a generic fast-cloneable map with string keys.
+type BTreeMap[V any] interface {
+	Get(key string) (V, bool)
+	Set(key string, val V)
+	Delete(key string)
+	List() []V
+	ListKeys() []string
+	Clone() BTreeMap[V]
+	Len() int
 }
 
-func btreeItemLess(a, b btreeItem) bool {
+type btreeMapItem[V any] struct {
+	key string
+	val V
+}
+
+func btreeMapItemLess[V any](a, b btreeMapItem[V]) bool {
 	return a.key < b.key
+}
+
+type btreeMap[V any] struct {
+	tree *btree.BTree[btreeMapItem[V]]
+}
+
+func NewBTreeMap[V any]() BTreeMap[V] {
+	return &btreeMap[V]{
+		tree: btree.New(2, btreeMapItemLess[V]),
+	}
+}
+
+func (m *btreeMap[V]) Get(key string) (V, bool) {
+	it, ok := m.tree.Get(btreeMapItem[V]{key: key})
+	if !ok {
+		var zero V
+		return zero, false
+	}
+	return it.val, true
+}
+
+func (m *btreeMap[V]) Set(key string, val V) {
+	m.tree.ReplaceOrInsert(btreeMapItem[V]{key: key, val: val})
+}
+
+func (m *btreeMap[V]) Delete(key string) {
+	m.tree.Delete(btreeMapItem[V]{key: key})
+}
+
+func (m *btreeMap[V]) List() []V {
+	res := make([]V, 0, m.tree.Len())
+	m.tree.Ascend(func(item btreeMapItem[V]) bool {
+		res = append(res, item.val)
+		return true
+	})
+	return res
+}
+
+func (m *btreeMap[V]) ListKeys() []string {
+	res := make([]string, 0, m.tree.Len())
+	m.tree.Ascend(func(item btreeMapItem[V]) bool {
+		res = append(res, item.key)
+		return true
+	})
+	return res
+}
+
+func (m *btreeMap[V]) Clone() BTreeMap[V] {
+	return &btreeMap[V]{
+		tree: m.tree.Clone(),
+	}
+}
+
+func (m *btreeMap[V]) Len() int {
+	return m.tree.Len()
 }
 
 type btreeIndexer struct {
 	keyFunc cache.KeyFunc
-	tree    *btree.BTree[btreeItem]
+	data    BTreeMap[any]
 	lastRV  string
 }
 
@@ -33,14 +99,14 @@ type btreeIndexer struct {
 func NewBTreeIndexer(keyFunc cache.KeyFunc) CloneableIndexer {
 	return &btreeIndexer{
 		keyFunc: keyFunc,
-		tree:    btree.New(2, btreeItemLess), // degree 2 means 2-3-4 tree
+		data:    NewBTreeMap[any](),
 	}
 }
 
 func (i *btreeIndexer) Clone() CloneableIndexer {
 	return &btreeIndexer{
 		keyFunc: i.keyFunc,
-		tree:    i.tree.Clone(),
+		data:    i.data.Clone(),
 		lastRV:  i.lastRV,
 	}
 }
@@ -50,7 +116,7 @@ func (i *btreeIndexer) Add(obj any) error {
 	if err != nil {
 		return err
 	}
-	i.tree.ReplaceOrInsert(btreeItem{key: key, obj: obj})
+	i.data.Set(key, obj)
 	return nil
 }
 
@@ -63,26 +129,16 @@ func (i *btreeIndexer) Delete(obj any) error {
 	if err != nil {
 		return err
 	}
-	i.tree.Delete(btreeItem{key: key})
+	i.data.Delete(key)
 	return nil
 }
 
 func (i *btreeIndexer) List() []any {
-	res := make([]any, 0, i.tree.Len())
-	i.tree.Ascend(func(item btreeItem) bool {
-		res = append(res, item.obj)
-		return true
-	})
-	return res
+	return i.data.List()
 }
 
 func (i *btreeIndexer) ListKeys() []string {
-	res := make([]string, 0, i.tree.Len())
-	i.tree.Ascend(func(item btreeItem) bool {
-		res = append(res, item.key)
-		return true
-	})
-	return res
+	return i.data.ListKeys()
 }
 
 func (i *btreeIndexer) Get(obj any) (item any, exists bool, err error) {
@@ -94,15 +150,12 @@ func (i *btreeIndexer) Get(obj any) (item any, exists bool, err error) {
 }
 
 func (i *btreeIndexer) GetByKey(key string) (item any, exists bool, err error) {
-	it, ok := i.tree.Get(btreeItem{key: key})
-	if !ok {
-		return nil, false, nil
-	}
-	return it.obj, true, nil
+	val, ok := i.data.Get(key)
+	return val, ok, nil
 }
 
 func (i *btreeIndexer) Replace(objs []any, rv string) error {
-	i.tree.Clear(false)
+	i.data = NewBTreeMap[any]()
 	i.lastRV = rv
 	for _, obj := range objs {
 		if err := i.Add(obj); err != nil {
