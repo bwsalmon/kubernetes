@@ -32,14 +32,21 @@ func newFlatMapperWithHandler[Out, In any](mapper FlatMapFunc[Out, In], from cac
 		source:  from,
 	}
 
-	// Initial registration from constructor still replays
+	// Initial registration from constructor.
 	m.registration, _ = from.AddEventHandler(m)
 
+	// Sync propagation goroutine.
 	go func() {
 		check := m.registration.HasSyncedChecker()
 		syncedChan := check.Done()
-		<-syncedChan
-		m.handler.SetHasSynced()
+		
+		// Wait for sync or for the handler to be stopped.
+		select {
+		case <-syncedChan:
+			m.handler.SetHasSynced()
+		case <-m.handler.IsStoppedChan():
+			// Exit if the informer is stopped.
+		}
 	}()
 
 	return m
@@ -179,12 +186,20 @@ func (m *flatMapper[Out, In]) GetController() cache.Controller {
 	return nil
 }
 
+// Run starts the informer and unregisters from source when stopCh is closed.
 func (m *flatMapper[Out, In]) Run(stopCh <-chan struct{}) {
+	defer m.SetIsStopped()
+	// Unregister from source when stopped.
+	defer func() {
+		if m.source != nil && m.registration != nil {
+			_ = m.source.RemoveEventHandler(m.registration)
+		}
+	}()
 	<-stopCh
 }
 
 func (m *flatMapper[Out, In]) RunWithContext(ctx context.Context) {
-	<-ctx.Done()
+	m.Run(ctx.Done())
 }
 
 func (m *flatMapper[Out, In]) LastSyncResourceVersion() string {
@@ -209,6 +224,10 @@ func (m *flatMapper[Out, In]) HasSynced() bool {
 
 func (m *flatMapper[Out, In]) IsStopped() bool {
 	return m.handler.IsStopped()
+}
+
+func (m *flatMapper[Out, In]) IsStoppedChan() <-chan struct{} {
+	return m.handler.(interface{ IsStoppedChan() <-chan struct{} }).IsStoppedChan()
 }
 
 func (m *flatMapper[Out, In]) SetIsStopped() {

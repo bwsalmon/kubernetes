@@ -52,9 +52,16 @@ func newJoinerWithHandler[L, R any](leftSource, rightSource cache.SharedInformer
 	go func() {
 		lCheck := j.leftRegistration.HasSyncedChecker()
 		rCheck := j.rightRegistration.HasSyncedChecker()
-		<-lCheck.Done()
-		<-rCheck.Done()
-		j.handler.SetHasSynced()
+		
+		select {
+		case <-lCheck.Done():
+			select {
+			case <-rCheck.Done():
+				j.handler.SetHasSynced()
+			case <-j.handler.IsStoppedChan():
+			}
+		case <-j.handler.IsStoppedChan():
+		}
 	}()
 
 	return j
@@ -113,6 +120,13 @@ func (h rightHandler[L, R]) OnDelete(obj any) {
 }
 func (h rightHandler[L, R]) OnDeleteLocked(obj any) { h.j.onRightDelete(obj.(R)) }
 
+// objectsEqual robustly compares two objects using DefaultKeyFunc to avoid panics on non-comparable types.
+func objectsEqual(a, b any) bool {
+	ka, _ := DefaultKeyFunc(a)
+	kb, _ := DefaultKeyFunc(b)
+	return ka == kb
+}
+
 // Core join logic.
 
 func (j *joiner[L, R]) onLeftAdd(left L, isInitial bool) {
@@ -147,7 +161,7 @@ func (j *joiner[L, R]) onLeftUpdate(oldLeft, newLeft L) {
 		slice, _ := j.left.Get(keyStr)
 		newSlice := append([]L(nil), slice...)
 		for i, v := range newSlice {
-			if any(v) == any(oldLeft) {
+			if objectsEqual(v, oldLeft) {
 				newSlice[i] = newLeft
 				break
 			}
@@ -173,7 +187,7 @@ func (j *joiner[L, R]) onLeftDelete(left L) {
 	slice, _ := j.left.Get(keyStr)
 	newSlice := make([]L, 0, len(slice))
 	for _, v := range slice {
-		if any(v) != any(left) {
+		if !objectsEqual(v, left) {
 			newSlice = append(newSlice, v)
 		}
 	}
@@ -215,7 +229,7 @@ func (j *joiner[L, R]) onRightUpdate(oldRight, newRight R) {
 		slice, _ := j.right.Get(keyStr)
 		newSlice := append([]R(nil), slice...)
 		for i, v := range newSlice {
-			if any(v) == any(oldRight) {
+			if objectsEqual(v, oldRight) {
 				newSlice[i] = newRight
 				break
 			}
@@ -240,7 +254,7 @@ func (j *joiner[L, R]) onRightDelete(right R) {
 	slice, _ := j.right.Get(keyStr)
 	newSlice := make([]R, 0, len(slice))
 	for _, v := range slice {
-		if any(v) != any(right) {
+		if !objectsEqual(v, right) {
 			newSlice = append(newSlice, v)
 		}
 	}
@@ -324,12 +338,22 @@ func (j *joiner[L, R]) GetController() cache.Controller {
 	return nil
 }
 
+// Run starts the informer and unregisters from sources when stopCh is closed.
 func (j *joiner[L, R]) Run(stopCh <-chan struct{}) {
+	defer j.SetIsStopped()
+	defer func() {
+		if j.leftSource != nil && j.leftRegistration != nil {
+			_ = j.leftSource.RemoveEventHandler(j.leftRegistration)
+		}
+		if j.rightSource != nil && j.rightRegistration != nil {
+			_ = j.rightSource.RemoveEventHandler(j.rightRegistration)
+		}
+	}()
 	<-stopCh
 }
 
 func (j *joiner[L, R]) RunWithContext(ctx context.Context) {
-	<-ctx.Done()
+	j.Run(ctx.Done())
 }
 
 func (j *joiner[L, R]) LastSyncResourceVersion() string {
@@ -358,6 +382,10 @@ func (j *joiner[L, R]) HasSynced() bool {
 
 func (j *joiner[L, R]) IsStopped() bool {
 	return j.handler.IsStopped()
+}
+
+func (j *joiner[L, R]) IsStoppedChan() <-chan struct{} {
+	return j.handler.(interface{ IsStoppedChan() <-chan struct{} }).IsStoppedChan()
 }
 
 func (j *joiner[L, R]) SetIsStopped() {

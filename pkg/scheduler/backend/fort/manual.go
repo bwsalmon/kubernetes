@@ -19,7 +19,8 @@ type manualInformer struct {
 	handlers      map[int]cache.ResourceEventHandler
 	nextHandlerId int
 
-	synced chan struct{}
+	synced        chan struct{}
+	isStoppedChan chan struct{}
 
 	hasSynced bool
 	isStopped bool
@@ -133,11 +134,12 @@ func (p *manualInformer) GetController() cache.Controller {
 }
 
 func (p *manualInformer) Run(stopCh <-chan struct{}) {
+	defer p.SetIsStopped()
 	<-stopCh
 }
 
 func (p *manualInformer) RunWithContext(ctx context.Context) {
-	<-ctx.Done()
+	p.Run(ctx.Done())
 }
 
 func (p *manualInformer) LastSyncResourceVersion() string {
@@ -195,6 +197,10 @@ func (p *manualInformer) IsStopped() bool {
 	return p.isStopped
 }
 
+func (p *manualInformer) IsStoppedChan() <-chan struct{} {
+	return p.isStoppedChan
+}
+
 func (p *manualInformer) SetHasSynced() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -210,7 +216,12 @@ func (p *manualInformer) SetHasSynced() {
 func (p *manualInformer) SetIsStopped() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+
+	if p.isStopped {
+		return
+	}
 	p.isStopped = true
+	close(p.isStoppedChan)
 }
 
 func (p *manualInformer) GetKeyFunc() cache.KeyFunc {
@@ -306,9 +317,13 @@ func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformer
 		indexer:                 p.indexer.Clone(), // Fast O(1) B-Tree clone
 		lock:                    NewLockGroup(),
 		synced:                  make(chan struct{}),
+		isStoppedChan:           make(chan struct{}),
 	}
 	if p.hasSynced {
 		close(newInformer.synced)
+	}
+	if p.isStopped {
+		close(newInformer.isStoppedChan)
 	}
 
 	return newInformer

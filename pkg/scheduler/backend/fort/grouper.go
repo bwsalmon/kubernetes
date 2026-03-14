@@ -70,10 +70,15 @@ func newGrouperWithHandler[Out, In any](sel GroupSelectFunc[Out], groupBy Single
 
 	g.registration, _ = from.AddEventHandler(g)
 
+	// Sync propagation goroutine.
 	go func() {
 		check := g.registration.HasSyncedChecker()
-		<-check.Done()
-		g.handler.SetHasSynced()
+		
+		select {
+		case <-check.Done():
+			g.handler.SetHasSynced()
+		case <-g.handler.IsStoppedChan():
+		}
 	}()
 
 	return g
@@ -319,8 +324,8 @@ func (g *grouper[Out, In]) HasSyncedChecker() cache.DoneChecker {
 	return g.handler.HasSyncedChecker()
 }
 
-// Clone creates a new instance.
-// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
+// Clone creates a new instance of the grouper.
+// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
 func (g *grouper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
 	ns := newSources[0]
 	newLock := ns.(CloneableSharedInformerQuery).GetLockGroup()
@@ -354,12 +359,19 @@ func (g *grouper[Out, In]) GetController() cache.Controller {
 	return nil
 }
 
+// Run starts the informer and unregisters from source when stopCh is closed.
 func (g *grouper[Out, In]) Run(stopCh <-chan struct{}) {
+	defer g.SetIsStopped()
+	defer func() {
+		if g.source != nil && g.registration != nil {
+			_ = g.source.RemoveEventHandler(g.registration)
+		}
+	}()
 	<-stopCh
 }
 
 func (g *grouper[Out, In]) RunWithContext(ctx context.Context) {
-	<-ctx.Done()
+	g.Run(ctx.Done())
 }
 
 func (g *grouper[Out, In]) LastSyncResourceVersion() string {
@@ -384,6 +396,10 @@ func (g *grouper[Out, In]) HasSynced() bool {
 
 func (g *grouper[Out, In]) IsStopped() bool {
 	return g.handler.IsStopped()
+}
+
+func (g *grouper[Out, In]) IsStoppedChan() <-chan struct{} {
+	return g.handler.(interface{ IsStoppedChan() <-chan struct{} }).IsStoppedChan()
 }
 
 func (g *grouper[Out, In]) SetIsStopped() {

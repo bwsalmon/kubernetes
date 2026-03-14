@@ -2,6 +2,7 @@ package fort
 
 import (
 	"testing"
+	"time"
 
 	"k8s.io/client-go/tools/cache"
 )
@@ -51,31 +52,39 @@ func TestClonePipeline_CyclePanic(t *testing.T) {
 	ClonePipeline(i1, memo)
 }
 
-func TestFlatMap_DuplicateKeys(t *testing.T) {
+func TestOperator_RegistrationLeak(t *testing.T) {
 	lock := NewLockGroup()
-	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
-	
-	// Map one input to two outputs with SAME key
-	fm := QueryInformer(&FlatMap[string, string]{
-		Lock: lock,
-		Map: func(s string) ([]string, error) {
-			return []string{"result", "result"}, nil
-		},
-		Over: source,
+	source := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
+
+	// Build a small pipeline
+	query := QueryInformer(&Select[int, int]{
+		Lock:   lock,
+		From:   source,
+		Select: func(i int) (int, error) { return i, nil },
 	})
 
-	var adds, updates, deletes int
-	fm.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { adds++ },
-		UpdateFunc: func(old, new any) { updates++ },
-		DeleteFunc: func(obj any) { deletes++ },
-	})
+	// Get internal informer to check handlers count
+	si := source.(*manualInformer)
 
-	source.OnAdd("input", true)
+	initialHandlers := len(si.handlers)
 	
-	// Since handler is a manualInformer with BTreeIndexer, 
-	// the second "result" should overwrite the first.
-	if adds != 2 {
-		t.Logf("Note: Adds is %d (expected 2 if duplicate results are emitted)", adds)
+	for i := 0; i < 100; i++ {
+		// Clone
+		cl := query.Clone([]cache.SharedInformer{source})
+		
+		// Run and stop immediately to unregister
+		stopCh := make(chan struct{})
+		go cl.Run(stopCh)
+		close(stopCh)
+		
+		// Give a tiny bit of time for the goroutine to cleanup
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	finalHandlers := len(si.handlers)
+	if finalHandlers > initialHandlers {
+		t.Errorf("Registration leak detected! Handlers count grew from %d to %d", initialHandlers, finalHandlers)
 	}
 }
+
+

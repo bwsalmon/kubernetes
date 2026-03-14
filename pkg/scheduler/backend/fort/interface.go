@@ -50,6 +50,10 @@ type CloneableSharedInformerQuery interface {
 	SetName(name string)
 	// GetSources returns the upstream informers providing data to this query.
 	GetSources() []cache.SharedInformer
+	// IsStoppedChan returns a channel that is closed when the informer is stopped.
+	IsStoppedChan() <-chan struct{}
+	// GetKeyFunc returns the key function used by this informer.
+	GetKeyFunc() cache.KeyFunc
 }
 
 // QueryInformer generates a new SharedInformer by running the given query spec.
@@ -196,11 +200,12 @@ func NewManualSharedInformer() ManualSharedInformer {
 // NewManualSharedInformerWithOptions creates a ManualSharedInformer with specific options.
 func NewManualSharedInformerWithOptions(lock LockGroup, keyFunc cache.KeyFunc) ManualSharedInformer {
 	return &manualInformer{
-		handlers: map[int]cache.ResourceEventHandler{},
-		keyFunc:  keyFunc,
-		indexer:  NewBTreeIndexer(keyFunc),
-		lock:     lock,
-		synced:   make(chan struct{}),
+		handlers:      map[int]cache.ResourceEventHandler{},
+		keyFunc:       keyFunc,
+		indexer:       NewBTreeIndexer(keyFunc),
+		lock:          lock,
+		synced:        make(chan struct{}),
+		isStoppedChan: make(chan struct{}),
 	}
 }
 

@@ -12,6 +12,13 @@ func getLock(lock LockGroup, source cache.SharedInformer) LockGroup {
 	return NewLockGroup()
 }
 
+func getSourceKeyFunc(source cache.SharedInformer) cache.KeyFunc {
+	if q, ok := source.(CloneableSharedInformerQuery); ok {
+		return q.GetKeyFunc()
+	}
+	return DefaultKeyFunc
+}
+
 func (q *Select[Out, In]) Build() CloneableSharedInformerQuery {
 	lock := getLock(q.Lock, q.From)
 	inf := newFlatMapper[Out, In](lock, func(value In) ([]Out, error) {
@@ -34,12 +41,23 @@ func (q *Join[Out, Left, Right]) Build() CloneableSharedInformerQuery {
 	if on == nil {
 		on = func(l Left, r Right) any { return 0 }
 	}
+
+	kl := getSourceKeyFunc(q.From)
+	kr := getSourceKeyFunc(q.Join)
+
+	joinKeyFunc := func(obj any) (string, error) {
+		jv := obj.(JoinValue[Left, Right])
+		l, _ := kl(jv.Left)
+		r, _ := kr(jv.Right)
+		return l + " // " + r, nil
+	}
+
 	sq := &Select[Out, JoinValue[Left, Right]]{
 		Lock: lock,
 		Select: func(joined JoinValue[Left, Right]) (Out, error) {
 			return q.Select(joined.Left, joined.Right)
 		},
-		From: newJoiner[Left, Right](lock, q.From, q.Join, on),
+		From: newJoinerWithHandler(q.From, q.Join, on, NewManualSharedInformerWithOptions(lock, joinKeyFunc)),
 		Where: func(joined JoinValue[Left, Right]) bool {
 			if q.Where == nil {
 				return true
@@ -65,10 +83,21 @@ func (q *GroupByJoin[Out, Left, Right]) Build() CloneableSharedInformerQuery {
 	if on == nil {
 		on = func(l Left, r Right) any { return 0 }
 	}
+
+	kl := getSourceKeyFunc(q.From)
+	kr := getSourceKeyFunc(q.Join)
+
+	joinKeyFunc := func(obj any) (string, error) {
+		jv := obj.(JoinValue[Left, Right])
+		l, _ := kl(jv.Left)
+		r, _ := kr(jv.Right)
+		return l + " // " + r, nil
+	}
+
 	g := &GroupBy[Out, JoinValue[Left, Right]]{
 		Lock:   lock,
 		Select: q.Select,
-		From:   newJoiner[Left, Right](lock, q.From, q.Join, on),
+		From:   newJoinerWithHandler(q.From, q.Join, on, NewManualSharedInformerWithOptions(lock, joinKeyFunc)),
 		Where: func(joined JoinValue[Left, Right]) bool {
 			if q.Where == nil {
 				return true
