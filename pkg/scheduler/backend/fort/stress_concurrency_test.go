@@ -78,7 +78,7 @@ func TestStress_ConcurrentUpdateAndClone(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < clonesPerCloner; j++ {
 				// Atomically capture the original state and take a clone
-				locks := LockDomain(grouper)
+				locks := SnapshotLockDomain(grouper)
 				
 				// Capture current state from original using List() for identity-agnostic check
 				var origCount int64
@@ -155,7 +155,7 @@ func TestStress_MassiveCloning(t *testing.T) {
 		source.OnAdd(i, false)
 		
 		func() {
-			locks := LockDomain(query)
+			locks := SnapshotLockDomain(query)
 			defer locks.Unlock()
 			
 			ns := source.Clone(nil)

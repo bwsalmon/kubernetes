@@ -217,28 +217,35 @@ func NewManualSharedInformerWithOptions(lock LockGroup, keyFunc cache.KeyFunc) M
 	}
 }
 
-// LockDomain acquires a Read Lock on the domain (LockGroup), enabling a consistent snapshot.
-func LockDomain(informers ...CloneableSharedInformerQuery) DomainLock {
+// SnapshotLockDomain acquires an exclusive Lock on the domain (LockGroup), 
+// enabling a consistent and safe snapshot. Exclusive lock is REQUIRED because 
+// B-Tree structural cloning is not thread-safe for concurrent read-only clones.
+func SnapshotLockDomain(informers ...CloneableSharedInformerQuery) DomainLock {
 	if len(informers) == 0 {
 		return &domainLock{}
 	}
 	lock := informers[0].GetLockGroup()
-	lock.RLock()
-	return &domainLock{lock: lock}
+	lock.Lock()
+	return &domainLock{lock: lock, exclusive: true}
 }
 
-// DomainLock provides a handle to release a domain-level read lock.
+// DomainLock provides a handle to release a domain-level lock.
 type DomainLock interface {
 	Unlock()
 }
 
 type domainLock struct {
-	lock LockGroup
+	lock      LockGroup
+	exclusive bool
 }
 
 func (ls *domainLock) Unlock() {
 	if ls.lock != nil {
-		ls.lock.RUnlock()
+		if ls.exclusive {
+			ls.lock.Unlock()
+		} else {
+			ls.lock.RUnlock()
+		}
 	}
 }
 

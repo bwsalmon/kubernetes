@@ -67,7 +67,7 @@ func TestClone_ConsistencyUnderUpdate(t *testing.T) {
 	// Perform multiple clones while updates are happening
 	for i := 0; i < 10; i++ {
 		// 1. Lock original pipeline
-		locks := LockDomain(grouper)
+		locks := SnapshotLockDomain(grouper)
 		
 		// 2. Clone the chain
 		// IMPORTANT: For the clone to have state, we must connect it to the snapshot sources.
@@ -126,7 +126,7 @@ func TestClone_AtomicSnapshot(t *testing.T) {
 
 	source.OnAdd(1, true)
 
-	locks := LockDomain(query)
+	locks := SnapshotLockDomain(query)
 	
 	// Start an update in background
 	updated := make(chan struct{})

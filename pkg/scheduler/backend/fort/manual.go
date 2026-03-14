@@ -310,7 +310,9 @@ func (p *manualInformer) OnDeleteLocked(oldObj any) {
 }
 
 // Clone creates a new instance.
-// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
+// REQUIRES: Caller must hold the shared LockGroup (Lock, exclusive). 
+// Exclusive lock is required because B-Tree structural cloning is not thread-safe for 
+// concurrent read-only clones.
 func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformerQuery {
 	newInformer := &manualInformer{
 		name:                    p.name,
