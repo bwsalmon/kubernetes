@@ -181,7 +181,7 @@ func NewManualSharedInformerWithOptions(lock LockGroup, keyFunc cache.KeyFunc) M
 	return &manualInformer{
 		handlers: map[int]cache.ResourceEventHandler{},
 		keyFunc:  keyFunc,
-		indexer:  cache.NewIndexer(keyFunc, cache.Indexers{}),
+		indexer:  NewBTreeIndexer(keyFunc),
 		lock:     lock,
 	}
 }

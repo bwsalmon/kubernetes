@@ -305,22 +305,8 @@ func (j *joiner[L, R]) Clone(newSources []cache.SharedInformer) CloneableSharedI
 	
 	newLock := nl.(CloneableSharedInformerQuery).GetLockGroup()
 	
-	p := j.handler.(*manualInformer)
-
-	// Clone the handler (snapshot results)
-	newIndexer := cache.NewIndexer(p.keyFunc, cache.Indexers{})
-	for _, obj := range p.indexer.List() {
-		newIndexer.Add(obj)
-	}
-	newHandler := &manualInformer{
-		name:      p.name,
-		handlers:  map[int]cache.ResourceEventHandler{},
-		transform: p.transform,
-		hasSynced: p.hasSynced,
-		keyFunc:   p.keyFunc,
-		indexer:   newIndexer,
-		lock:      newLock,
-	}
+	newHandler := j.handler.Clone(nil).(ManualSharedInformer)
+	newHandler.(*manualInformer).lock = newLock
 
 	nj := &joiner[L, R]{
 		handler:     newHandler,

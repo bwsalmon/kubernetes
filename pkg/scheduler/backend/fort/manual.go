@@ -27,7 +27,7 @@ type manualInformer struct {
 	transform cache.TransformFunc
 
 	keyFunc cache.KeyFunc
-	indexer cache.Indexer
+	indexer CloneableIndexer
 
 	watchErrorHandler            cache.WatchErrorHandler
 	watchErrorHandlerWithContext cache.WatchErrorHandlerWithContext
@@ -303,12 +303,6 @@ func (p *manualInformer) OnDeleteLocked(oldObj any) {
 // Clone creates a new instance.
 // REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
 func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformerQuery {
-	newIndexer := cache.NewIndexer(p.keyFunc, cache.Indexers{})
-	list := p.indexer.List()
-	for _, obj := range list {
-		newIndexer.Add(obj)
-	}
-
 	newInformer := &manualInformer{
 		name:                    p.name,
 		handlers:                map[int]cache.ResourceEventHandler{},
@@ -317,7 +311,7 @@ func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformer
 		hasSynced:               p.hasSynced,
 		lastSyncResourceVersion: p.lastSyncResourceVersion,
 		keyFunc:                 p.keyFunc,
-		indexer:                 newIndexer,
+		indexer:                 p.indexer.Clone(), // Fast O(1) B-Tree clone
 		lock:                    NewLockGroup(),
 	}
 

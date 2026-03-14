@@ -146,23 +146,8 @@ func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) Cloneable
 		newLock = NewLockGroup()
 	}
 
-	p := m.handler.(*manualInformer)
-
-	newIndexer := cache.NewIndexer(p.keyFunc, cache.Indexers{})
-	list := p.indexer.List()
-	for _, obj := range list {
-		newIndexer.Add(obj)
-	}
-
-	newHandler := &manualInformer{
-		name:      p.name,
-		handlers:  map[int]cache.ResourceEventHandler{},
-		transform: p.transform,
-		hasSynced: p.hasSynced,
-		keyFunc:   p.keyFunc,
-		indexer:   newIndexer,
-		lock:      newLock,
-	}
+	newHandler := m.handler.Clone(nil).(ManualSharedInformer)
+	newHandler.(*manualInformer).lock = newLock
 
 	return newFlatMapperWithHandler(m.mapper, newSource, newHandler)
 }

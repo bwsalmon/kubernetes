@@ -245,21 +245,8 @@ func (g *grouper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSha
 	ns := newSources[0]
 	newLock := ns.(CloneableSharedInformerQuery).GetLockGroup()
 	
-	p := g.handler.(*manualInformer)
-
-	newIndexer := cache.NewIndexer(p.keyFunc, cache.Indexers{})
-	for _, obj := range p.indexer.List() {
-		newIndexer.Add(obj)
-	}
-	newHandler := &manualInformer{
-		name:      p.name,
-		handlers:  map[int]cache.ResourceEventHandler{},
-		transform: p.transform,
-		hasSynced: p.hasSynced,
-		keyFunc:   p.keyFunc,
-		indexer:   newIndexer,
-		lock:      newLock,
-	}
+	newHandler := g.handler.Clone(nil).(ManualSharedInformer)
+	newHandler.(*manualInformer).lock = newLock
 
 	ng := &grouper[Out, In]{
 		handler: newHandler,
