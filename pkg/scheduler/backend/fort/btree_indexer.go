@@ -15,12 +15,17 @@ type CloneableIndexer interface {
 }
 
 // BTreeMap is a generic fast-cloneable map with string keys.
+// It uses a B-Tree to provide O(1) structural cloning via Copy-on-Write (COW).
+// IMPORTANT: While the B-Tree structure is COW, the values stored inside are NOT automatically
+// deep-copied. Handlers must perform manual COW (shallow copy) on complex values (slices, maps, structs)
+// before updating them in the tree to ensure snapshot isolation.
 type BTreeMap[V any] interface {
 	Get(key string) (V, bool)
 	Set(key string, val V)
 	Delete(key string)
 	List() []V
 	ListKeys() []string
+	// Clone performs an O(1) structural clone.
 	Clone() BTreeMap[V]
 	Len() int
 }
@@ -38,6 +43,7 @@ type btreeMap[V any] struct {
 	tree *btree.BTree[btreeMapItem[V]]
 }
 
+// NewBTreeMap creates a new B-Tree based cloneable map.
 func NewBTreeMap[V any]() BTreeMap[V] {
 	return &btreeMap[V]{
 		tree: btree.New(2, btreeMapItemLess[V]),
@@ -81,6 +87,7 @@ func (m *btreeMap[V]) ListKeys() []string {
 
 func (m *btreeMap[V]) Clone() BTreeMap[V] {
 	return &btreeMap[V]{
+		// tree.Clone() is O(1) structural copy.
 		tree: m.tree.Clone(),
 	}
 }
@@ -89,6 +96,7 @@ func (m *btreeMap[V]) Len() int {
 	return m.tree.Len()
 }
 
+// btreeIndexer implements CloneableIndexer (cache.Indexer) using a B-Tree for storage.
 type btreeIndexer struct {
 	keyFunc cache.KeyFunc
 	data    BTreeMap[any]
@@ -106,7 +114,7 @@ func NewBTreeIndexer(keyFunc cache.KeyFunc) CloneableIndexer {
 func (i *btreeIndexer) Clone() CloneableIndexer {
 	return &btreeIndexer{
 		keyFunc: i.keyFunc,
-		data:    i.data.Clone(),
+		data:    i.data.Clone(), // O(1) structural clone.
 		lastRV:  i.lastRV,
 	}
 }
@@ -178,6 +186,8 @@ func (i *btreeIndexer) Bookmark(rv string) {
 }
 
 // Indexer methods stubs - currently not used by Fort queries.
+// If indexing support is needed, these must be implemented using B-Trees as well.
+
 func (i *btreeIndexer) Index(indexName string, obj any) ([]any, error) {
 	return nil, fmt.Errorf("Index not implemented in BTreeIndexer")
 }

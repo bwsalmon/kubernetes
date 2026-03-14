@@ -9,6 +9,8 @@ import (
 )
 
 // joiner implements a many-to-many join between two source informers.
+// It maintains internal B-Trees of join sets (slices of objects) to allow
+// O(1) structural cloning and fast multi-match lookups.
 type joiner[L, R any] struct {
 	handler ManualSharedInformer
 	on      JoinOnFunc[L, R]
@@ -20,6 +22,7 @@ type joiner[L, R any] struct {
 	rightRegistration cache.ResourceEventHandlerRegistration
 
 	// Indexed by the join key. Supports multiple objects per key (many-to-many).
+	// Mutations on these slices MUST use COW to ensure snapshot isolation.
 	left  BTreeMap[[]L]
 	right BTreeMap[[]R]
 }
@@ -45,6 +48,7 @@ func newJoinerWithHandler[L, R any](leftSource, rightSource cache.SharedInformer
 	j.leftRegistration, _ = leftSource.AddEventHandler(leftHandler[L, R]{j})
 	j.rightRegistration, _ = rightSource.AddEventHandler(rightHandler[L, R]{j})
 
+	// Cascade sync state from sources.
 	go func() {
 		lCheck := j.leftRegistration.HasSyncedChecker()
 		rCheck := j.rightRegistration.HasSyncedChecker()
@@ -56,84 +60,91 @@ func newJoinerWithHandler[L, R any](leftSource, rightSource cache.SharedInformer
 	return j
 }
 
-func (j *joiner[L, R]) OnAdd(obj any, isInitial bool) {
-	j.handler.GetLockGroup().Lock()
-	defer j.handler.GetLockGroup().Unlock()
-	j.OnAddLocked(obj, isInitial)
-}
+// joiner does not handle events itself; it uses specialized side handlers
+// to process updates from its two upstream sources.
+func (j *joiner[L, R]) OnAdd(obj any, isInitial bool)    {}
+func (j *joiner[L, R]) OnUpdate(old, new any)           {}
+func (j *joiner[L, R]) OnDelete(obj any)                {}
+func (j *joiner[L, R]) OnAddLocked(obj any, init bool)  {}
+func (j *joiner[L, R]) OnUpdateLocked(old, new any)     {}
+func (j *joiner[L, R]) OnDeleteLocked(obj any)          {}
 
-func (j *joiner[L, R]) OnAddLocked(obj any, isInitial bool) {
-}
+// sideHandlers for left and right sources.
 
-func (j *joiner[L, R]) OnUpdate(oldObj, newObj any) {
-	j.handler.GetLockGroup().Lock()
-	defer j.handler.GetLockGroup().Unlock()
-	j.OnUpdateLocked(oldObj, newObj)
-}
+type leftHandler[L, R any] struct{ j *joiner[L, R] }
 
-func (j *joiner[L, R]) OnUpdateLocked(oldObj, newObj any) {
-}
-
-func (j *joiner[L, R]) OnDelete(obj any) {
-	j.handler.GetLockGroup().Lock()
-	defer j.handler.GetLockGroup().Unlock()
-	j.OnDeleteLocked(obj)
-}
-
-func (j *joiner[L, R]) OnDeleteLocked(obj any) {
-}
-
-// leftHandler handles events from the 'From' (left) informer.
-type leftHandler[L, R any] struct {
-	j *joiner[L, R]
-}
-
-var _ LockedResourceEventHandler = &leftHandler[int, int]{}
-
-func (h leftHandler[L, R]) OnAdd(obj any, isInitial bool) {
+func (h leftHandler[L, R]) OnAdd(obj any, init bool) {
 	h.j.handler.GetLockGroup().Lock()
 	defer h.j.handler.GetLockGroup().Unlock()
-	h.OnAddLocked(obj, isInitial)
+	h.OnAddLocked(obj, init)
 }
+func (h leftHandler[L, R]) OnAddLocked(obj any, init bool) { h.j.onLeftAdd(obj.(L), init) }
+func (h leftHandler[L, R]) OnUpdate(old, new any) {
+	h.j.handler.GetLockGroup().Lock()
+	defer h.j.handler.GetLockGroup().Unlock()
+	h.OnUpdateLocked(old, new)
+}
+func (h leftHandler[L, R]) OnUpdateLocked(old, new any) { h.j.onLeftUpdate(old.(L), new.(L)) }
+func (h leftHandler[L, R]) OnDelete(obj any) {
+	h.j.handler.GetLockGroup().Lock()
+	defer h.j.handler.GetLockGroup().Unlock()
+	h.OnDeleteLocked(obj)
+}
+func (h leftHandler[L, R]) OnDeleteLocked(obj any) { h.j.onLeftDelete(obj.(L)) }
 
-func (h leftHandler[L, R]) OnAddLocked(obj any, isInitial bool) {
-	left := obj.(L)
-	key := h.j.on(left, *new(R))
+type rightHandler[L, R any] struct{ j *joiner[L, R] }
+
+func (h rightHandler[L, R]) OnAdd(obj any, init bool) {
+	h.j.handler.GetLockGroup().Lock()
+	defer h.j.handler.GetLockGroup().Unlock()
+	h.OnAddLocked(obj, init)
+}
+func (h rightHandler[L, R]) OnAddLocked(obj any, init bool) { h.j.onRightAdd(obj.(R), init) }
+func (h rightHandler[L, R]) OnUpdate(old, new any) {
+	h.j.handler.GetLockGroup().Lock()
+	defer h.j.handler.GetLockGroup().Unlock()
+	h.OnUpdateLocked(old, new)
+}
+func (h rightHandler[L, R]) OnUpdateLocked(old, new any) { h.j.onRightUpdate(old.(R), new.(R)) }
+func (h rightHandler[L, R]) OnDelete(obj any) {
+	h.j.handler.GetLockGroup().Lock()
+	defer h.j.handler.GetLockGroup().Unlock()
+	h.OnDeleteLocked(obj)
+}
+func (h rightHandler[L, R]) OnDeleteLocked(obj any) { h.j.onRightDelete(obj.(R)) }
+
+// Core join logic.
+
+func (j *joiner[L, R]) onLeftAdd(left L, isInitial bool) {
+	key := j.on(left, *new(R))
 	keyStr, _ := DefaultKeyFunc(key)
 
-	// COW: Clone existing slice
-	items, _ := h.j.left.Get(keyStr)
+	// COW: Shallow-clone the existing slice before updating to protect snapshots.
+	items, _ := j.left.Get(keyStr)
 	newItems := append(append([]L(nil), items...), left)
-	h.j.left.Set(keyStr, newItems)
+	j.left.Set(keyStr, newItems)
 
-	if rights, ok := h.j.right.Get(keyStr); ok {
+	// Emit join results for all matching objects on the right side.
+	if rights, ok := j.right.Get(keyStr); ok {
 		for _, right := range rights {
-			h.j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: right}, isInitial)
+			j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: right}, isInitial)
 		}
 	}
 }
 
-func (h leftHandler[L, R]) OnUpdate(oldObj, newObj any) {
-	h.j.handler.GetLockGroup().Lock()
-	defer h.j.handler.GetLockGroup().Unlock()
-	h.OnUpdateLocked(oldObj, newObj)
-}
-
-func (h leftHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
-	oldLeft := objToL[L](oldObj)
-	newLeft := objToL[L](newObj)
-	oldKey := h.j.on(oldLeft, *new(R))
-	newKey := h.j.on(newLeft, *new(R))
+func (j *joiner[L, R]) onLeftUpdate(oldLeft, newLeft L) {
+	oldKey := j.on(oldLeft, *new(R))
+	newKey := j.on(newLeft, *new(R))
 
 	if oldKey == newKey {
 		keyStr, _ := DefaultKeyFunc(oldKey)
-		if rights, ok := h.j.right.Get(keyStr); ok {
+		if rights, ok := j.right.Get(keyStr); ok {
 			for _, right := range rights {
-				h.j.handler.OnUpdateLocked(JoinValue[L, R]{Left: oldLeft, Right: right}, JoinValue[L, R]{Left: newLeft, Right: right})
+				j.handler.OnUpdateLocked(JoinValue[L, R]{Left: oldLeft, Right: right}, JoinValue[L, R]{Left: newLeft, Right: right})
 			}
 		}
-		// COW: Update the stored object in the left map.
-		slice, _ := h.j.left.Get(keyStr)
+		// COW: Update the stored object in the left map by cloning the slice.
+		slice, _ := j.left.Get(keyStr)
 		newSlice := append([]L(nil), slice...)
 		for i, v := range newSlice {
 			if any(v) == any(oldLeft) {
@@ -141,74 +152,25 @@ func (h leftHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
 				break
 			}
 		}
-		h.j.left.Set(keyStr, newSlice)
+		j.left.Set(keyStr, newSlice)
 	} else {
-		oldKeyStr, _ := DefaultKeyFunc(oldKey)
-		if rights, ok := h.j.right.Get(oldKeyStr); ok {
-			for _, right := range rights {
-				h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: oldLeft, Right: right})
-			}
-		}
-		// COW: Remove from old slice
-		slice, _ := h.j.left.Get(oldKeyStr)
-		newSlice := make([]L, 0, len(slice))
-		for _, v := range slice {
-			if any(v) != any(oldLeft) {
-				newSlice = append(newSlice, v)
-			}
-		}
-		if len(newSlice) == 0 {
-			h.j.left.Delete(oldKeyStr)
-		} else {
-			h.j.left.Set(oldKeyStr, newSlice)
-		}
-
-		newKeyStr, _ := DefaultKeyFunc(newKey)
-		// COW: Add to new slice
-		slice, _ = h.j.left.Get(newKeyStr)
-		newSlice = append(append([]L(nil), slice...), newLeft)
-		h.j.left.Set(newKeyStr, newSlice)
-
-		if rights, ok := h.j.right.Get(newKeyStr); ok {
-			for _, right := range rights {
-				h.j.handler.OnAddLocked(JoinValue[L, R]{Left: newLeft, Right: right}, false)
-			}
-		}
+		// Key changed: perform atomic Delete + Add transition.
+		j.onLeftDelete(oldLeft)
+		j.onLeftAdd(newLeft, false)
 	}
 }
 
-func objToL[L any](obj any) L {
-	if l, ok := obj.(L); ok {
-		return l
-	}
-	return *new(L)
-}
-
-func objToR[R any](obj any) R {
-	if r, ok := obj.(R); ok {
-		return r
-	}
-	return *new(R)
-}
-
-func (h leftHandler[L, R]) OnDelete(obj any) {
-	h.j.handler.GetLockGroup().Lock()
-	defer h.j.handler.GetLockGroup().Unlock()
-	h.OnDeleteLocked(obj)
-}
-
-func (h leftHandler[L, R]) OnDeleteLocked(obj any) {
-	left := objToL[L](obj)
-	key := h.j.on(left, *new(R))
+func (j *joiner[L, R]) onLeftDelete(left L) {
+	key := j.on(left, *new(R))
 	keyStr, _ := DefaultKeyFunc(key)
 
-	if rights, ok := h.j.right.Get(keyStr); ok {
+	if rights, ok := j.right.Get(keyStr); ok {
 		for _, right := range rights {
-			h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: right})
+			j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: right})
 		}
 	}
-	// COW: Remove from slice
-	slice, _ := h.j.left.Get(keyStr)
+	// COW: Filter out the deleted object into a new slice.
+	slice, _ := j.left.Get(keyStr)
 	newSlice := make([]L, 0, len(slice))
 	for _, v := range slice {
 		if any(v) != any(left) {
@@ -216,63 +178,41 @@ func (h leftHandler[L, R]) OnDeleteLocked(obj any) {
 		}
 	}
 	if len(newSlice) == 0 {
-		h.j.left.Delete(keyStr)
+		j.left.Delete(keyStr)
 	} else {
-		h.j.left.Set(keyStr, newSlice)
+		j.left.Set(keyStr, newSlice)
 	}
 }
 
-// rightHandler handles events from the 'Join' (right) informer.
-type rightHandler[L, R any] struct {
-	j *joiner[L, R]
-}
-
-var _ LockedResourceEventHandler = &rightHandler[int, int]{}
-
-func (h rightHandler[L, R]) OnAdd(obj any, isInitial bool) {
-	h.j.handler.GetLockGroup().Lock()
-	defer h.j.handler.GetLockGroup().Unlock()
-	h.OnAddLocked(obj, isInitial)
-}
-
-func (h rightHandler[L, R]) OnAddLocked(obj any, isInitial bool) {
-	right := objToR[R](obj)
-	key := h.j.on(*new(L), right)
+func (j *joiner[L, R]) onRightAdd(right R, isInitial bool) {
+	key := j.on(*new(L), right)
 	keyStr, _ := DefaultKeyFunc(key)
 
-	// COW: Clone existing slice
-	items, _ := h.j.right.Get(keyStr)
+	// COW: Shallow-clone the existing slice.
+	items, _ := j.right.Get(keyStr)
 	newItems := append(append([]R(nil), items...), right)
-	h.j.right.Set(keyStr, newItems)
+	j.right.Set(keyStr, newItems)
 
-	if lefts, ok := h.j.left.Get(keyStr); ok {
+	if lefts, ok := j.left.Get(keyStr); ok {
 		for _, left := range lefts {
-			h.j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: right}, isInitial)
+			j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: right}, isInitial)
 		}
 	}
 }
 
-func (h rightHandler[L, R]) OnUpdate(oldObj, newObj any) {
-	h.j.handler.GetLockGroup().Lock()
-	defer h.j.handler.GetLockGroup().Unlock()
-	h.OnUpdateLocked(oldObj, newObj)
-}
-
-func (h rightHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
-	oldRight := objToR[R](oldObj)
-	newRight := objToR[R](newObj)
-	oldKey := h.j.on(*new(L), oldRight)
-	newKey := h.j.on(*new(L), newRight)
+func (j *joiner[L, R]) onRightUpdate(oldRight, newRight R) {
+	oldKey := j.on(*new(L), oldRight)
+	newKey := j.on(*new(L), newRight)
 
 	if oldKey == newKey {
 		keyStr, _ := DefaultKeyFunc(oldKey)
-		if lefts, ok := h.j.left.Get(keyStr); ok {
+		if lefts, ok := j.left.Get(keyStr); ok {
 			for _, left := range lefts {
-				h.j.handler.OnUpdateLocked(JoinValue[L, R]{Left: left, Right: oldRight}, JoinValue[L, R]{Left: left, Right: newRight})
+				j.handler.OnUpdateLocked(JoinValue[L, R]{Left: left, Right: oldRight}, JoinValue[L, R]{Left: left, Right: newRight})
 			}
 		}
-		// COW: Update the stored object in the right map.
-		slice, _ := h.j.right.Get(keyStr)
+		// COW: Update the stored object.
+		slice, _ := j.right.Get(keyStr)
 		newSlice := append([]R(nil), slice...)
 		for i, v := range newSlice {
 			if any(v) == any(oldRight) {
@@ -280,60 +220,24 @@ func (h rightHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
 				break
 			}
 		}
-		h.j.right.Set(keyStr, newSlice)
+		j.right.Set(keyStr, newSlice)
 	} else {
-		oldKeyStr, _ := DefaultKeyFunc(oldKey)
-		if lefts, ok := h.j.left.Get(oldKeyStr); ok {
-			for _, left := range lefts {
-				h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: oldRight})
-			}
-		}
-		// COW: Remove from old slice
-		slice, _ := h.j.right.Get(oldKeyStr)
-		newSlice := make([]R, 0, len(slice))
-		for _, v := range slice {
-			if any(v) != any(oldRight) {
-				newSlice = append(newSlice, v)
-			}
-		}
-		if len(newSlice) == 0 {
-			h.j.right.Delete(oldKeyStr)
-		} else {
-			h.j.right.Set(oldKeyStr, newSlice)
-		}
-
-		newKeyStr, _ := DefaultKeyFunc(newKey)
-		// COW: Add to new slice
-		slice, _ = h.j.right.Get(newKeyStr)
-		newSlice = append(append([]R(nil), slice...), newRight)
-		h.j.right.Set(newKeyStr, newSlice)
-
-		if lefts, ok := h.j.left.Get(newKeyStr); ok {
-			for _, left := range lefts {
-				h.j.handler.OnAddLocked(JoinValue[L, R]{Left: left, Right: newRight}, false)
-			}
-		}
+		j.onRightDelete(oldRight)
+		j.onRightAdd(newRight, false)
 	}
 }
 
-func (h rightHandler[L, R]) OnDelete(obj any) {
-	h.j.handler.GetLockGroup().Lock()
-	defer h.j.handler.GetLockGroup().Unlock()
-	h.OnDeleteLocked(obj)
-}
-
-func (h rightHandler[L, R]) OnDeleteLocked(obj any) {
-	right := objToR[R](obj)
-	key := h.j.on(*new(L), right)
+func (j *joiner[L, R]) onRightDelete(right R) {
+	key := j.on(*new(L), right)
 	keyStr, _ := DefaultKeyFunc(key)
 
-	if lefts, ok := h.j.left.Get(keyStr); ok {
+	if lefts, ok := j.left.Get(keyStr); ok {
 		for _, left := range lefts {
-			h.j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: right})
+			j.handler.OnDeleteLocked(JoinValue[L, R]{Left: left, Right: right})
 		}
 	}
-	// COW: Remove from slice
-	slice, _ := h.j.right.Get(keyStr)
+	// COW: Filter into new slice.
+	slice, _ := j.right.Get(keyStr)
 	newSlice := make([]R, 0, len(slice))
 	for _, v := range slice {
 		if any(v) != any(right) {
@@ -341,9 +245,9 @@ func (h rightHandler[L, R]) OnDeleteLocked(obj any) {
 		}
 	}
 	if len(newSlice) == 0 {
-		h.j.right.Delete(keyStr)
+		j.right.Delete(keyStr)
 	} else {
-		h.j.right.Set(keyStr, newSlice)
+		j.right.Set(keyStr, newSlice)
 	}
 }
 
@@ -375,14 +279,15 @@ func (j *joiner[L, R]) HasSyncedChecker() cache.DoneChecker {
 	return j.handler.HasSyncedChecker()
 }
 
-// Clone creates a new instance.
-// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
+// Clone creates a new instance of the joiner.
+// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
 func (j *joiner[L, R]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
 	nl := newSources[0]
 	nr := newSources[1]
 	
 	newLock := nl.(CloneableSharedInformerQuery).GetLockGroup()
 	
+	// Structural COW clone of the result storage.
 	newHandler := j.handler.Clone(nil).(ManualSharedInformer)
 	newHandler.(*manualInformer).lock = newLock
 
@@ -391,10 +296,12 @@ func (j *joiner[L, R]) Clone(newSources []cache.SharedInformer) CloneableSharedI
 		on:          j.on,
 		leftSource:  nl,
 		rightSource: nr,
-		left:        j.left.Clone(),  // Fast O(1) B-Tree clone
-		right:       j.right.Clone(), // Fast O(1) B-Tree clone
+		left:        j.left.Clone(),  // O(1) B-Tree clone.
+		right:       j.right.Clone(), // O(1) B-Tree clone.
 	}
 
+	// Optimize: Use NoReplay during cloning to maintain the "born hydrated" state
+	// inherited from the COW structural copies. This avoids redundant O(N) hydration.
 	if ms, ok := nl.(ManualSharedInformer); ok {
 		nj.leftRegistration, _ = ms.AddEventHandlerNoReplay(leftHandler[L, R]{nj})
 	} else {

@@ -8,6 +8,7 @@ import (
 )
 
 // DefaultKeyFunc is a robust key function that handles both K8s objects and primitive types.
+// It ensures that even non-meta objects can be indexed without returning errors.
 func DefaultKeyFunc(obj any) (string, error) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err == nil && key != "" {
@@ -17,7 +18,9 @@ func DefaultKeyFunc(obj any) (string, error) {
 	return fmt.Sprintf("%v", obj), nil
 }
 
-// LockGroup manages a shared RWMutex for a connected set of query informers.
+// LockGroup manages a shared RWMutex for a connected set of query informers (a Domain).
+// In Fort, an entire query DAG (from sources to final aggregates) should share a single
+// LockGroup to ensure transactional consistency across the domain.
 type LockGroup interface {
 	RLock()
 	RUnlock()
@@ -29,20 +32,23 @@ type lockGroup struct {
 	sync.RWMutex
 }
 
+// NewLockGroup creates a new shared mutex domain.
 func NewLockGroup() LockGroup {
 	return &lockGroup{}
 }
 
 // CloneableSharedInformerQuery is a shared informer defined by a query that can be cloned.
+// Clones are "born hydrated" via Copy-on-Write (COW) data structures, enabling O(1) snapshots.
 type CloneableSharedInformerQuery interface {
 	cache.SharedInformer
 	// Clone creates a new instance of the query using the provided new sources.
+	// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
 	Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery
-	// GetLockGroup returns the shared lock used by this informer.
+	// GetLockGroup returns the shared lock used by this informer domain.
 	GetLockGroup() LockGroup
 	// SetName sets the name for debug logging.
 	SetName(name string)
-	// GetSources returns the upstream informers.
+	// GetSources returns the upstream informers providing data to this query.
 	GetSources() []cache.SharedInformer
 }
 
@@ -51,7 +57,7 @@ func QueryInformer(query QuerySpec) CloneableSharedInformerQuery {
 	return query.Build()
 }
 
-// QuerySpec defines the interface for building a query informer.
+// QuerySpec defines the interface for building a query informer from a declarative specification.
 type QuerySpec interface {
 	Build() CloneableSharedInformerQuery
 }
@@ -79,6 +85,7 @@ type Join[Out, Left, Right any] struct {
 	Select JoinSelectFunc[Out, Left, Right]
 	From   cache.SharedInformer
 	Join   cache.SharedInformer
+	// On defines the join key. If nil, a full Cartesian join is performed.
 	On     JoinOnFunc[Left, Right]
 	Where  JoinFilterFunc[Left, Right]
 }
@@ -125,6 +132,8 @@ type groupField struct {
 	anyValue any
 }
 
+// Aggregate builders.
+
 func GroupKey(key any) GroupField {
 	return &groupField{key: key}
 }
@@ -155,6 +164,7 @@ type FlatMap[Out, In any] struct {
 type FlatMapFunc[Out, In any] func(obj In) ([]Out, error)
 
 // LockedResourceEventHandler allows processing events without re-acquiring the LockGroup.
+// Internal query stages use this to propagate events across the shared-lock domain.
 type LockedResourceEventHandler interface {
 	OnAddLocked(obj any, isInInitialList bool)
 	OnUpdateLocked(oldObj, newObj any)
@@ -162,6 +172,7 @@ type LockedResourceEventHandler interface {
 }
 
 // ManualSharedInformer allows manual triggering of events.
+// It is primarily used for testing and for providing hydrated snapshot sources.
 type ManualSharedInformer interface {
 	CloneableSharedInformerQuery
 	cache.ResourceEventHandler
@@ -173,6 +184,7 @@ type ManualSharedInformer interface {
 	TriggerWatchError(err error)
 
 	// AddEventHandlerNoReplay registers a handler without replaying current state.
+	// Used during pipeline cloning to prevent redundant O(N) hydration.
 	AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error)
 }
 
@@ -188,35 +200,38 @@ func NewManualSharedInformerWithOptions(lock LockGroup, keyFunc cache.KeyFunc) M
 		keyFunc:  keyFunc,
 		indexer:  NewBTreeIndexer(keyFunc),
 		lock:     lock,
+		synced:   make(chan struct{}),
 	}
 }
 
-// LockInformerSet acquires a Read Lock on the domain, enabling a consistent snapshot.
-func LockInformerSet(informers []CloneableSharedInformerQuery) InformerLockSet {
+// LockDomain acquires a Read Lock on the domain (LockGroup), enabling a consistent snapshot.
+func LockDomain(informers ...CloneableSharedInformerQuery) DomainLock {
 	if len(informers) == 0 {
-		return &informerLockSet{}
+		return &domainLock{}
 	}
 	lock := informers[0].GetLockGroup()
 	lock.RLock()
-	return &informerLockSet{lock: lock}
+	return &domainLock{lock: lock}
 }
 
-type InformerLockSet interface {
+// DomainLock provides a handle to release a domain-level read lock.
+type DomainLock interface {
 	Unlock()
 }
 
-type informerLockSet struct {
+type domainLock struct {
 	lock LockGroup
 }
 
-func (ls *informerLockSet) Unlock() {
+func (ls *domainLock) Unlock() {
 	if ls.lock != nil {
 		ls.lock.RUnlock()
 	}
 }
 
 // ClonePipeline recursively clones a query DAG starting from root, replacing leaf sources.
-// The memo map should initially contain leaf replacements and will be populated with cloned intermediates.
+// The memo map should initially contain leaf replacements (Source -> ClonedSource)
+// and will be populated with cloned intermediate stages to handle shared query branches (Diamond DAGs).
 func ClonePipeline(root cache.SharedInformer, memo map[cache.SharedInformer]cache.SharedInformer) cache.SharedInformer {
 	if repl, ok := memo[root]; ok {
 		return repl

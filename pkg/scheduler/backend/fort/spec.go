@@ -14,21 +14,16 @@ func getLock(lock LockGroup, source cache.SharedInformer) LockGroup {
 
 func (q *Select[Out, In]) Build() CloneableSharedInformerQuery {
 	lock := getLock(q.Lock, q.From)
-	m := &FlatMap[Out, In]{
-		Lock: lock,
-		Map: func(value In) ([]Out, error) {
-			if q.Where == nil || q.Where(value) {
-				out, err := q.Select(value)
-				if err != nil {
-					return nil, err
-				}
-				return []Out{out}, nil
+	inf := newFlatMapper[Out, In](lock, func(value In) ([]Out, error) {
+		if q.Where == nil || q.Where(value) {
+			out, err := q.Select(value)
+			if err != nil {
+				return nil, err
 			}
-			return nil, nil
-		},
-		Over: q.From,
-	}
-	inf := m.Build()
+			return []Out{out}, nil
+		}
+		return nil, nil
+	}, q.From)
 	inf.SetName("select-query")
 	return inf
 }

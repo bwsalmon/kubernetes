@@ -1,6 +1,7 @@
 package fort
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -151,5 +152,116 @@ func TestPodSpreadLiteInfo_MultiDomainNode(t *testing.T) {
 	}
 	if !reflect.DeepEqual(latest.DomainCounts, expected) {
 		t.Errorf("Unexpected domain counts: %v", latest.DomainCounts)
+	}
+}
+
+func TestPodSpreadLiteInfo_LargeDataset(t *testing.T) {
+	lock := NewLockGroup()
+	podSource := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
+	serviceSource := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
+	nodeSource := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
+
+	ps := NewPodSpreadLiteInfo(podSource, serviceSource, nodeSource)
+
+	var latestResults map[string]*TServiceInfo = make(map[string]*TServiceInfo)
+	ps.ServiceInfo.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { si := obj.(*TServiceInfo); latestResults[si.Service] = si },
+		UpdateFunc: func(old, new any) { si := new.(*TServiceInfo); latestResults[si.Service] = si },
+	})
+
+	numZones := 5
+	numNodesPerZone := 10
+	numServices := 10
+	podsPerNodePerService := 2 // Each node will have 2 pods for each matching service
+
+	// 1. Setup Nodes (50 total)
+	for z := 0; z < numZones; z++ {
+		zoneName := fmt.Sprintf("zone-%d", z)
+		for n := 0; n < numNodesPerZone; n++ {
+			nodeName := fmt.Sprintf("node-%d-%d", z, n)
+			nodeSource.OnAdd(&TNode{Name: nodeName, Domains: []string{zoneName}}, true)
+		}
+	}
+
+	// 2. Setup Services (10 total)
+	// Service 's-i' matches pods with labels starting with char(ord('A') + i)
+	for i := 0; i < numServices; i++ {
+		serviceName := fmt.Sprintf("s-%d", i)
+		matchChar := string(rune('A' + i))
+		serviceSource.OnAdd(&TService{Name: serviceName, SomeData: matchChar}, true)
+	}
+
+	// 3. Setup Pods (50 nodes * 10 services * 2 pods = 1000 pods)
+	for z := 0; z < numZones; z++ {
+		for n := 0; n < numNodesPerZone; n++ {
+			nodeName := fmt.Sprintf("node-%d-%d", z, n)
+			for i := 0; i < numServices; i++ {
+				matchChar := string(rune('A' + i))
+				for p := 0; p < podsPerNodePerService; p++ {
+					podLabel := fmt.Sprintf("%s-pod-%d", matchChar, p)
+					podSource.OnAdd(&TPod{NodeName: nodeName, Label: podLabel}, true)
+				}
+			}
+		}
+	}
+
+	// 4. Validate Results
+	// Total expected pods for EACH service: 50 nodes * 2 pods = 100
+	// Per zone: 10 nodes * 2 pods = 20
+	if len(latestResults) != numServices {
+		t.Errorf("Expected %d services, got %d", numServices, len(latestResults))
+	}
+
+	for i := 0; i < numServices; i++ {
+		serviceName := fmt.Sprintf("s-%d", i)
+		si, ok := latestResults[serviceName]
+		if !ok {
+			t.Fatalf("Service %s missing", serviceName)
+		}
+		if len(si.DomainCounts) != numZones {
+			t.Errorf("Service %s: expected %d zones, got %d", serviceName, numZones, len(si.DomainCounts))
+		}
+		total := int64(0)
+		for _, dc := range si.DomainCounts {
+			if dc.Count != 20 {
+				t.Errorf("Service %s, Zone %s: expected 20 pods, got %d", serviceName, dc.Domain, dc.Count)
+			}
+			total += dc.Count
+		}
+		if total != 100 {
+			t.Errorf("Service %s: expected total 100 pods, got %d", serviceName, total)
+		}
+	}
+
+	// 5. Verify Clone Isolation under Large Dataset
+	psClone := ps.Clone()
+	var cloneResults map[string]*TServiceInfo = make(map[string]*TServiceInfo)
+	psClone.ServiceInfo.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj any) { si := obj.(*TServiceInfo); cloneResults[si.Service] = si },
+		UpdateFunc: func(old, new any) { si := new.(*TServiceInfo); cloneResults[si.Service] = si },
+	})
+
+	// Add more pods to ORIGINAL only
+	podSource.OnAdd(&TPod{NodeName: "node-0-0", Label: "A-extra"}, false)
+	
+	// Original service 's-0' in 'zone-0' should have 21 pods
+	if latestResults["s-0"].DomainCounts[0].Count != 21 {
+		// Note: DomainCounts order might not be fixed, find zone-0
+		count := int64(0)
+		for _, dc := range latestResults["s-0"].DomainCounts {
+			if dc.Domain == "zone-0" { count = dc.Count; break }
+		}
+		if count != 21 {
+			t.Errorf("Original zone-0 expected 21 pods, got %d", count)
+		}
+	}
+
+	// Clone service 's-0' in 'zone-0' should still have 20 pods
+	count := int64(0)
+	for _, dc := range cloneResults["s-0"].DomainCounts {
+		if dc.Domain == "zone-0" { count = dc.Count; break }
+	}
+	if count != 20 {
+		t.Errorf("Clone zone-0 expected 20 pods (isolated), got %d", count)
 	}
 }

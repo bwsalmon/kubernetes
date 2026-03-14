@@ -9,6 +9,8 @@ import (
 )
 
 // manualInformer implements ManualSharedInformer using a shared LockGroup.
+// It is designed for testing and high-performance simulations where clones
+// can inherit populated state from a parent via B-Tree structural cloning.
 type manualInformer struct {
 	name string
 
@@ -17,7 +19,7 @@ type manualInformer struct {
 	handlers      map[int]cache.ResourceEventHandler
 	nextHandlerId int
 
-	doneCheckers []*manualInformerDoneChecker
+	synced chan struct{}
 
 	hasSynced bool
 	isStopped bool
@@ -40,11 +42,6 @@ type manualInformerRegistration struct {
 	id       int
 }
 
-type manualInformerDoneChecker struct {
-	informer *manualInformer
-	synced   chan struct{}
-}
-
 var _ cache.ResourceEventHandlerRegistration = &manualInformerRegistration{}
 
 func (r *manualInformerRegistration) HasSynced() bool {
@@ -55,13 +52,12 @@ func (r *manualInformerRegistration) HasSyncedChecker() cache.DoneChecker {
 	return r.informer.HasSyncedChecker()
 }
 
-func (c *manualInformerDoneChecker) Name() string {
-	return ""
+type manualDoneChecker struct {
+	synced <-chan struct{}
 }
 
-func (c *manualInformerDoneChecker) Done() <-chan struct{} {
-	return c.synced
-}
+func (c *manualDoneChecker) Name() string { return "" }
+func (c *manualDoneChecker) Done() <-chan struct{} { return c.synced }
 
 func (p *manualInformer) GetLockGroup() LockGroup {
 	return p.lock
@@ -83,6 +79,7 @@ func (p *manualInformer) AddEventHandlerNoReplay(handler cache.ResourceEventHand
 	return p.addEventHandler(handler, false)
 }
 
+// addEventHandler registers a handler, optionally replaying the entire current state.
 func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, replay bool) (cache.ResourceEventHandlerRegistration, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -95,19 +92,27 @@ func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, rep
 	p.handlers[p.nextHandlerId] = handler
 
 	if replay {
-		// Atomic replay of current state
+		// Atomic replay of current state to ensure the new handler is fully hydrated.
 		list := p.indexer.List()
 		for _, obj := range list {
-			// If handler supports Locked events, use them to avoid deadlock.
-			if m, ok := handler.(LockedResourceEventHandler); ok {
-				m.OnAddLocked(obj, true)
-			} else {
-				handler.OnAdd(obj, true)
-			}
+			// Use dispatchEvent to handle Locked handlers correctly.
+			p.dispatchEvent(handler, 
+				func(h cache.ResourceEventHandler) { h.OnAdd(obj, true) }, 
+				func(l LockedResourceEventHandler) { l.OnAddLocked(obj, true) })
 		}
 	}
 
 	return r, nil
+}
+
+// dispatchEvent selects the appropriate handler method based on whether the handler
+// supports the Locked interface (to avoid re-entrant deadlocks on the shared LockGroup).
+func (p *manualInformer) dispatchEvent(h cache.ResourceEventHandler, std func(cache.ResourceEventHandler), locked func(LockedResourceEventHandler)) {
+	if m, ok := h.(LockedResourceEventHandler); ok {
+		locked(m)
+	} else {
+		std(h)
+	}
 }
 
 func (p *manualInformer) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
@@ -199,10 +204,7 @@ func (p *manualInformer) SetHasSynced() {
 	}
 
 	p.hasSynced = true
-	for _, d := range p.doneCheckers {
-		close(d.synced)
-	}
-	p.doneCheckers = nil
+	close(p.synced)
 }
 
 func (p *manualInformer) SetIsStopped() {
@@ -216,21 +218,7 @@ func (p *manualInformer) GetKeyFunc() cache.KeyFunc {
 }
 
 func (i *manualInformer) HasSyncedChecker() cache.DoneChecker {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-
-	ch := make(chan struct{})
-	if i.hasSynced {
-		close(ch)
-	}
-	checker := &manualInformerDoneChecker{
-		informer: i,
-		synced:   ch,
-	}
-	if !i.hasSynced {
-		i.doneCheckers = append(i.doneCheckers, checker)
-	}
-	return checker
+	return &manualDoneChecker{synced: i.synced}
 }
 
 func (p *manualInformer) OnAdd(obj any, isInInitialList bool) {
@@ -248,13 +236,9 @@ func (p *manualInformer) OnAddLocked(obj any, isInInitialList bool) {
 	p.indexer.Add(transformed)
 
 	for _, h := range p.handlers {
-		if h != nil {
-			if m, ok := h.(LockedResourceEventHandler); ok {
-				m.OnAddLocked(transformed, isInInitialList)
-			} else {
-				h.OnAdd(transformed, isInInitialList)
-			}
-		}
+		p.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnAdd(transformed, isInInitialList) }, 
+			func(l LockedResourceEventHandler) { l.OnAddLocked(transformed, isInInitialList) })
 	}
 }
 
@@ -275,13 +259,9 @@ func (p *manualInformer) OnUpdateLocked(oldObj, newObj any) {
 	p.indexer.Update(newTransformed)
 
 	for _, h := range p.handlers {
-		if h != nil {
-			if m, ok := h.(LockedResourceEventHandler); ok {
-				m.OnUpdateLocked(oldTransformed, newTransformed)
-			} else {
-				h.OnUpdate(oldTransformed, newTransformed)
-			}
-		}
+		p.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnUpdate(oldTransformed, newTransformed) }, 
+			func(l LockedResourceEventHandler) { l.OnUpdateLocked(oldTransformed, newTransformed) })
 	}
 }
 
@@ -300,13 +280,9 @@ func (p *manualInformer) OnDeleteLocked(oldObj any) {
 	p.indexer.Delete(transformed)
 
 	for _, h := range p.handlers {
-		if h != nil {
-			if m, ok := h.(LockedResourceEventHandler); ok {
-				m.OnDeleteLocked(transformed)
-			} else {
-				h.OnDelete(transformed)
-			}
-		}
+		p.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnDelete(transformed) }, 
+			func(l LockedResourceEventHandler) { l.OnDeleteLocked(transformed) })
 	}
 }
 
@@ -323,6 +299,10 @@ func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformer
 		keyFunc:                 p.keyFunc,
 		indexer:                 p.indexer.Clone(), // Fast O(1) B-Tree clone
 		lock:                    NewLockGroup(),
+		synced:                  make(chan struct{}),
+	}
+	if p.hasSynced {
+		close(newInformer.synced)
 	}
 
 	return newInformer

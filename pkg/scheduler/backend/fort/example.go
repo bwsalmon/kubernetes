@@ -175,7 +175,7 @@ func NewPodSpreadLiteInfo(podInformer, serviceInformer, nodeInformer ManualShare
 func (d *PodSpreadLiteInfo) Clone() *PodSpreadLiteInfo {
 	nd := &PodSpreadLiteInfo{}
 
-	locks := LockInformerSet([]CloneableSharedInformerQuery{d.ServiceNodes, d.NodeDomains, d.ServiceDomains, d.ServiceInfo})
+	locks := LockDomain(d.ServiceNodes, d.NodeDomains, d.ServiceDomains, d.ServiceInfo)
 	defer locks.Unlock()
 
 	nd.PodUpdates = d.PodUpdates.Clone(nil).(ManualSharedInformer)

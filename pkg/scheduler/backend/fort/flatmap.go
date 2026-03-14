@@ -14,7 +14,6 @@ type flatMapper[Out, In any] struct {
 	handler      ManualSharedInformer
 	mapper       FlatMapFunc[Out, In]
 	registration cache.ResourceEventHandlerRegistration
-	doneChecker  cache.DoneChecker
 	source       cache.SharedInformer
 }
 
@@ -140,8 +139,8 @@ func (m *flatMapper[Out, In]) HasSyncedChecker() cache.DoneChecker {
 	return m.handler.HasSyncedChecker()
 }
 
-// Clone creates a new instance.
-// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
+// Clone creates a new instance of the flatMapper.
+// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
 func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
 	newSource := newSources[0]
 	var newLock LockGroup
@@ -151,10 +150,12 @@ func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) Cloneable
 		newLock = NewLockGroup()
 	}
 
+	// Structural clone of the result handler (O(1) B-Tree copy).
 	newHandler := m.handler.Clone(nil).(ManualSharedInformer)
 	newHandler.(*manualInformer).lock = newLock
 
-	// Optimize: Use NoReplay during cloning
+	// Optimize: Use NoReplay during cloning to maintain the "born hydrated" state
+	// inherited from the COW structural copy. This avoids redundant O(N) hydration.
 	cloned := &flatMapper[Out, In]{
 		handler: newHandler,
 		mapper:  m.mapper,

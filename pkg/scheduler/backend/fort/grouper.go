@@ -36,6 +36,22 @@ type groupState[Out any] struct {
 	anyValues map[int]map[any]int
 }
 
+func (s *groupState[Out]) clone() *groupState[Out] {
+	ns := *s
+	ns.fields = append([]any(nil), s.fields...)
+	if s.anyValues != nil {
+		ns.anyValues = make(map[int]map[any]int, len(s.anyValues))
+		for k, v := range s.anyValues {
+			inner := make(map[any]int, len(v))
+			for ik, iv := range v {
+				inner[ik] = iv
+			}
+			ns.anyValues[k] = inner
+		}
+	}
+	return &ns
+}
+
 func newGrouper[Out, In any](lock LockGroup, sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In]) *grouper[Out, In] {
 	handler := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
 	handler.SetName("grouper-handler")
@@ -80,33 +96,18 @@ func (g *grouper[Out, In]) OnAddLocked(obj any, isInitial bool) {
 
 	state, ok := g.groups.Get(keyStr)
 	var oldOut Out
+	var newState *groupState[Out]
 	if ok {
 		oldOut = state.lastOut
-	}
-
-	// COW: Create a new state if modifying
-	var newState groupState[Out]
-	if ok {
-		newState = *state
-		newState.fields = append([]any(nil), state.fields...)
-		// Clone anyValues map of maps
-		newAnyValues := make(map[int]map[any]int, len(state.anyValues))
-		for k, v := range state.anyValues {
-			newInner := make(map[any]int, len(v))
-			for ik, iv := range v {
-				newInner[ik] = iv
-			}
-			newAnyValues[k] = newInner
-		}
-		newState.anyValues = newAnyValues
+		newState = state.clone()
 	} else {
-		newState.anyValues = make(map[int]map[any]int)
+		newState = &groupState[Out]{}
 	}
 
-	newFields := g.evaluateFields(fields, &newState, input, true)
+	newFields := g.evaluateFields(fields, newState, input, true)
 	newOut, _ := g.sel(newFields)
 	newState.lastOut = newOut
-	g.groups.Set(keyStr, &newState)
+	g.groups.Set(keyStr, newState)
 
 	if ok {
 		g.handler.OnUpdateLocked(oldOut, newOut)
@@ -153,25 +154,14 @@ func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
 		}
 
 		oldOut := state.lastOut
-		// COW: Create a new state
-		newState := *state
-		newState.fields = append([]any(nil), state.fields...)
-		newAnyValues := make(map[int]map[any]int, len(state.anyValues))
-		for k, v := range state.anyValues {
-			newInner := make(map[any]int, len(v))
-			for ik, iv := range v {
-				newInner[ik] = iv
-			}
-			newAnyValues[k] = newInner
-		}
-		newState.anyValues = newAnyValues
+		newState := state.clone()
 
-		g.evaluateFields(oldFields, &newState, oldInput, false)
-		resFields := g.evaluateFields(newFields, &newState, newInput, true)
+		g.evaluateFields(oldFields, newState, oldInput, false)
+		resFields := g.evaluateFields(newFields, newState, newInput, true)
 		
 		newOut, _ := g.sel(resFields)
 		newState.lastOut = newOut
-		g.groups.Set(keyStr, &newState)
+		g.groups.Set(keyStr, newState)
 		g.handler.OnUpdateLocked(oldOut, newOut)
 	} else {
 		g.OnDeleteLocked(oldObj)
@@ -200,20 +190,9 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 	}
 
 	oldOut := state.lastOut
-	// COW: Create a new state
-	newState := *state
-	newState.fields = append([]any(nil), state.fields...)
-	newAnyValues := make(map[int]map[any]int, len(state.anyValues))
-	for k, v := range state.anyValues {
-		newInner := make(map[any]int, len(v))
-		for ik, iv := range v {
-			newInner[ik] = iv
-		}
-		newAnyValues[k] = newInner
-	}
-	newState.anyValues = newAnyValues
+	newState := state.clone()
 
-	newFields := g.evaluateFields(fields, &newState, input, false)
+	newFields := g.evaluateFields(fields, newState, input, false)
 
 	if newState.count == 0 {
 		g.groups.Delete(keyStr)
@@ -221,7 +200,7 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 	} else {
 		newOut, _ := g.sel(newFields)
 		newState.lastOut = newOut
-		g.groups.Set(keyStr, &newState)
+		g.groups.Set(keyStr, newState)
 		g.handler.OnUpdateLocked(oldOut, newOut)
 	}
 }
@@ -281,6 +260,9 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			}
 			res[i] = distincts
 		} else if gf.anyValue != nil {
+			if state.anyValues == nil {
+				state.anyValues = make(map[int]map[any]int)
+			}
 			m := state.anyValues[i]
 			if m == nil {
 				m = make(map[any]int)
