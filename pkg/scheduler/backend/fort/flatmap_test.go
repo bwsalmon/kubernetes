@@ -10,8 +10,9 @@ func TestFlatMap_UpdateAndDelete(t *testing.T) {
 	keyFunc := func(obj any) (string, error) {
 		return obj.(string), nil
 	}
-	handler := NewManualSharedInformerWithKeyFunc(keyFunc)
-	source := NewManualSharedInformer()
+	lock := NewLockGroup()
+	handler := NewManualSharedInformerWithOptions(lock, keyFunc)
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type Item struct {
 		ID   int
@@ -19,6 +20,7 @@ func TestFlatMap_UpdateAndDelete(t *testing.T) {
 	}
 
 	m := &FlatMap[string, Item]{
+		Lock: lock,
 		Map: func(item Item) ([]string, error) {
 			return item.Vals, nil
 		},

@@ -7,14 +7,16 @@ import (
 )
 
 func TestJoiner_OnUpdate(t *testing.T) {
-	left := NewManualSharedInformer()
-	right := NewManualSharedInformer()
+	lock := NewLockGroup()
+	left := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	right := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type L struct{ ID int; Val string }
 	type R struct{ ID int; Val string }
 	type Joined struct{ LVal, RVal string }
 
 	joinedInformer := QueryInformer(&Join[Joined, L, R]{
+		Lock: lock,
 		Select: func(l L, r R) (Joined, error) {
 			return Joined{LVal: l.Val, RVal: r.Val}, nil
 		},
@@ -80,12 +82,14 @@ func TestJoiner_OnUpdate(t *testing.T) {
 }
 
 func TestJoiner_Where(t *testing.T) {
-	left := NewManualSharedInformer()
-	right := NewManualSharedInformer()
+	lock := NewLockGroup()
+	left := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	right := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type Item struct{ ID int; Val int }
 	
 	joinedInformer := QueryInformer(&Join[int, Item, Item]{
+		Lock:   lock,
 		Select: func(l, r Item) (int, error) { return l.ID + r.ID, nil },
 		From:   left,
 		Join:   right,

@@ -7,7 +7,8 @@ import (
 )
 
 func TestGrouper_UpdateAndDelete(t *testing.T) {
-	source := NewManualSharedInformer()
+	lock := NewLockGroup()
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type Data struct {
 		ID       int
@@ -20,6 +21,7 @@ func TestGrouper_UpdateAndDelete(t *testing.T) {
 	}
 
 	grouped := QueryInformer(&GroupBy[Aggregated, Data]{
+		Lock: lock,
 		Select: func(fields []GroupField) (Aggregated, error) {
 			return Aggregated{
 				Category: fields[0].(string),
@@ -90,13 +92,15 @@ func TestGrouper_UpdateAndDelete(t *testing.T) {
 }
 
 func TestGrouper_Where(t *testing.T) {
-	source := NewManualSharedInformer()
+	lock := NewLockGroup()
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type Data struct {
 		Val int
 	}
 
 	grouped := QueryInformer(&GroupBy[int, Data]{
+		Lock: lock,
 		Select: func(fields []GroupField) (int, error) {
 			return int(fields[0].(int64)), nil
 		},

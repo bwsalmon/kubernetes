@@ -8,9 +8,10 @@ import (
 )
 
 func TestStress_ComplexPipeline(t *testing.T) {
+	lock := NewLockGroup()
 	// Root sources
-	sourceA := NewManualSharedInformer() // Emits RawA
-	sourceB := NewManualSharedInformer() // Emits RawB
+	sourceA := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc) // Emits RawA
+	sourceB := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc) // Emits RawB
 
 	type RawA struct {
 		ID   int
@@ -42,6 +43,7 @@ func TestStress_ComplexPipeline(t *testing.T) {
 	// 1. FlatMap: RawA -> []ExpandedA
 	// Each RawA generates multiple ExpandedA objects.
 	flatMapA := QueryInformer(&FlatMap[ExpandedA, RawA]{
+		Lock: lock,
 		Map: func(a RawA) ([]ExpandedA, error) {
 			res := make([]ExpandedA, len(a.Vals))
 			for i, v := range a.Vals {
@@ -55,6 +57,7 @@ func TestStress_ComplexPipeline(t *testing.T) {
 	// 2. Join: ExpandedA + RawB -> Joined
 	// Joins on ID.
 	joinedInformer := QueryInformer(&Join[Joined, ExpandedA, RawB]{
+		Lock: lock,
 		Select: func(a ExpandedA, b RawB) (Joined, error) {
 			return Joined{
 				ID:    a.ID,
@@ -76,6 +79,7 @@ func TestStress_ComplexPipeline(t *testing.T) {
 	// 3. GroupBy: Joined -> Aggregated
 	// Groups by ID, calculates Sum of Total and Count of items.
 	finalAggregator := QueryInformer(&GroupBy[Aggregated, Joined]{
+		Lock: lock,
 		Select: func(fields []GroupField) (Aggregated, error) {
 			return Aggregated{
 				ID:    fields[0].(int),
@@ -94,26 +98,26 @@ func TestStress_ComplexPipeline(t *testing.T) {
 	})
 
 	// Track final results
-	var lock sync.Mutex
+	var resLock sync.Mutex
 	finalResults := make(map[int]Aggregated)
 	finalAggregator.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
 			agg := obj.(Aggregated)
-			lock.Lock()
+			resLock.Lock()
 			finalResults[agg.ID] = agg
-			lock.Unlock()
+			resLock.Unlock()
 		},
 		UpdateFunc: func(old, new any) {
 			agg := new.(Aggregated)
-			lock.Lock()
+			resLock.Lock()
 			finalResults[agg.ID] = agg
-			lock.Unlock()
+			resLock.Unlock()
 		},
 		DeleteFunc: func(obj any) {
 			agg := obj.(Aggregated)
-			lock.Lock()
+			resLock.Lock()
 			delete(finalResults, agg.ID)
-			lock.Unlock()
+			resLock.Unlock()
 		},
 	})
 
@@ -127,8 +131,6 @@ func TestStress_ComplexPipeline(t *testing.T) {
 	}
 
 	// Push RawA data
-	// Each ID i will have Sum = (1+2...+10) + (10 * 100) = 55 + 1000 = 1055
-	// Total across all IDs = 100 * 1055 = 105,500
 	for i := 1; i <= numIDs; i++ {
 		vals := make([]int, valsPerID)
 		for j := 0; j < valsPerID; j++ {
@@ -138,7 +140,7 @@ func TestStress_ComplexPipeline(t *testing.T) {
 	}
 
 	// Validate results
-	lock.Lock()
+	resLock.Lock()
 	if len(finalResults) != numIDs {
 		t.Errorf("Expected %d groups, got %d", numIDs, len(finalResults))
 	}
@@ -151,26 +153,23 @@ func TestStress_ComplexPipeline(t *testing.T) {
 			t.Errorf("ID %d: expected count %d, got %d", id, valsPerID, agg.Count)
 		}
 	}
-	lock.Unlock()
+	resLock.Unlock()
 
 	// --- Update Phase (Churn) ---
-	// Update all RawB values to 200
-	// New Sum = 55 + (10 * 200) = 2055
 	for i := 1; i <= numIDs; i++ {
 		sourceB.OnUpdate(RawB{ID: i, Value: 100}, RawB{ID: i, Value: 200})
 	}
 
-	lock.Lock()
+	resLock.Lock()
 	for id, agg := range finalResults {
 		expectedSum := int64(2055)
 		if agg.Sum != expectedSum {
 			t.Errorf("AFTER UPDATE ID %d: expected sum %d, got %d", id, expectedSum, agg.Sum)
 		}
 	}
-	lock.Unlock()
+	resLock.Unlock()
 
 	// --- Delete Phase ---
-	// Delete half of sourceA
 	for i := 1; i <= numIDs/2; i++ {
 		vals := make([]int, valsPerID)
 		for j := 0; j < valsPerID; j++ {
@@ -179,16 +178,17 @@ func TestStress_ComplexPipeline(t *testing.T) {
 		sourceA.OnDelete(RawA{ID: i, Vals: vals})
 	}
 
-	lock.Lock()
+	resLock.Lock()
 	if len(finalResults) != numIDs/2 {
 		t.Errorf("AFTER DELETE: Expected %d groups, got %d", numIDs/2, len(finalResults))
 	}
-	lock.Unlock()
+	resLock.Unlock()
 }
 
 func BenchmarkPipeline(b *testing.B) {
-	sourceA := NewManualSharedInformer()
-	sourceB := NewManualSharedInformer()
+	lock := NewLockGroup()
+	sourceA := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	sourceB := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type RawA struct { ID int; Vals []int }
 	type RawB struct { ID int; Value int }
@@ -197,6 +197,7 @@ func BenchmarkPipeline(b *testing.B) {
 	type Aggregated struct { ID int; Sum int64 }
 
 	flatMapA := QueryInformer(&FlatMap[ExpandedA, RawA]{
+		Lock: lock,
 		Map: func(a RawA) ([]ExpandedA, error) {
 			res := make([]ExpandedA, len(a.Vals))
 			for i, v := range a.Vals { res[i] = ExpandedA{ID: a.ID, Val: v} }
@@ -206,6 +207,7 @@ func BenchmarkPipeline(b *testing.B) {
 	})
 
 	joinedInformer := QueryInformer(&Join[Joined, ExpandedA, RawB]{
+		Lock: lock,
 		Select: func(a ExpandedA, b RawB) (Joined, error) {
 			return Joined{ID: a.ID, AVal: a.Val, BVal: b.Value, Total: a.Val + b.Value}, nil
 		},
@@ -218,6 +220,7 @@ func BenchmarkPipeline(b *testing.B) {
 	})
 
 	finalAggregator := QueryInformer(&GroupBy[Aggregated, Joined]{
+		Lock: lock,
 		Select: func(fields []GroupField) (Aggregated, error) {
 			return Aggregated{ID: fields[0].(int), Sum: fields[1].(int64)}, nil
 		},

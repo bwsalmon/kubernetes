@@ -3,7 +3,6 @@ package fort
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"k8s.io/client-go/tools/cache"
@@ -20,9 +19,11 @@ type grouper[Out, In any] struct {
 
 	registration cache.ResourceEventHandlerRegistration
 
-	lock   sync.Mutex
 	groups map[any]*groupState[Out]
 }
+
+var _ ManualSharedInformer = &grouper[int, int]{}
+var _ LockedResourceEventHandler = &grouper[int, int]{}
 
 // groupState maintains the current aggregation state for a single group.
 type groupState[Out any] struct {
@@ -31,9 +32,16 @@ type groupState[Out any] struct {
 	lastOut Out // The last object emitted for this group, used for OnUpdate.
 }
 
-func newGrouper[Out, In any](sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In]) *grouper[Out, In] {
+func newGrouper[Out, In any](lock LockGroup, sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In]) *grouper[Out, In] {
+	// grouper emits Out. Assume MetaNamespaceKeyFunc for aggregates.
+	handler := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
+	handler.SetName("grouper-handler")
+	return newGrouperWithHandler(sel, groupBy, from, where, handler)
+}
+
+func newGrouperWithHandler[Out, In any](sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In], handler ManualSharedInformer) *grouper[Out, In] {
 	g := &grouper[Out, In]{
-		handler: NewManualSharedInformer(),
+		handler: handler,
 		sel:     sel,
 		groupBy: groupBy,
 		where:   where,
@@ -52,13 +60,111 @@ func newGrouper[Out, In any](sel GroupSelectFunc[Out], groupBy SingleGroupByFunc
 	return g
 }
 
+func (g *grouper[Out, In]) OnAdd(obj any, isInitial bool) {
+	g.handler.GetLockGroup().Lock()
+	defer g.handler.GetLockGroup().Unlock()
+	g.OnAddLocked(obj, isInitial)
+}
+
+func (g *grouper[Out, In]) OnAddLocked(obj any, isInitial bool) {
+	input := obj.(In)
+	if g.where != nil && !g.where(input) {
+		return
+	}
+
+	key, fields := g.groupBy(input)
+
+	state, ok := g.groups[key]
+	var oldOut Out
+	if ok {
+		oldOut = state.lastOut
+	} else {
+		state = &groupState[Out]{}
+		g.groups[key] = state
+	}
+
+	newFields := g.evaluateFields(fields, state, input, true)
+	newOut, _ := g.sel(newFields)
+	state.lastOut = newOut
+
+	if ok {
+		g.handler.OnUpdateLocked(oldOut, newOut)
+	} else {
+		g.handler.OnAddLocked(newOut, isInitial)
+	}
+}
+
+func (g *grouper[Out, In]) OnUpdate(oldObj, newObj any) {
+	g.handler.GetLockGroup().Lock()
+	defer g.handler.GetLockGroup().Unlock()
+	g.OnUpdateLocked(oldObj, newObj)
+}
+
+func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
+	oldInput := oldObj.(In)
+	newInput := newObj.(In)
+
+	oldKey, oldFields := g.groupBy(oldInput)
+	newKey, newFields := g.groupBy(newInput)
+
+	if oldKey == newKey {
+		state, ok := g.groups[oldKey]
+		if !ok {
+			g.OnAddLocked(newObj, false)
+			return
+		}
+
+		oldOut := state.lastOut
+		g.evaluateFields(oldFields, state, oldInput, false)
+		resFields := g.evaluateFields(newFields, state, newInput, true)
+		
+		newOut, _ := g.sel(resFields)
+		state.lastOut = newOut
+		g.handler.OnUpdateLocked(oldOut, newOut)
+	} else {
+		g.OnDeleteLocked(oldObj)
+		g.OnAddLocked(newObj, false)
+	}
+}
+
+func (g *grouper[Out, In]) OnDelete(obj any) {
+	g.handler.GetLockGroup().Lock()
+	defer g.handler.GetLockGroup().Unlock()
+	g.OnDeleteLocked(obj)
+}
+
+func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
+	input := obj.(In)
+	if g.where != nil && !g.where(input) {
+		return
+	}
+
+	key, fields := g.groupBy(input)
+
+	state, ok := g.groups[key]
+	if !ok {
+		return
+	}
+
+	oldOut := state.lastOut
+	newFields := g.evaluateFields(fields, state, input, false)
+
+	if state.count == 0 {
+		delete(g.groups, key)
+		g.handler.OnDeleteLocked(oldOut)
+	} else {
+		newOut, _ := g.sel(newFields)
+		state.lastOut = newOut
+		g.handler.OnUpdateLocked(oldOut, newOut)
+	}
+}
+
 // evaluateFields calculates or updates the values of aggregate fields for a group.
 func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState[Out], input In, adding bool) []GroupField {
 	if state.fields == nil {
 		state.fields = make([]any, len(fields))
 	}
 
-	// Always track the number of items in the group to handle deletions correctly.
 	if adding {
 		state.count++
 	} else {
@@ -109,107 +215,8 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 	return res
 }
 
-func (g *grouper[Out, In]) OnAdd(obj any, isInitial bool) {
-	g.lock.Lock()
-	defer g.lock.Unlock()
-
-	input := obj.(In)
-	if g.where != nil && !g.where(input) {
-		return
-	}
-
-	key, fields := g.groupBy(input)
-
-	state, ok := g.groups[key]
-	var oldOut Out
-	if ok {
-		oldOut = state.lastOut
-	} else {
-		state = &groupState[Out]{}
-		g.groups[key] = state
-	}
-
-	newFields := g.evaluateFields(fields, state, input, true)
-	newOut, _ := g.sel(newFields)
-	state.lastOut = newOut
-
-	if ok {
-		g.handler.OnUpdate(oldOut, newOut)
-	} else {
-		g.handler.OnAdd(newOut, isInitial)
-	}
-}
-
-// OnUpdate handles item updates. If the group key is the same, it incrementally
-// updates the aggregation. If the key changed, it performs a delete from the old
-// group and an add to the new group.
-func (g *grouper[Out, In]) OnUpdate(oldObj, newObj any) {
-	g.lock.Lock()
-	defer g.lock.Unlock()
-
-	oldInput := oldObj.(In)
-	newInput := newObj.(In)
-
-	oldKey, oldFields := g.groupBy(oldInput)
-	newKey, newFields := g.groupBy(newInput)
-
-	if oldKey == newKey {
-		state, ok := g.groups[oldKey]
-		if !ok {
-			g.lock.Unlock()
-			g.OnAdd(newObj, false)
-			g.lock.Lock()
-			return
-		}
-
-		oldOut := state.lastOut
-		// To update aggregate fields correctly: subtract old values then add new values.
-		g.evaluateFields(oldFields, state, oldInput, false)
-		resFields := g.evaluateFields(newFields, state, newInput, true)
-		
-		newOut, _ := g.sel(resFields)
-		state.lastOut = newOut
-		g.handler.OnUpdate(oldOut, newOut)
-	} else {
-		// Key changed: move object between groups.
-		g.lock.Unlock()
-		g.OnDelete(oldObj)
-		g.OnAdd(newObj, false)
-		g.lock.Lock()
-	}
-}
-
-func (g *grouper[Out, In]) OnDelete(obj any) {
-	g.lock.Lock()
-	defer g.lock.Unlock()
-
-	input := obj.(In)
-	if g.where != nil && !g.where(input) {
-		return
-	}
-
-	key, fields := g.groupBy(input)
-
-	state, ok := g.groups[key]
-	if !ok {
-		return
-	}
-
-	oldOut := state.lastOut
-	newFields := g.evaluateFields(fields, state, input, false)
-
-	if state.count == 0 {
-		delete(g.groups, key)
-		g.handler.OnDelete(oldOut)
-	} else {
-		newOut, _ := g.sel(newFields)
-		state.lastOut = newOut
-		g.handler.OnUpdate(oldOut, newOut)
-	}
-}
-
-func (g *grouper[Out, In]) Lock() *sync.Mutex {
-	return g.handler.(*manualInformer).Lock()
+func (g *grouper[Out, In]) GetLockGroup() LockGroup {
+	return g.handler.GetLockGroup()
 }
 
 func (g *grouper[Out, In]) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
@@ -232,12 +239,63 @@ func (g *grouper[Out, In]) HasSyncedChecker() cache.DoneChecker {
 	return g.handler.HasSyncedChecker()
 }
 
-func (g *grouper[Out, In]) Clone(sources []cache.SharedInformer) CloneableSharedInformerQuery {
-	return newGrouper[Out, In](g.sel, g.groupBy, sources[0], g.where)
+// Clone creates a new instance.
+// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
+func (g *grouper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
+	ns := newSources[0]
+	newLock := ns.(CloneableSharedInformerQuery).GetLockGroup()
+	
+	p := g.handler.(*manualInformer)
+
+	newIndexer := cache.NewIndexer(p.keyFunc, cache.Indexers{})
+	for _, obj := range p.indexer.List() {
+		newIndexer.Add(obj)
+	}
+	newHandler := &manualInformer{
+		name:      p.name,
+		handlers:  map[int]cache.ResourceEventHandler{},
+		transform: p.transform,
+		hasSynced: p.hasSynced,
+		keyFunc:   p.keyFunc,
+		indexer:   newIndexer,
+		lock:      newLock,
+	}
+
+	ng := &grouper[Out, In]{
+		handler: newHandler,
+		sel:     g.sel,
+		groupBy: g.groupBy,
+		where:   g.where,
+		source:  ns,
+		groups:  make(map[any]*groupState[Out]),
+	}
+
+	// Deep copy groups
+	for k, v := range g.groups {
+		newGS := &groupState[Out]{
+			count:   v.count,
+			fields:  append([]any(nil), v.fields...),
+			lastOut: v.lastOut,
+		}
+		for i, f := range newGS.fields {
+			if m, ok := f.(map[any]int); ok {
+				nm := make(map[any]int)
+				for mk, mv := range m {
+					nm[mk] = mv
+				}
+				newGS.fields[i] = nm
+			}
+		}
+		ng.groups[k] = newGS
+	}
+
+	ng.registration, _ = ns.AddEventHandler(ng)
+
+	return ng
 }
 
 func (g *grouper[Out, In]) GetStore() cache.Store {
-	return nil
+	return g.handler.GetStore()
 }
 
 func (g *grouper[Out, In]) GetController() cache.Controller {
@@ -274,4 +332,24 @@ func (g *grouper[Out, In]) HasSynced() bool {
 
 func (g *grouper[Out, In]) IsStopped() bool {
 	return g.handler.IsStopped()
+}
+
+func (g *grouper[Out, In]) SetIsStopped() {
+	g.handler.SetIsStopped()
+}
+
+func (g *grouper[Out, In]) SetHasSynced() {
+	g.handler.SetHasSynced()
+}
+
+func (g *grouper[Out, In]) GetKeyFunc() cache.KeyFunc {
+	return g.handler.GetKeyFunc()
+}
+
+func (g *grouper[Out, In]) TriggerWatchError(err error) {
+	g.handler.TriggerWatchError(err)
+}
+
+func (g *grouper[Out, In]) SetName(name string) {
+	g.handler.SetName(name)
 }

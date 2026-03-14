@@ -24,11 +24,13 @@ type UserOrder struct {
 }
 
 func TestSelectJoinGroupBy(t *testing.T) {
-	users := NewManualSharedInformer()
-	orders := NewManualSharedInformer()
+	lock := NewLockGroup()
+	users := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	orders := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	// Query pipeline setup
 	userOrders := QueryInformer(&Join[UserOrder, User, Order]{
+		Lock: lock,
 		Select: func(u User, o Order) (UserOrder, error) {
 			return UserOrder{UserName: u.Name, Amount: o.Amount}, nil
 		},
@@ -50,6 +52,7 @@ func TestSelectJoinGroupBy(t *testing.T) {
 		Total    int64
 	}
 	userTotals := QueryInformer(&GroupBy[UserTotal, UserOrder]{
+		Lock: lock,
 		Select: func(fields []GroupField) (UserTotal, error) {
 			return UserTotal{
 				UserName: fields[0].(string),
@@ -103,8 +106,9 @@ func TestFlatMap(t *testing.T) {
 		ti := obj.(*TaggedItem)
 		return fmt.Sprintf("%d/%s", ti.ID, ti.Tag), nil
 	}
-	source := NewManualSharedInformer()
-	handler := NewManualSharedInformerWithKeyFunc(keyFunc)
+	lock := NewLockGroup()
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	handler := NewManualSharedInformerWithOptions(lock, keyFunc)
 	
 	type Item struct {
 		ID   int
@@ -112,6 +116,7 @@ func TestFlatMap(t *testing.T) {
 	}
 
 	m := &FlatMap[*TaggedItem, *Item]{
+		Lock: lock,
 		Map: func(item *Item) ([]*TaggedItem, error) {
 			var res []*TaggedItem
 			for _, tag := range item.Tags {
@@ -139,14 +144,16 @@ func TestFlatMap(t *testing.T) {
 }
 
 func TestJoinUpdatesAndDeletes(t *testing.T) {
-	left := NewManualSharedInformer()
-	right := NewManualSharedInformer()
+	lock := NewLockGroup()
+	left := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	right := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type L struct{ ID int; Val string }
 	type R struct{ ID int; Val string }
 	type Joined struct{ LVal, RVal string }
 
 	joinedInformer := QueryInformer(&Join[Joined, L, R]{
+		Lock: lock,
 		Select: func(l L, r R) (Joined, error) {
 			return Joined{LVal: l.Val, RVal: r.Val}, nil
 		},
@@ -198,7 +205,8 @@ func TestJoinUpdatesAndDeletes(t *testing.T) {
 }
 
 func TestGroupByAggregations(t *testing.T) {
-	source := NewManualSharedInformer()
+	lock := NewLockGroup()
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type Data struct {
 		Category string
@@ -214,6 +222,7 @@ func TestGroupByAggregations(t *testing.T) {
 	}
 
 	grouped := QueryInformer(&GroupBy[Aggregated, Data]{
+		Lock: lock,
 		Select: func(fields []GroupField) (Aggregated, error) {
 			// fields: [Category, Count, Sum, Distinct, Any]
 			distinctAny := fields[3].([]any)
@@ -264,13 +273,16 @@ func TestGroupByAggregations(t *testing.T) {
 }
 
 func TestClone(t *testing.T) {
-	source := NewManualSharedInformer()
+	lock := NewLockGroup()
+	source := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 	query := QueryInformer(&Select[int, int]{
+		Lock:   lock,
 		Select: func(i int) (int, error) { return i * 2, nil },
 		From:   source,
 	})
 
-	newSource := NewManualSharedInformer()
+	newLock := NewLockGroup()
+	newSource := NewManualSharedInformerWithOptions(newLock, cache.MetaNamespaceKeyFunc)
 	cloned := query.Clone([]cache.SharedInformer{newSource})
 
 	var results []int

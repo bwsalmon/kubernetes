@@ -1,21 +1,50 @@
 package fort
 
 import (
+	"fmt"
 	"sync"
 
 	"k8s.io/client-go/tools/cache"
 )
 
+// DefaultKeyFunc is a robust key function that handles both K8s objects and primitive types.
+func DefaultKeyFunc(obj any) (string, error) {
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err == nil && key != "" {
+		return key, nil
+	}
+	// Fallback for non-K8s objects. Never return error to ensure indexer.Add works.
+	return fmt.Sprintf("%v", obj), nil
+}
+
+// LockGroup manages a shared RWMutex for a connected set of query informers.
+type LockGroup interface {
+	RLock()
+	RUnlock()
+	Lock()
+	Unlock()
+}
+
+type lockGroup struct {
+	sync.RWMutex
+}
+
+func NewLockGroup() LockGroup {
+	return &lockGroup{}
+}
+
 // CloneableSharedInformerQuery is a shared informer defined by a query that can be cloned.
-// Cloning is essential for simulations where live informers are replaced with manual ones.
 type CloneableSharedInformerQuery interface {
 	cache.SharedInformer
 	// Clone creates a new instance of the query using the provided new sources.
 	Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery
+	// GetLockGroup returns the shared lock used by this informer.
+	GetLockGroup() LockGroup
+	// SetName sets the name for debug logging.
+	SetName(name string)
 }
 
 // QueryInformer generates a new SharedInformer by running the given query spec.
-// It follows a declarative pattern similar to SQL but implemented as Go code.
 func QueryInformer(query QuerySpec) CloneableSharedInformerQuery {
 	return query.Build()
 }
@@ -27,6 +56,7 @@ type QuerySpec interface {
 
 // Select defines a simple transformation and filtering query.
 type Select[Out, In any] struct {
+	Lock   LockGroup
 	Select SingleSelectFunc[Out, In]
 	From   cache.SharedInformer
 	Where  SingleFilterFunc[In]
@@ -35,8 +65,15 @@ type Select[Out, In any] struct {
 type SingleSelectFunc[Out, Left any] func(value Left) (Out, error)
 type SingleFilterFunc[In any] func(in In) bool
 
+// JoinValue represents a pair of joined objects.
+type JoinValue[Left, Right any] struct {
+	Left  Left
+	Right Right
+}
+
 // Join defines a many-to-many join between two informers.
 type Join[Out, Left, Right any] struct {
+	Lock   LockGroup
 	Select JoinSelectFunc[Out, Left, Right]
 	From   cache.SharedInformer
 	Join   cache.SharedInformer
@@ -48,11 +85,11 @@ type JoinSelectFunc[Out, Left, Right any] func(left Left, right Right) (Out, err
 type JoinFilterFunc[Left, Right any] func(left Left, right Right) bool
 
 // JoinOnFunc defines the key used for joining two objects.
-// To ensure map compatibility, it should return a comparable type (e.g., [N]string).
 type JoinOnFunc[Left, Right any] func(left Left, right Right) any
 
 // GroupBy defines an aggregation query over a single informer.
 type GroupBy[Out, In any] struct {
+	Lock    LockGroup
 	Select  GroupSelectFunc[Out]
 	From    cache.SharedInformer
 	Where   SingleFilterFunc[In]
@@ -60,12 +97,11 @@ type GroupBy[Out, In any] struct {
 }
 
 type GroupSelectFunc[Out any] func(fields []GroupField) (Out, error)
-
-// SingleGroupByFunc returns a comparable key for the group and a slice of aggregate fields.
 type SingleGroupByFunc[In any] func(in In) (any, []GroupField)
 
 // GroupByJoin defines an aggregation query over the results of a join.
 type GroupByJoin[Out, Left, Right any] struct {
+	Lock    LockGroup
 	Select  GroupSelectFunc[Out]
 	From    cache.SharedInformer
 	Join    cache.SharedInformer
@@ -87,43 +123,47 @@ type groupField struct {
 	anyValue any
 }
 
-// GroupKey wraps a value to be used as a grouping key field.
 func GroupKey(key any) GroupField {
 	return &groupField{key: key}
 }
 
-// Count returns an aggregate field representing the number of items in the group.
 func Count() GroupField {
 	return &groupField{count: true}
 }
 
-// Sum returns an aggregate field representing the sum of a numeric value across the group.
 func Sum(val int64) GroupField {
 	return &groupField{sum: &val}
 }
 
-// Distinct returns an aggregate field representing the set of unique values across the group.
 func Distinct(val any) GroupField {
 	return &groupField{distinct: val}
 }
 
-// AnyValue returns an aggregate field representing an arbitrary value from the group.
 func AnyValue(val any) GroupField {
 	return &groupField{anyValue: val}
 }
 
 // FlatMap defines a one-to-many transformation query.
 type FlatMap[Out, In any] struct {
+	Lock LockGroup
 	Map  FlatMapFunc[Out, In]
 	Over cache.SharedInformer
 }
 
 type FlatMapFunc[Out, In any] func(obj In) ([]Out, error)
 
-// ManualSharedInformer allows manual triggering of events, useful for testing and simulations.
+// LockedResourceEventHandler allows processing events without re-acquiring the LockGroup.
+type LockedResourceEventHandler interface {
+	OnAddLocked(obj any, isInInitialList bool)
+	OnUpdateLocked(oldObj, newObj any)
+	OnDeleteLocked(oldObj any)
+}
+
+// ManualSharedInformer allows manual triggering of events.
 type ManualSharedInformer interface {
 	CloneableSharedInformerQuery
 	cache.ResourceEventHandler
+	LockedResourceEventHandler
 
 	SetIsStopped()
 	SetHasSynced()
@@ -131,44 +171,41 @@ type ManualSharedInformer interface {
 	TriggerWatchError(err error)
 }
 
-// NewManualSharedInformer creates a ManualSharedInformer using the default MetaNamespaceKeyFunc.
+// NewManualSharedInformer creates a ManualSharedInformer with a default lock and keyfunc.
 func NewManualSharedInformer() ManualSharedInformer {
-	return NewManualSharedInformerWithKeyFunc(cache.MetaNamespaceKeyFunc)
+	return NewManualSharedInformerWithOptions(NewLockGroup(), DefaultKeyFunc)
 }
 
-// NewManualSharedInformerWithKeyFunc creates a ManualSharedInformer with a custom KeyFunc.
-func NewManualSharedInformerWithKeyFunc(keyFunc cache.KeyFunc) ManualSharedInformer {
+// NewManualSharedInformerWithOptions creates a ManualSharedInformer with specific options.
+func NewManualSharedInformerWithOptions(lock LockGroup, keyFunc cache.KeyFunc) ManualSharedInformer {
 	return &manualInformer{
 		handlers: map[int]cache.ResourceEventHandler{},
 		keyFunc:  keyFunc,
+		indexer:  cache.NewIndexer(keyFunc, cache.Indexers{}),
+		lock:     lock,
 	}
 }
 
-// LockInformerSet locks multiple informers together in a deterministic order.
-// Use this to ensure consistent snapshots across related informers.
+// LockInformerSet acquires a Read Lock on the domain, enabling a consistent snapshot.
 func LockInformerSet(informers []CloneableSharedInformerQuery) InformerLockSet {
-	ls := &informerLockSet{}
-	for _, inf := range informers {
-		if m, ok := inf.(interface{ Lock() *sync.Mutex }); ok {
-			lock := m.Lock()
-			lock.Lock()
-			ls.locks = append(ls.locks, lock)
-		}
+	if len(informers) == 0 {
+		return &informerLockSet{}
 	}
-	return ls
+	lock := informers[0].GetLockGroup()
+	lock.RLock()
+	return &informerLockSet{lock: lock}
 }
 
-// InformerLockSet provides a single Unlock method to release all acquired locks.
 type InformerLockSet interface {
 	Unlock()
 }
 
 type informerLockSet struct {
-	locks []*sync.Mutex
+	lock LockGroup
 }
 
 func (ls *informerLockSet) Unlock() {
-	for i := len(ls.locks) - 1; i >= 0; i-- {
-		ls.locks[i].Unlock()
+	if ls.lock != nil {
+		ls.lock.RUnlock()
 	}
 }

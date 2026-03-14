@@ -3,18 +3,23 @@ package fort
 import (
 	"testing"
 	"time"
+
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestSyncPropagation_Chained(t *testing.T) {
-	s1 := NewManualSharedInformer()
+	lock := NewLockGroup()
+	s1 := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 	
 	// Chain: s1 -> flatMap -> grouper
 	flatMap := QueryInformer(&FlatMap[int, int]{
+		Lock: lock,
 		Map: func(i int) ([]int, error) { return []int{i}, nil },
 		Over: s1,
 	})
 
 	grouper := QueryInformer(&GroupBy[int, int]{
+		Lock: lock,
 		Select: func(fields []GroupField) (int, error) { return int(fields[0].(int64)), nil },
 		From: flatMap,
 		GroupBy: func(i int) (any, []GroupField) { return [1]int{0}, []GroupField{Count()} },
@@ -42,10 +47,12 @@ func TestSyncPropagation_Chained(t *testing.T) {
 }
 
 func TestSyncPropagation_Join(t *testing.T) {
-	s1 := NewManualSharedInformer()
-	s2 := NewManualSharedInformer()
+	lock := NewLockGroup()
+	s1 := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	s2 := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	joined := QueryInformer(&Join[int, int, int]{
+		Lock:   lock,
 		Select: func(l, r int) (int, error) { return l + r, nil },
 		From:   s1,
 		Join:   s2,

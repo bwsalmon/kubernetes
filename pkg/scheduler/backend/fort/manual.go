@@ -3,18 +3,16 @@ package fort
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"k8s.io/client-go/tools/cache"
 )
 
-// manualInformer implements ManualSharedInformer and provides a mechanism to manually
-// trigger informer events. It acts as the "leaf" source in many simulation or test chains.
+// manualInformer implements ManualSharedInformer using a shared LockGroup.
 type manualInformer struct {
 	name string
 
-	lock sync.Mutex
+	lock LockGroup
 
 	handlers      map[int]cache.ResourceEventHandler
 	nextHandlerId int
@@ -29,6 +27,7 @@ type manualInformer struct {
 	transform cache.TransformFunc
 
 	keyFunc cache.KeyFunc
+	indexer cache.Indexer
 
 	watchErrorHandler            cache.WatchErrorHandler
 	watchErrorHandlerWithContext cache.WatchErrorHandlerWithContext
@@ -41,7 +40,6 @@ type manualInformerRegistration struct {
 	id       int
 }
 
-// manualInformerDoneChecker implementation for DoneChecker interface.
 type manualInformerDoneChecker struct {
 	informer *manualInformer
 	synced   chan struct{}
@@ -65,12 +63,19 @@ func (c *manualInformerDoneChecker) Done() <-chan struct{} {
 	return c.synced
 }
 
-// Lock returns the underlying mutex. Used by LockInformerSet for consistent snapshoting.
-func (p *manualInformer) Lock() *sync.Mutex {
-	return &p.lock
+func (p *manualInformer) GetLockGroup() LockGroup {
+	return p.lock
 }
 
 func (p *manualInformer) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return p.AddEventHandlerWithOptions(h, cache.HandlerOptions{})
+}
+
+func (p *manualInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
+	return p.AddEventHandler(handler)
+}
+
+func (p *manualInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -79,16 +84,20 @@ func (p *manualInformer) AddEventHandler(h cache.ResourceEventHandler) (cache.Re
 		informer: p,
 		id:       p.nextHandlerId,
 	}
-	p.handlers[p.nextHandlerId] = h
+	p.handlers[p.nextHandlerId] = handler
+
+	// Atomic replay of current state
+	list := p.indexer.List()
+	for _, obj := range list {
+		// If handler supports Locked events, use them to avoid deadlock.
+		if m, ok := handler.(LockedResourceEventHandler); ok {
+			m.OnAddLocked(obj, true)
+		} else {
+			handler.OnAdd(obj, true)
+		}
+	}
+
 	return r, nil
-}
-
-func (p *manualInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
-	return p.AddEventHandler(handler)
-}
-
-func (p *manualInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
-	return p.AddEventHandler(handler)
 }
 
 func (p *manualInformer) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
@@ -101,7 +110,7 @@ func (p *manualInformer) RemoveEventHandler(r cache.ResourceEventHandlerRegistra
 }
 
 func (p *manualInformer) GetStore() cache.Store {
-	return nil
+	return p.indexer
 }
 
 func (p *manualInformer) GetController() cache.Controller {
@@ -117,9 +126,6 @@ func (p *manualInformer) RunWithContext(ctx context.Context) {
 }
 
 func (p *manualInformer) LastSyncResourceVersion() string {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
 	return p.lastSyncResourceVersion
 }
 
@@ -137,15 +143,14 @@ func (p *manualInformer) SetWatchErrorHandlerWithContext(handler cache.WatchErro
 	return nil
 }
 
-// TriggerWatchError manually triggers the registered watch error handlers.
 func (p *manualInformer) TriggerWatchError(err error) {
-	p.lock.Lock()
+	p.lock.RLock()
 	h := p.watchErrorHandler
 	hc := p.watchErrorHandlerWithContext
-	p.lock.Unlock()
+	p.lock.RUnlock()
 
 	if h != nil {
-		h(nil, err) // We don't have a Reflector here
+		h(nil, err)
 	}
 	if hc != nil {
 		hc(context.TODO(), nil, err)
@@ -164,20 +169,17 @@ func (p *manualInformer) SetTransform(handler cache.TransformFunc) error {
 }
 
 func (p *manualInformer) HasSynced() bool {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	return p.hasSynced
 }
 
 func (p *manualInformer) IsStopped() bool {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
+	p.lock.RLock()
+	defer p.lock.RUnlock()
 	return p.isStopped
 }
 
-// SetHasSynced marks the informer as synced and notifies all waiting checkers.
 func (p *manualInformer) SetHasSynced() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -196,7 +198,6 @@ func (p *manualInformer) SetHasSynced() {
 func (p *manualInformer) SetIsStopped() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-
 	p.isStopped = true
 }
 
@@ -204,7 +205,6 @@ func (p *manualInformer) GetKeyFunc() cache.KeyFunc {
 	return p.keyFunc
 }
 
-// HasSyncedChecker returns a checker that completes when SetHasSynced is called.
 func (i *manualInformer) HasSyncedChecker() cache.DoneChecker {
 	i.lock.Lock()
 	defer i.lock.Unlock()
@@ -223,32 +223,38 @@ func (i *manualInformer) HasSyncedChecker() cache.DoneChecker {
 	return checker
 }
 
-// OnAdd triggers the Add event for all registered handlers.
 func (p *manualInformer) OnAdd(obj any, isInInitialList bool) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+	p.OnAddLocked(obj, isInInitialList)
+}
 
-	// XXX set last version
-
+func (p *manualInformer) OnAddLocked(obj any, isInInitialList bool) {
 	transformed := obj
 	if p.transform != nil {
 		transformed, _ = p.transform(obj)
 	}
 
+	p.indexer.Add(transformed)
+
 	for _, h := range p.handlers {
 		if h != nil {
-			h.OnAdd(transformed, isInInitialList)
+			if m, ok := h.(LockedResourceEventHandler); ok {
+				m.OnAddLocked(transformed, isInInitialList)
+			} else {
+				h.OnAdd(transformed, isInInitialList)
+			}
 		}
 	}
 }
 
-// OnUpdate triggers the Update event for all registered handlers.
 func (p *manualInformer) OnUpdate(oldObj, newObj any) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+	p.OnUpdateLocked(oldObj, newObj)
+}
 
-	// XXX set last version
-
+func (p *manualInformer) OnUpdateLocked(oldObj, newObj any) {
 	oldTransformed := oldObj
 	newTransformed := newObj
 	if p.transform != nil {
@@ -256,35 +262,52 @@ func (p *manualInformer) OnUpdate(oldObj, newObj any) {
 		newTransformed, _ = p.transform(newObj)
 	}
 
+	p.indexer.Update(newTransformed)
+
 	for _, h := range p.handlers {
 		if h != nil {
-			h.OnUpdate(oldTransformed, newTransformed)
+			if m, ok := h.(LockedResourceEventHandler); ok {
+				m.OnUpdateLocked(oldTransformed, newTransformed)
+			} else {
+				h.OnUpdate(oldTransformed, newTransformed)
+			}
 		}
 	}
 }
 
-// OnDelete triggers the Delete event for all registered handlers.
 func (p *manualInformer) OnDelete(oldObj any) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
+	p.OnDeleteLocked(oldObj)
+}
 
-	// XXX set last version
-
+func (p *manualInformer) OnDeleteLocked(oldObj any) {
 	transformed := oldObj
 	if p.transform != nil {
 		transformed, _ = p.transform(oldObj)
 	}
 
+	p.indexer.Delete(transformed)
+
 	for _, h := range p.handlers {
 		if h != nil {
-			h.OnDelete(transformed)
+			if m, ok := h.(LockedResourceEventHandler); ok {
+				m.OnDeleteLocked(transformed)
+			} else {
+				h.OnDelete(transformed)
+			}
 		}
 	}
 }
 
+// Clone creates a new instance.
+// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
 func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformerQuery {
-	p.lock.Lock()
-	defer p.lock.Unlock()
+	newIndexer := cache.NewIndexer(p.keyFunc, cache.Indexers{})
+	list := p.indexer.List()
+	for _, obj := range list {
+		newIndexer.Add(obj)
+	}
 
 	newInformer := &manualInformer{
 		name:                    p.name,
@@ -294,7 +317,13 @@ func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformer
 		hasSynced:               p.hasSynced,
 		lastSyncResourceVersion: p.lastSyncResourceVersion,
 		keyFunc:                 p.keyFunc,
+		indexer:                 newIndexer,
+		lock:                    NewLockGroup(),
 	}
 
 	return newInformer
+}
+
+func (p *manualInformer) SetName(name string) {
+	p.name = name
 }

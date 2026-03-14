@@ -8,8 +8,9 @@ import (
 )
 
 func TestChaining_FlatMapToJoin(t *testing.T) {
-	source1 := NewManualSharedInformer()
-	source2 := NewManualSharedInformer()
+	lock := NewLockGroup()
+	source1 := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	source2 := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type Item struct {
 		ID   int
@@ -33,10 +34,11 @@ func TestChaining_FlatMapToJoin(t *testing.T) {
 		t := obj.(Tagged)
 		return fmt.Sprintf("%d/%s", t.ID, t.Tag), nil
 	}
-	taggedHandler := NewManualSharedInformerWithKeyFunc(taggedKeyFunc)
+	taggedHandler := NewManualSharedInformerWithOptions(lock, taggedKeyFunc)
 
 	// FlatMap source1
 	m := &FlatMap[Tagged, Item]{
+		Lock: lock,
 		Map: func(i Item) ([]Tagged, error) {
 			var res []Tagged
 			for _, tag := range i.Tags {
@@ -50,6 +52,7 @@ func TestChaining_FlatMapToJoin(t *testing.T) {
 
 	// Join tagged with source2 (Meta)
 	finalInformer := QueryInformer(&Join[Result, Tagged, Meta]{
+		Lock: lock,
 		Select: func(t Tagged, m Meta) (Result, error) {
 			return Result{ID: t.ID, Tag: t.Tag, Value: m.Value}, nil
 		},
@@ -98,8 +101,9 @@ func TestChaining_FlatMapToJoin(t *testing.T) {
 }
 
 func TestChaining_JoinToGroupByToFlatMap(t *testing.T) {
-	users := NewManualSharedInformer()
-	orders := NewManualSharedInformer()
+	lock := NewLockGroup()
+	users := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
+	orders := NewManualSharedInformerWithOptions(lock, cache.MetaNamespaceKeyFunc)
 
 	type User struct{ ID int; Name string }
 	type Order struct{ ID, UserID int; Amount int }
@@ -107,6 +111,7 @@ func TestChaining_JoinToGroupByToFlatMap(t *testing.T) {
 
 	// 1. Join
 	userOrders := QueryInformer(&Join[UserOrder, User, Order]{
+		Lock: lock,
 		Select: func(u User, o Order) (UserOrder, error) {
 			return UserOrder{Name: u.Name, Amount: o.Amount}, nil
 		},
@@ -125,6 +130,7 @@ func TestChaining_JoinToGroupByToFlatMap(t *testing.T) {
 
 	// 2. GroupBy
 	userTotals := QueryInformer(&GroupBy[UserTotal, UserOrder]{
+		Lock: lock,
 		Select: func(fields []GroupField) (UserTotal, error) {
 			return UserTotal{Name: fields[0].(string), Total: fields[1].(int64)}, nil
 		},
@@ -140,6 +146,7 @@ func TestChaining_JoinToGroupByToFlatMap(t *testing.T) {
 
 	// 3. FlatMap (Alert if total > 100)
 	alerts := QueryInformer(&FlatMap[Alert, UserTotal]{
+		Lock: lock,
 		Map: func(ut UserTotal) ([]Alert, error) {
 			if ut.Total > 100 {
 				return []Alert{{Msg: ut.Name + " is a big spender"}}, nil

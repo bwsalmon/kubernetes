@@ -3,15 +3,13 @@ package fort
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"k8s.io/client-go/tools/cache"
 )
 
 // flatMapper implements FlatMap query by applying a mapping function to each object
-// from a source informer. The mapping function returns a slice, allowing one input
-// object to generate zero or more output objects.
+// from a source informer. It uses a shared LockGroup for transactional consistency.
 type flatMapper[Out, In any] struct {
 	handler      ManualSharedInformer
 	mapper       FlatMapFunc[Out, In]
@@ -20,14 +18,14 @@ type flatMapper[Out, In any] struct {
 	source       cache.SharedInformer
 }
 
-var _ CloneableSharedInformerQuery = &flatMapper[int, int]{}
+var _ ManualSharedInformer = &flatMapper[int, int]{}
 
-func newFlatMapper[Out, In any](mapper FlatMapFunc[Out, In], from cache.SharedInformer) *flatMapper[Out, In] {
-	return newFlatMapperWithHandler(mapper, from, NewManualSharedInformer())
+func newFlatMapper[Out, In any](lock LockGroup, mapper FlatMapFunc[Out, In], from cache.SharedInformer) *flatMapper[Out, In] {
+	handler := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
+	handler.SetName("flatMap-handler")
+	return newFlatMapperWithHandler(mapper, from, handler)
 }
 
-// newFlatMapperWithHandler creates a flatMapper with a specific handler.
-// This is useful in tests where a custom KeyFunc is needed for matching.
 func newFlatMapperWithHandler[Out, In any](mapper FlatMapFunc[Out, In], from cache.SharedInformer, handler ManualSharedInformer) *flatMapper[Out, In] {
 	m := &flatMapper[Out, In]{
 		handler: handler,
@@ -37,8 +35,6 @@ func newFlatMapperWithHandler[Out, In any](mapper FlatMapFunc[Out, In], from cac
 
 	m.registration, _ = from.AddEventHandler(m)
 
-	// Register a sync checker with the source. When it tells us
-	// we are synced update the handler to reflect this.
 	go func() {
 		check := m.registration.HasSyncedChecker()
 		syncedChan := check.Done()
@@ -49,23 +45,31 @@ func newFlatMapperWithHandler[Out, In any](mapper FlatMapFunc[Out, In], from cac
 	return m
 }
 
-func (m *flatMapper[Out, In]) Lock() *sync.Mutex {
-	return m.handler.(*manualInformer).Lock()
+func (m *flatMapper[Out, In]) GetLockGroup() LockGroup {
+	return m.handler.GetLockGroup()
 }
 
 func (m *flatMapper[O, I]) OnAdd(obj any, isInitial bool) {
+	m.handler.GetLockGroup().Lock()
+	defer m.handler.GetLockGroup().Unlock()
+	m.OnAddLocked(obj, isInitial)
+}
+
+func (m *flatMapper[O, I]) OnAddLocked(obj any, isInitial bool) {
 	input := obj.(I)
 	results, _ := m.mapper(input)
 	for _, r := range results {
-		m.handler.OnAdd(r, isInitial)
+		m.handler.OnAddLocked(r, isInitial)
 	}
 }
 
-// OnUpdate handles updates from the source informer by re-evaluating the mapping.
-// It uses the handler's KeyFunc to surgically match old and new results,
-// emitting OnUpdate for existing objects, OnDelete for removed ones,
-// and OnAdd for new ones.
 func (m *flatMapper[O, I]) OnUpdate(oldObj, newObj any) {
+	m.handler.GetLockGroup().Lock()
+	defer m.handler.GetLockGroup().Unlock()
+	m.OnUpdateLocked(oldObj, newObj)
+}
+
+func (m *flatMapper[O, I]) OnUpdateLocked(oldObj, newObj any) {
 	oldInput := oldObj.(I)
 	newInput := newObj.(I)
 	oldResults, _ := m.mapper(oldInput)
@@ -84,30 +88,34 @@ func (m *flatMapper[O, I]) OnUpdate(oldObj, newObj any) {
 		newKeys[key] = r
 	}
 
-	// Match old results against new results to minimize downstream churn.
 	for key, oldR := range oldKeys {
 		if newR, ok := newKeys[key]; ok {
-			m.handler.OnUpdate(oldR, newR)
+			m.handler.OnUpdateLocked(oldR, newR)
 			delete(newKeys, key)
 		} else {
-			m.handler.OnDelete(oldR)
+			m.handler.OnDeleteLocked(oldR)
 		}
 	}
-	// Remaining new keys were not in the old result set.
 	for _, newR := range newKeys {
-		m.handler.OnAdd(newR, false)
+		m.handler.OnAddLocked(newR, false)
 	}
 }
 
 func (m *flatMapper[O, I]) OnDelete(oldObj any) {
+	m.handler.GetLockGroup().Lock()
+	defer m.handler.GetLockGroup().Unlock()
+	m.OnDeleteLocked(oldObj)
+}
+
+func (m *flatMapper[O, I]) OnDeleteLocked(oldObj any) {
 	input := oldObj.(I)
 	results, _ := m.mapper(input)
 	for _, r := range results {
-		m.handler.OnDelete(r)
+		m.handler.OnDeleteLocked(r)
 	}
 }
 
-func (m *flatMapper[O, I]) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+func (m *flatMapper[Out, In]) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
 	return m.handler.AddEventHandler(h)
 }
 
@@ -116,7 +124,7 @@ func (m *flatMapper[Out, In]) AddEventHandlerWithResyncPeriod(handler cache.Reso
 }
 
 func (m *flatMapper[Out, In]) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
-	return m.handler.AddEventHandlerWithResyncPeriod(handler, 0) // Options not used in manual
+	return m.handler.AddEventHandlerWithOptions(handler, options)
 }
 
 func (m *flatMapper[Out, In]) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
@@ -127,12 +135,40 @@ func (m *flatMapper[Out, In]) HasSyncedChecker() cache.DoneChecker {
 	return m.handler.HasSyncedChecker()
 }
 
-func (m *flatMapper[Out, In]) Clone(source []cache.SharedInformer) CloneableSharedInformerQuery {
-	return newFlatMapper(m.mapper, source[0])
+// Clone creates a new instance.
+// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock).
+func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
+	newSource := newSources[0]
+	var newLock LockGroup
+	if q, ok := newSource.(CloneableSharedInformerQuery); ok {
+		newLock = q.GetLockGroup()
+	} else {
+		newLock = NewLockGroup()
+	}
+
+	p := m.handler.(*manualInformer)
+
+	newIndexer := cache.NewIndexer(p.keyFunc, cache.Indexers{})
+	list := p.indexer.List()
+	for _, obj := range list {
+		newIndexer.Add(obj)
+	}
+
+	newHandler := &manualInformer{
+		name:      p.name,
+		handlers:  map[int]cache.ResourceEventHandler{},
+		transform: p.transform,
+		hasSynced: p.hasSynced,
+		keyFunc:   p.keyFunc,
+		indexer:   newIndexer,
+		lock:      newLock,
+	}
+
+	return newFlatMapperWithHandler(m.mapper, newSource, newHandler)
 }
 
 func (m *flatMapper[Out, In]) GetStore() cache.Store {
-	return nil
+	return m.handler.GetStore()
 }
 
 func (m *flatMapper[Out, In]) GetController() cache.Controller {
@@ -169,4 +205,24 @@ func (m *flatMapper[Out, In]) HasSynced() bool {
 
 func (m *flatMapper[Out, In]) IsStopped() bool {
 	return m.handler.IsStopped()
+}
+
+func (m *flatMapper[Out, In]) SetIsStopped() {
+	m.handler.SetIsStopped()
+}
+
+func (m *flatMapper[Out, In]) SetHasSynced() {
+	m.handler.SetHasSynced()
+}
+
+func (m *flatMapper[Out, In]) GetKeyFunc() cache.KeyFunc {
+	return m.handler.GetKeyFunc()
+}
+
+func (m *flatMapper[Out, In]) TriggerWatchError(err error) {
+	m.handler.TriggerWatchError(err)
+}
+
+func (m *flatMapper[Out, In]) SetName(name string) {
+	m.handler.SetName(name)
 }
