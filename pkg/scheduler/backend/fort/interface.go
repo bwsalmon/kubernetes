@@ -169,6 +169,9 @@ type ManualSharedInformer interface {
 	SetHasSynced()
 	GetKeyFunc() cache.KeyFunc
 	TriggerWatchError(err error)
+
+	// AddEventHandlerNoReplay registers a handler without replaying current state.
+	AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error)
 }
 
 // NewManualSharedInformer creates a ManualSharedInformer with a default lock and keyfunc.

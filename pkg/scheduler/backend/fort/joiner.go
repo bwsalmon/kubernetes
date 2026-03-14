@@ -120,8 +120,8 @@ func (h leftHandler[L, R]) OnUpdate(oldObj, newObj any) {
 }
 
 func (h leftHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
-	oldLeft := oldObj.(L)
-	newLeft := newObj.(L)
+	oldLeft := objToL[L](oldObj)
+	newLeft := objToL[L](newObj)
 	oldKey := h.j.on(oldLeft, *new(R))
 	newKey := h.j.on(newLeft, *new(R))
 
@@ -177,6 +177,20 @@ func (h leftHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
 	}
 }
 
+func objToL[L any](obj any) L {
+	if l, ok := obj.(L); ok {
+		return l
+	}
+	return *new(L)
+}
+
+func objToR[R any](obj any) R {
+	if r, ok := obj.(R); ok {
+		return r
+	}
+	return *new(R)
+}
+
 func (h leftHandler[L, R]) OnDelete(obj any) {
 	h.j.handler.GetLockGroup().Lock()
 	defer h.j.handler.GetLockGroup().Unlock()
@@ -184,7 +198,7 @@ func (h leftHandler[L, R]) OnDelete(obj any) {
 }
 
 func (h leftHandler[L, R]) OnDeleteLocked(obj any) {
-	left := obj.(L)
+	left := objToL[L](obj)
 	key := h.j.on(left, *new(R))
 	keyStr, _ := DefaultKeyFunc(key)
 
@@ -222,7 +236,7 @@ func (h rightHandler[L, R]) OnAdd(obj any, isInitial bool) {
 }
 
 func (h rightHandler[L, R]) OnAddLocked(obj any, isInitial bool) {
-	right := obj.(R)
+	right := objToR[R](obj)
 	key := h.j.on(*new(L), right)
 	keyStr, _ := DefaultKeyFunc(key)
 
@@ -245,8 +259,8 @@ func (h rightHandler[L, R]) OnUpdate(oldObj, newObj any) {
 }
 
 func (h rightHandler[L, R]) OnUpdateLocked(oldObj, newObj any) {
-	oldRight := oldObj.(R)
-	newRight := newObj.(R)
+	oldRight := objToR[R](oldObj)
+	newRight := objToR[R](newObj)
 	oldKey := h.j.on(*new(L), oldRight)
 	newKey := h.j.on(*new(L), newRight)
 
@@ -309,7 +323,7 @@ func (h rightHandler[L, R]) OnDelete(obj any) {
 }
 
 func (h rightHandler[L, R]) OnDeleteLocked(obj any) {
-	right := obj.(R)
+	right := objToR[R](obj)
 	key := h.j.on(*new(L), right)
 	keyStr, _ := DefaultKeyFunc(key)
 
@@ -349,6 +363,10 @@ func (j *joiner[L, R]) AddEventHandlerWithOptions(handler cache.ResourceEventHan
 	return j.handler.AddEventHandlerWithOptions(handler, options)
 }
 
+func (j *joiner[L, R]) AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return j.handler.AddEventHandlerNoReplay(h)
+}
+
 func (j *joiner[L, R]) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
 	return j.handler.RemoveEventHandler(r)
 }
@@ -377,8 +395,16 @@ func (j *joiner[L, R]) Clone(newSources []cache.SharedInformer) CloneableSharedI
 		right:       j.right.Clone(), // Fast O(1) B-Tree clone
 	}
 
-	nj.leftRegistration, _ = nl.AddEventHandler(leftHandler[L, R]{nj})
-	nj.rightRegistration, _ = nr.AddEventHandler(rightHandler[L, R]{nj})
+	if ms, ok := nl.(ManualSharedInformer); ok {
+		nj.leftRegistration, _ = ms.AddEventHandlerNoReplay(leftHandler[L, R]{nj})
+	} else {
+		nj.leftRegistration, _ = nl.AddEventHandler(leftHandler[L, R]{nj})
+	}
+	if ms, ok := nr.(ManualSharedInformer); ok {
+		nj.rightRegistration, _ = ms.AddEventHandlerNoReplay(rightHandler[L, R]{nj})
+	} else {
+		nj.rightRegistration, _ = nr.AddEventHandler(rightHandler[L, R]{nj})
+	}
 
 	return nj
 }

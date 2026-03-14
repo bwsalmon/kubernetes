@@ -76,6 +76,14 @@ func (p *manualInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceE
 }
 
 func (p *manualInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
+	return p.addEventHandler(handler, true)
+}
+
+func (p *manualInformer) AddEventHandlerNoReplay(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return p.addEventHandler(handler, false)
+}
+
+func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, replay bool) (cache.ResourceEventHandlerRegistration, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -86,14 +94,16 @@ func (p *manualInformer) AddEventHandlerWithOptions(handler cache.ResourceEventH
 	}
 	p.handlers[p.nextHandlerId] = handler
 
-	// Atomic replay of current state
-	list := p.indexer.List()
-	for _, obj := range list {
-		// If handler supports Locked events, use them to avoid deadlock.
-		if m, ok := handler.(LockedResourceEventHandler); ok {
-			m.OnAddLocked(obj, true)
-		} else {
-			handler.OnAdd(obj, true)
+	if replay {
+		// Atomic replay of current state
+		list := p.indexer.List()
+		for _, obj := range list {
+			// If handler supports Locked events, use them to avoid deadlock.
+			if m, ok := handler.(LockedResourceEventHandler); ok {
+				m.OnAddLocked(obj, true)
+			} else {
+				handler.OnAdd(obj, true)
+			}
 		}
 	}
 

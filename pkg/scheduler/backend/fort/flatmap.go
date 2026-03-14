@@ -33,6 +33,7 @@ func newFlatMapperWithHandler[Out, In any](mapper FlatMapFunc[Out, In], from cac
 		source:  from,
 	}
 
+	// Initial registration from constructor still replays
 	m.registration, _ = from.AddEventHandler(m)
 
 	go func() {
@@ -127,6 +128,10 @@ func (m *flatMapper[Out, In]) AddEventHandlerWithOptions(handler cache.ResourceE
 	return m.handler.AddEventHandlerWithOptions(handler, options)
 }
 
+func (m *flatMapper[Out, In]) AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return m.handler.AddEventHandlerNoReplay(h)
+}
+
 func (m *flatMapper[Out, In]) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
 	return m.handler.RemoveEventHandler(r)
 }
@@ -149,7 +154,20 @@ func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) Cloneable
 	newHandler := m.handler.Clone(nil).(ManualSharedInformer)
 	newHandler.(*manualInformer).lock = newLock
 
-	return newFlatMapperWithHandler(m.mapper, newSource, newHandler)
+	// Optimize: Use NoReplay during cloning
+	cloned := &flatMapper[Out, In]{
+		handler: newHandler,
+		mapper:  m.mapper,
+		source:  newSource,
+	}
+
+	if ms, ok := newSource.(ManualSharedInformer); ok {
+		cloned.registration, _ = ms.AddEventHandlerNoReplay(cloned)
+	} else {
+		cloned.registration, _ = newSource.AddEventHandler(cloned)
+	}
+
+	return cloned
 }
 
 func (m *flatMapper[Out, In]) GetStore() cache.Store {

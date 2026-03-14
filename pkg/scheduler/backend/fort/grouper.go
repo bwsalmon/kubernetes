@@ -170,7 +170,7 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 		g.handler.OnDeleteLocked(oldOut)
 	} else {
 		newOut, _ := g.sel(newFields)
-		newState.lastOut = newOut
+		state.lastOut = newOut
 		g.groups.Set(keyStr, &newState)
 		g.handler.OnUpdateLocked(oldOut, newOut)
 	}
@@ -256,6 +256,10 @@ func (g *grouper[Out, In]) AddEventHandlerWithOptions(handler cache.ResourceEven
 	return g.handler.AddEventHandlerWithOptions(handler, options)
 }
 
+func (g *grouper[Out, In]) AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return g.handler.AddEventHandlerNoReplay(h)
+}
+
 func (g *grouper[Out, In]) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
 	return g.handler.RemoveEventHandler(r)
 }
@@ -282,7 +286,11 @@ func (g *grouper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSha
 		groups:  g.groups.Clone(), // Fast O(1) B-Tree clone
 	}
 
-	ng.registration, _ = ns.AddEventHandler(ng)
+	if ms, ok := ns.(ManualSharedInformer); ok {
+		ng.registration, _ = ms.AddEventHandlerNoReplay(ng)
+	} else {
+		ng.registration, _ = ns.AddEventHandler(ng)
+	}
 
 	return ng
 }
