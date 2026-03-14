@@ -30,6 +30,10 @@ type groupState[Out any] struct {
 	count   int
 	fields  []any
 	lastOut Out // The last object emitted for this group, used for OnUpdate.
+
+	// Track all AnyValues in the group to allow picking a new one on deletion.
+	// Indexed by field index -> value -> count.
+	anyValues map[int]map[any]int
 }
 
 func newGrouper[Out, In any](lock LockGroup, sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In]) *grouper[Out, In] {
@@ -85,6 +89,18 @@ func (g *grouper[Out, In]) OnAddLocked(obj any, isInitial bool) {
 	if ok {
 		newState = *state
 		newState.fields = append([]any(nil), state.fields...)
+		// Clone anyValues map of maps
+		newAnyValues := make(map[int]map[any]int, len(state.anyValues))
+		for k, v := range state.anyValues {
+			newInner := make(map[any]int, len(v))
+			for ik, iv := range v {
+				newInner[ik] = iv
+			}
+			newAnyValues[k] = newInner
+		}
+		newState.anyValues = newAnyValues
+	} else {
+		newState.anyValues = make(map[int]map[any]int)
 	}
 
 	newFields := g.evaluateFields(fields, &newState, input, true)
@@ -124,6 +140,15 @@ func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
 		// COW: Create a new state
 		newState := *state
 		newState.fields = append([]any(nil), state.fields...)
+		newAnyValues := make(map[int]map[any]int, len(state.anyValues))
+		for k, v := range state.anyValues {
+			newInner := make(map[any]int, len(v))
+			for ik, iv := range v {
+				newInner[ik] = iv
+			}
+			newAnyValues[k] = newInner
+		}
+		newState.anyValues = newAnyValues
 
 		g.evaluateFields(oldFields, &newState, oldInput, false)
 		resFields := g.evaluateFields(newFields, &newState, newInput, true)
@@ -162,6 +187,15 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 	// COW: Create a new state
 	newState := *state
 	newState.fields = append([]any(nil), state.fields...)
+	newAnyValues := make(map[int]map[any]int, len(state.anyValues))
+	for k, v := range state.anyValues {
+		newInner := make(map[any]int, len(v))
+		for ik, iv := range v {
+			newInner[ik] = iv
+		}
+		newAnyValues[k] = newInner
+	}
+	newState.anyValues = newAnyValues
 
 	newFields := g.evaluateFields(fields, &newState, input, false)
 
@@ -170,7 +204,7 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 		g.handler.OnDeleteLocked(oldOut)
 	} else {
 		newOut, _ := g.sel(newFields)
-		state.lastOut = newOut
+		newState.lastOut = newOut
 		g.groups.Set(keyStr, &newState)
 		g.handler.OnUpdateLocked(oldOut, newOut)
 	}
@@ -231,8 +265,27 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			}
 			res[i] = distincts
 		} else if gf.anyValue != nil {
-			state.fields[i] = gf.anyValue
-			res[i] = gf.anyValue
+			m := state.anyValues[i]
+			if m == nil {
+				m = make(map[any]int)
+				state.anyValues[i] = m
+			}
+			if adding {
+				m[gf.anyValue]++
+			} else {
+				m[gf.anyValue]--
+				if m[gf.anyValue] == 0 {
+					delete(m, gf.anyValue)
+				}
+			}
+			// Pick one value from the remaining set
+			var picked any
+			for k := range m {
+				picked = k
+				break
+			}
+			state.fields[i] = picked
+			res[i] = picked
 		} else if gf.key != nil {
 			res[i] = gf.key
 		}
