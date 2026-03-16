@@ -48,7 +48,7 @@ type btreeMap[V any] struct {
 // NewBTreeMap creates a new B-Tree based cloneable map.
 func NewBTreeMap[V any]() BTreeMap[V] {
 	return &btreeMap[V]{
-		tree: btree.New(2, btreeMapItemLess[V]),
+		tree: btree.New(32, btreeMapItemLess[V]),
 	}
 }
 
