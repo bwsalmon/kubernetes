@@ -65,3 +65,25 @@ To ensure consistency when taking snapshots across multiple related informers, u
 
 ### Object Identity
 Objects emitted by `ManualSharedInformer` or query informers should have a consistent identity. By default, Fort uses `cache.MetaNamespaceKeyFunc`, but custom `KeyFunc` implementations can be provided during informer creation to support non-Kubernetes-resource types.
+
+## Performance and Memory Overhead
+
+Fort is designed for high-performance simulations where cloning entire query pipelines must be nearly instantaneous and memory-efficient.
+
+### Memory Efficiency
+Based on automated benchmarks (see `memory_test.go`), the memory overhead for various operations is as follows:
+
+| Operation | Scale | Total Memory | Overhead per Unit |
+| :--- | :--- | :--- | :--- |
+| **Source Only** | 100,000 items | 19.93 MB | ~209 bytes/item |
+| **Source + Select** | 100,000 items | 39.95 MB | ~419 bytes/item |
+| **Source + FlatMap (1:2)** | 100,000 items | 61.09 MB | ~641 bytes/item |
+| **2 Sources + Join** | 100,000 items each | 125.24 MB | ~1313 bytes/result |
+| **Source + GroupBy** | 100,000 items / 1000 groups | 20.21 MB | ~212 bytes/item |
+| **Cloning** | 1000 clones of 10,000 items | 0.47 MB | ~494 bytes/clone |
+
+### Cloning Latency
+Fort leverages B-Tree structural cloning (Copy-on-Write) to achieve O(1) snapshots of entire query domains.
+- **Cloning Latency**: ~2-3µs for a pipeline containing 1,000,000 items.
+- **Update Propagation**: ~65µs per update at 1,000,000 items scale.
+
