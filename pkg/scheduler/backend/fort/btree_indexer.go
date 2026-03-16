@@ -2,6 +2,7 @@ package fort
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"k8s.io/client-go/tools/cache"
@@ -40,6 +41,7 @@ func btreeMapItemLess[V any](a, b btreeMapItem[V]) bool {
 }
 
 type btreeMap[V any] struct {
+	mu   sync.RWMutex
 	tree *btree.BTree[btreeMapItem[V]]
 }
 
@@ -51,6 +53,8 @@ func NewBTreeMap[V any]() BTreeMap[V] {
 }
 
 func (m *btreeMap[V]) Get(key string) (V, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	it, ok := m.tree.Get(btreeMapItem[V]{key: key})
 	if !ok {
 		var zero V
@@ -60,14 +64,20 @@ func (m *btreeMap[V]) Get(key string) (V, bool) {
 }
 
 func (m *btreeMap[V]) Set(key string, val V) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.tree.ReplaceOrInsert(btreeMapItem[V]{key: key, val: val})
 }
 
 func (m *btreeMap[V]) Delete(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.tree.Delete(btreeMapItem[V]{key: key})
 }
 
 func (m *btreeMap[V]) List() []V {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	res := make([]V, 0, m.tree.Len())
 	m.tree.Ascend(func(item btreeMapItem[V]) bool {
 		res = append(res, item.val)
@@ -77,6 +87,8 @@ func (m *btreeMap[V]) List() []V {
 }
 
 func (m *btreeMap[V]) ListKeys() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	res := make([]string, 0, m.tree.Len())
 	m.tree.Ascend(func(item btreeMapItem[V]) bool {
 		res = append(res, item.key)
@@ -86,6 +98,8 @@ func (m *btreeMap[V]) ListKeys() []string {
 }
 
 func (m *btreeMap[V]) Clone() BTreeMap[V] {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return &btreeMap[V]{
 		// tree.Clone() is O(1) structural copy.
 		tree: m.tree.Clone(),
@@ -93,6 +107,8 @@ func (m *btreeMap[V]) Clone() BTreeMap[V] {
 }
 
 func (m *btreeMap[V]) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.tree.Len()
 }
 

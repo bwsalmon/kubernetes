@@ -66,7 +66,9 @@ func TestOperator_RegistrationLeak(t *testing.T) {
 	// Get internal informer to check handlers count
 	si := source.(*manualInformer)
 
+	si.lock.RLock()
 	initialHandlers := len(si.handlers)
+	si.lock.RUnlock()
 	
 	for i := 0; i < 100; i++ {
 		// Clone
@@ -81,7 +83,9 @@ func TestOperator_RegistrationLeak(t *testing.T) {
 		time.Sleep(1 * time.Millisecond)
 	}
 
+	si.lock.RLock()
 	finalHandlers := len(si.handlers)
+	si.lock.RUnlock()
 	if finalHandlers > initialHandlers {
 		t.Errorf("Registration leak detected! Handlers count grew from %d to %d", initialHandlers, finalHandlers)
 	}
