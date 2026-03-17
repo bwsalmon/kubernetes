@@ -9,7 +9,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// baseInformer implements common SharedInformer logic without storage.
+// baseInformer implements common SharedInformer logic (registration, sync propagation, 
+// error handling) without providing its own storage.
+// It is designed to be embedded in specialized informers (manualInformer, queries).
 type baseInformer struct {
 	name string
 
@@ -33,12 +35,17 @@ type baseInformer struct {
 	watchErrorHandler            cache.WatchErrorHandler
 	watchErrorHandlerWithContext cache.WatchErrorHandlerWithContext
 
-	// parent is the outer informer (e.g. manualInformer or a query informer).
-	// This allows baseInformer to delegate store-related calls back to the outer struct.
+	// parent is the outer informer that embeds this baseInformer.
+	// It allows baseInformer to delegate store-related calls (like GetStore()) 
+	// back to the specialized implementation, ensuring that even if a query 
+	// doesn't use standard BTree storage, baseInformer's registration 
+	// logic (like atomic replay) still works correctly.
 	parent ManualSharedInformer
 }
 
-// manualInformer implements ManualSharedInformer using a shared LockGroup and a B-Tree indexer.
+// manualInformer implements ManualSharedInformer using a shared LockGroup 
+// and a standard B-Tree indexer for storage. It is the primary "leaf" source 
+// for Fort query pipelines.
 type manualInformer struct {
 	*baseInformer
 	indexer CloneableIndexer

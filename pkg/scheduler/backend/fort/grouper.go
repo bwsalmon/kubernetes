@@ -8,6 +8,7 @@ import (
 
 // grouper implements GroupBy query. It aggregates objects from a source informer
 // into groups identified by a comparable key and evaluates aggregate fields.
+// It embeds baseInformer to handle event routing and state propagation.
 type grouper[Out, In any] struct {
 	*baseInformer
 	sel     GroupSelectFunc[Out]
@@ -347,6 +348,8 @@ func (g *grouper[Out, In]) GetSources() []cache.SharedInformer {
 	return []cache.SharedInformer{g.source}
 }
 
+// grouperIndexer implements cache.Store by wrapping the grouper's internal 
+// groups B-Tree. It avoids maintaining a redundant index of Out objects.
 type grouperIndexer[Out any] struct {
 	groups  BTreeMap[*groupState[Out]]
 	keyFunc cache.KeyFunc

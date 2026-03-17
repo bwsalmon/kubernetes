@@ -7,6 +7,8 @@ import (
 )
 
 // joiner implements a many-to-many join between two source informers.
+// It maintains internal B-Trees of join sets to allow fast multi-match lookups.
+// It embeds baseInformer to handle downstream event propagation.
 type joiner[L, R any] struct {
 	*baseInformer
 	on      JoinOnFunc[L, R]
@@ -333,6 +335,9 @@ func (j *joiner[L, R]) GetSources() []cache.SharedInformer {
 	return []cache.SharedInformer{j.leftSource, j.rightSource}
 }
 
+// joinerIndexer implements cache.Store by computing join results on the fly 
+// from the left and right B-Trees. This avoids the O(N^2) memory cost of 
+// storing all joined pairs explicitly, at the cost of O(N) lookup in GetByKey.
 type joinerIndexer[L, R any] struct {
 	left    BTreeMap[[]L]
 	right   BTreeMap[[]R]

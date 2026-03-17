@@ -5,8 +5,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// flatMapper implements FlatMap query by applying a mapping function to each object
-// from a source informer. It uses a shared LockGroup for transactional consistency.
+// flatMapper implements FlatMap query by applying a 1:N mapping function to each 
+// object from a source informer. It embeds baseInformer for event management.
+// When an input object is updated, flatMapper reconciles the old and new sets 
+// of mapped outputs to emit minimal downstream events.
 type flatMapper[Out, In any] struct {
 	*baseInformer
 	mapper       FlatMapFunc[Out, In]

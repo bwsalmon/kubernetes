@@ -62,7 +62,8 @@ type CloneableSharedInformerQuery interface {
 	//
 	// REQUIRES: The caller MUST hold the shared LockGroup of the parent. 
 	// For most query types, an RLock is sufficient, but ManualSharedInformer 
-	// requires an exclusive Lock to safely clone its underlying indexer.
+	// and queries that use structural COW cloning (B-Trees) require an 
+	// exclusive Lock to safely clone their underlying indexers.
 	Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery
 	// GetLockGroup returns the shared lock used by this informer domain.
 	GetLockGroup() LockGroup
@@ -245,8 +246,10 @@ func (ls *domainLock) Unlock() {
 }
 
 // ClonePipeline recursively clones a query DAG starting from root, replacing leaf sources.
-// The memo map should initially contain leaf replacements (Source -> ClonedSource)
-// and will be populated with cloned intermediate stages to handle shared query branches (Diamond DAGs).
+// It ensures that shared branches in the DAG are only cloned once (memoization).
+// 
+// REQUIRES: The caller MUST hold an exclusive lock on the LockGroup of the root informer
+// (and thus the entire domain) before calling this, as it triggers structural B-Tree clones.
 func ClonePipeline(root cache.SharedInformer, memo map[cache.SharedInformer]cache.SharedInformer) cache.SharedInformer {
 	return clonePipelineRecursive(root, memo, 0)
 }
