@@ -82,6 +82,11 @@ func (m *flatMapper[O, I]) OnUpdateLocked(oldObj, newObj any) {
 	oldResults, _ := m.mapper(oldInput)
 	newResults, _ := m.mapper(newInput)
 
+	// In FlatMap, one input object can map to many output objects.
+	// When the input is updated, we need to reconcile the old set of outputs 
+	// with the new set. To minimize downstream churn, we match objects by key
+	// and emit surgical OnUpdate events for persisting objects, while only
+	// emitting OnAdd/OnDelete for truly new or removed items.
 	keyFunc := m.handler.GetKeyFunc()
 	oldKeys := make(map[string]O)
 	for _, r := range oldResults {
@@ -97,12 +102,15 @@ func (m *flatMapper[O, I]) OnUpdateLocked(oldObj, newObj any) {
 
 	for key, oldR := range oldKeys {
 		if newR, ok := newKeys[key]; ok {
+			// Object still exists: propagate as an Update.
 			m.handler.OnUpdateLocked(oldR, newR)
 			delete(newKeys, key)
 		} else {
+			// Object was removed from the mapping result.
 			m.handler.OnDeleteLocked(oldR)
 		}
 	}
+	// Any remaining items in newKeys are truly new additions.
 	for _, newR := range newKeys {
 		m.handler.OnAddLocked(newR, false)
 	}

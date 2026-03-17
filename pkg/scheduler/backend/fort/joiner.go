@@ -133,7 +133,10 @@ func (j *joiner[L, R]) onLeftAdd(left L, isInitial bool) {
 	key := j.on(left, *new(R))
 	keyStr, _ := DefaultKeyFunc(key)
 
-	// COW: Shallow-clone the existing slice before updating to protect snapshots.
+	// B-Trees provide COW for the tree structure, but the values (slices of L/R)
+	// are shared. To maintain snapshot isolation, we MUST shallow-clone the 
+	// existing slice before appending the new item. This ensures that a 
+	// concurrent reader of a cloned pipeline still sees the old, immutable slice.
 	items, _ := j.left.Get(keyStr)
 	newItems := append(append([]L(nil), items...), left)
 	j.left.Set(keyStr, newItems)
@@ -158,6 +161,7 @@ func (j *joiner[L, R]) onLeftUpdate(oldLeft, newLeft L) {
 			}
 		}
 		// COW: Update the stored object in the left map by cloning the slice.
+		// Even if only one item changes, we clone the entire slice to protect snapshots.
 		slice, _ := j.left.Get(keyStr)
 		newSlice := append([]L(nil), slice...)
 		for i, v := range newSlice {
@@ -202,7 +206,7 @@ func (j *joiner[L, R]) onRightAdd(right R, isInitial bool) {
 	key := j.on(*new(L), right)
 	keyStr, _ := DefaultKeyFunc(key)
 
-	// COW: Shallow-clone the existing slice.
+	// COW: Shallow-clone the existing slice to maintain snapshot isolation.
 	items, _ := j.right.Get(keyStr)
 	newItems := append(append([]R(nil), items...), right)
 	j.right.Set(keyStr, newItems)
@@ -225,7 +229,7 @@ func (j *joiner[L, R]) onRightUpdate(oldRight, newRight R) {
 				j.handler.OnUpdateLocked(JoinValue[L, R]{Left: left, Right: oldRight}, JoinValue[L, R]{Left: left, Right: newRight})
 			}
 		}
-		// COW: Update the stored object.
+		// COW: Update the stored object by cloning the entire slice.
 		slice, _ := j.right.Get(keyStr)
 		newSlice := append([]R(nil), slice...)
 		for i, v := range newSlice {

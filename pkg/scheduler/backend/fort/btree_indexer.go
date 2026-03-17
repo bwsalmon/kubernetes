@@ -17,9 +17,15 @@ type CloneableIndexer interface {
 
 // BTreeMap is a generic fast-cloneable map with string keys.
 // It uses a B-Tree to provide O(1) structural cloning via Copy-on-Write (COW).
-// IMPORTANT: While the B-Tree structure is COW, the values stored inside are NOT automatically
-// deep-copied. Handlers must perform manual COW (shallow copy) on complex values (slices, maps, structs)
-// before updating them in the tree to ensure snapshot isolation.
+// 
+// IMPORTANT: The B-Tree structure itself is COW, meaning that tree.Clone() 
+// is very fast and doesn't duplicate the data. However, the VALUES stored inside 
+// the tree are NOT automatically deep-copied. 
+//
+// If you store complex types like slices, maps, or pointers to structs, you 
+// MUST perform a manual COW (e.g., shallow-clone the slice) BEFORE updating 
+// a value in the tree. This ensures that existing snapshots of the tree 
+// remain immutable and consistent.
 type BTreeMap[V any] interface {
 	Get(key string) (V, bool)
 	Set(key string, val V)

@@ -175,19 +175,28 @@ func NewPodSpreadLiteInfo(podInformer, serviceInformer, nodeInformer ManualShare
 func (d *PodSpreadLiteInfo) Clone() *PodSpreadLiteInfo {
 	nd := &PodSpreadLiteInfo{}
 
+	// To create a consistent snapshot of the entire query DAG, we must first 
+	// acquire an exclusive lock on the entire Domain. 
+	// SnapshotLockDomain identifies the shared LockGroup from the provided informers.
 	locks := SnapshotLockDomain(d.ServiceNodes, d.NodeDomains, d.ServiceDomains, d.ServiceInfo)
 	defer locks.Unlock()
 
+	// 1. Manually clone the leaf sources.
 	nd.PodUpdates = d.PodUpdates.Clone(nil).(ManualSharedInformer)
 	nd.ServiceUpdates = d.ServiceUpdates.Clone(nil).(ManualSharedInformer)
 	nd.NodeUpdates = d.NodeUpdates.Clone(nil).(ManualSharedInformer)
 
+	// 2. Prepare a memo map with the leaf replacements. 
+	// This map ensures that intermediate query stages are only cloned once,
+	// correctly handling "Diamond DAGs" where multiple queries share a source.
 	memo := map[cache.SharedInformer]cache.SharedInformer{
 		d.PodUpdates:     nd.PodUpdates,
 		d.ServiceUpdates: nd.ServiceUpdates,
 		d.NodeUpdates:    nd.NodeUpdates,
 	}
 
+	// 3. Use ClonePipeline to recursively perform O(1) structural clones of all
+	// intermediate query stages, attaching them to the new sources.
 	nd.ServiceNodes = ClonePipeline(d.ServiceNodes, memo).(CloneableSharedInformerQuery)
 	nd.NodeDomains = ClonePipeline(d.NodeDomains, memo).(CloneableSharedInformerQuery)
 	nd.ServiceDomains = ClonePipeline(d.ServiceDomains, memo).(CloneableSharedInformerQuery)

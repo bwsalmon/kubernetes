@@ -26,13 +26,21 @@ var _ ManualSharedInformer = &grouper[int, int]{}
 var _ LockedResourceEventHandler = &grouper[int, int]{}
 
 // groupState maintains the current aggregation state for a single group.
+// It is stored in a B-Tree and must be treated as immutable once stored to support 
+// structural cloning. Any update to a group's state must first clone the state
+// object (including its internal collections like anyValues and distinct maps).
 type groupState[Out any] struct {
+	// count is the total number of items currently belonging to this group.
 	count   int
+	// fields stores the current accumulated values for each GroupField.
 	fields  []any
-	lastOut Out // The last object emitted for this group, used for OnUpdate.
+	// lastOut is the last object emitted by this group. Used to generate OnUpdate events.
+	lastOut Out
 
-	// Track all AnyValues in the group to allow picking a new one on deletion.
-	// Indexed by field index -> value -> count.
+	// anyValues tracks all occurrences of AnyValue fields in the group.
+	// Indexed by: FieldIndex -> Value -> ReferenceCount.
+	// This allows picking a valid alternative value when the currently "picked"
+	// AnyValue is deleted from the group.
 	anyValues map[int]map[any]int
 }
 
@@ -211,6 +219,9 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 }
 
 // evaluateFields calculates or updates the values of aggregate fields for a group.
+// It modifies the provided groupState in-place (assumes state was already cloned if needed).
+// The 'adding' boolean indicates if we are adding a new object to the group (true) 
+// or removing an old one (false).
 func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState[Out], input In, adding bool) []GroupField {
 	if state.fields == nil {
 		state.fields = make([]any, len(fields))
@@ -228,6 +239,7 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 		if gf.count {
 			res[i] = int64(state.count)
 		} else if gf.sum != nil {
+			// Sum aggregator: maintains a running total.
 			if state.fields[i] == nil {
 				state.fields[i] = int64(0)
 			}
@@ -239,10 +251,11 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			}
 			res[i] = state.fields[i]
 		} else if gf.distinct != nil {
+			// Distinct aggregator: maintains a set of unique values.
 			if state.fields[i] == nil {
 				state.fields[i] = make(map[any]int)
 			}
-			// COW for the distinct map
+			// COW for the distinct map to ensure isolation for existing snapshots.
 			m := state.fields[i].(map[any]int)
 			newM := make(map[any]int, len(m))
 			for k, v := range m {
@@ -265,6 +278,7 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			}
 			res[i] = distincts
 		} else if gf.anyValue != nil {
+			// AnyValue aggregator: picks one arbitrary value from the group.
 			if state.anyValues == nil {
 				state.anyValues = make(map[int]map[any]int)
 			}
@@ -281,7 +295,8 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 					delete(m, gf.anyValue)
 				}
 			}
-			// Pick one value from the remaining set
+			// Pick one value from the remaining set (non-deterministic but consistent 
+			// until the set of available values changes).
 			var picked any
 			for k := range m {
 				picked = k
@@ -290,6 +305,7 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			state.fields[i] = picked
 			res[i] = picked
 		} else if gf.key != nil {
+			// Static key field (e.g., from the GroupBy key).
 			res[i] = gf.key
 		}
 	}

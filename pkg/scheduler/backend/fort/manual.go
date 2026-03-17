@@ -99,9 +99,10 @@ func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, rep
 
 	if replay {
 		// Atomic replay of current state to ensure the new handler is fully hydrated.
+		// Since we hold the exclusive lock, the replayed state is consistent.
 		list := p.indexer.List()
 		for _, obj := range list {
-			// Use dispatchEvent to handle Locked handlers correctly.
+			// Use dispatchEvent to handle Locked handlers correctly and avoid re-entrant deadlocks.
 			p.dispatchEvent(handler, 
 				func(h cache.ResourceEventHandler) { h.OnAdd(obj, true) }, 
 				func(l LockedResourceEventHandler) { l.OnAddLocked(obj, true) })
@@ -112,7 +113,12 @@ func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, rep
 }
 
 // dispatchEvent selects the appropriate handler method based on whether the handler
-// supports the Locked interface (to avoid re-entrant deadlocks on the shared LockGroup).
+// supports the Locked interface. 
+// 
+// Internal Fort query stages implement LockedResourceEventHandler to allow 
+// processing events WITHOUT re-acquiring the shared LockGroup. This is critical 
+// for avoiding re-entrant deadlocks, as the event emitter (like manualInformer) 
+// already holds the lock.
 func (p *manualInformer) dispatchEvent(h cache.ResourceEventHandler, std func(cache.ResourceEventHandler), locked func(LockedResourceEventHandler)) {
 	defer utilruntime.HandleCrash()
 	if m, ok := h.(LockedResourceEventHandler); ok {
@@ -315,10 +321,13 @@ func (p *manualInformer) OnDeleteLocked(oldObj any) {
 	}
 }
 
-// Clone creates a new instance.
-// REQUIRES: Caller must hold the shared LockGroup (Lock, exclusive). 
-// Exclusive lock is required because B-Tree structural cloning is not thread-safe for 
-// concurrent read-only clones.
+// Clone creates a new instance of the manualInformer.
+//
+// REQUIRES: The caller MUST hold the shared LockGroup exclusively (p.lock.Lock()). 
+// This is because structural cloning of the underlying B-Tree indexer is NOT 
+// thread-safe against concurrent read-only clones, even if they don't mutate 
+// the data. The exclusive lock ensures that the cloning process completes 
+// without interference.
 func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformerQuery {
 	newInformer := &manualInformer{
 		name:                    p.name,

@@ -26,9 +26,13 @@ func UnwrapDeleted(obj any) any {
 	return obj
 }
 
-// LockGroup manages a shared RWMutex for a connected set of query informers (a Domain).
-// In Fort, an entire query DAG (from sources to final aggregates) should share a single
-// LockGroup to ensure transactional consistency across the domain.
+// LockGroup manages a shared RWMutex for a connected set of query informers (a "Domain").
+// In Fort, an entire query Directed Acyclic Graph (DAG)—from leaf sources to final aggregates—
+// should share a single LockGroup. This shared lock ensures transactional consistency 
+// across the domain during complex updates and snapshots. 
+// When a source informer receives an event, the entire propagation through the DAG 
+// happens under this lock, ensuring that at any point, a reader sees a consistent 
+// state across all stages of the pipeline.
 type LockGroup interface {
 	RLock()
 	RUnlock()
@@ -45,12 +49,20 @@ func NewLockGroup() LockGroup {
 	return &lockGroup{}
 }
 
-// CloneableSharedInformerQuery is a shared informer defined by a query that can be cloned.
-// Clones are "born hydrated" via Copy-on-Write (COW) data structures, enabling O(1) snapshots.
+// CloneableSharedInformerQuery is a shared informer defined by a query that supports 
+// high-performance cloning. Clones are "born hydrated," meaning they inherit the 
+// full current state of their parent via O(1) Copy-on-Write (COW) structural 
+// cloning of the underlying B-Trees. This allows creating consistent snapshots 
+// of complex query pipelines nearly instantaneously, regardless of dataset size.
 type CloneableSharedInformerQuery interface {
 	cache.SharedInformer
 	// Clone creates a new instance of the query using the provided new sources.
-	// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
+	// The cloned informer starts with the exact same data state as the parent 
+	// at the moment of cloning.
+	//
+	// REQUIRES: The caller MUST hold the shared LockGroup of the parent. 
+	// For most query types, an RLock is sufficient, but ManualSharedInformer 
+	// requires an exclusive Lock to safely clone its underlying indexer.
 	Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery
 	// GetLockGroup returns the shared lock used by this informer domain.
 	GetLockGroup() LockGroup
