@@ -10,7 +10,7 @@ All queries return a `CloneableSharedInformerQuery`, which extends the standard 
 ### Operators
 - **Select**: Basic transformation and filtering (one-to-one).
 - **FlatMap**: One-to-many transformations. Useful for expanding nested collections or generating multiple derived objects from one source.
-- **Join**: Many-to-many joins between two informers. Supports custom join keys (standardized as comparable arrays) and join filters.
+- **Join**: Many-to-many joins between two informers. Supports custom join keys and join filters.
 - **GroupBy**: Aggregates objects from a source informer into groups. Supports:
     - `Count()`: Number of items in a group.
     - `Sum(val)`: Sum of a specific field.
@@ -43,8 +43,8 @@ serviceNodes := QueryInformer(&GroupByJoin[*TServiceNode, *TPod, *TService]{
     From: podInformer,
     Join: serviceInformer,
     On: func(pod *TPod, svc *TService) any {
-        // Return a comparable array as the join key
-        return [1]string{svc.Name} 
+        // Return a comparable value as the join key
+        return svc.Name 
     },
     GroupBy: func(pod *TPod, svc *TService) (any, []GroupField) {
         // Group by [Service, Node]
@@ -60,46 +60,45 @@ serviceNodes := QueryInformer(&GroupByJoin[*TServiceNode, *TPod, *TService]{
 
 ## Implementation Details
 
-### Locking
-To ensure consistency when taking snapshots across multiple related informers, use `LockInformerSet`. This utility locks all underlying mutexes in a deterministic order and provides a single `Unlock()` call.
+### Shared Domain Locking
+Fort informers that are part of the same query pipeline share a `LockGroup`. This ensures transactional consistency across the entire Directed Acyclic Graph (DAG) during event propagation and snapshots.
 
-### Object Identity
-Objects emitted by `ManualSharedInformer` or query informers should have a consistent identity. By default, Fort uses `cache.MetaNamespaceKeyFunc`, but custom `KeyFunc` implementations can be provided during informer creation to support non-Kubernetes-resource types.
+To safely clone a pipeline, use `SnapshotLockDomain(rootInformer)`. This acquires an exclusive lock on the entire domain, enabling a consistent O(1) structural clone of the underlying B-Trees.
+
+### Storage Optimization
+Fort queries are designed to be memory-efficient. Instead of maintaining redundant indexes for every stage of the pipeline, specialized informers like `Join` and `GroupBy` implement custom indexers that wrap their internal state:
+- **Join**: Computes join results on-the-fly from its internal left/right B-Trees, avoiding the O(N^2) memory overhead of storing joined pairs.
+- **GroupBy**: Directly serves results from its internal aggregation state.
+
+This architecture is enabled by a `baseInformer` base class that provides standard event routing and registration logic without mandating a specific storage backend.
 
 ## Performance and Memory Overhead
 
-Fort is designed for high-performance simulations where cloning entire query pipelines must be nearly instantaneous and memory-efficient.
+Fort is optimized for high-performance simulations where cloning entire query pipelines must be nearly instantaneous and memory-efficient.
 
 ### Memory Efficiency
 Based on automated benchmarks (see `memory_test.go`), the memory overhead for various operations is as follows:
 
 | Operation | Scale | Total Memory | Overhead per Unit |
 | :--- | :--- | :--- | :--- |
-| **Source Only** | 100,000 items | 9.34 MB | ~98 bytes/item |
-| **Source + Select** | 100,000 items | 18.74 MB | ~197 bytes/item |
+| **Source Only** | 100,000 items | 9.33 MB | ~98 bytes/item |
+| **Source + Select** | 100,000 items | 18.75 MB | ~197 bytes/item |
 | **Source + FlatMap (1:2)** | 100,000 items | 26.76 MB | ~281 bytes/item |
-| **2 Sources + Join** | 100,000 items each | 60.24 MB | ~632 bytes/result |
-| **Source + GroupBy** | 100,000 items / 1000 groups | 9.50 MB | ~100 bytes/item |
-| **Cloning** | 1000 clones of 10,000 items | 0.49 MB | ~511 bytes/clone |
+| **2 Sources + Join** | 100,000 items each | 49.35 MB | ~517 bytes/joined-result |
+| **Source + GroupBy** | 100,000 items / 1000 groups | 9.49 MB | ~99 bytes/item |
+| **Cloning** | 1000 clones of 10,000 items | 0.53 MB | ~557 bytes/clone |
+
+*Note: Join memory overhead was reduced by ~18% through on-the-fly result computation.*
 
 ### Cloning Latency
 Fort leverages B-Tree structural cloning (Copy-on-Write) and specialized "NoReplay" event registration to achieve O(1) snapshots of entire query domains.
 
-#### Detailed Benchmark Results
-The following results were collected on an AMD EPYC 7B13:
-
-```text
-BenchmarkCloningPerformance/Size10000-128      	  745552	      1688 ns/op
-
-BenchmarkThroughput/Depth1/Size10000-128       	  245874	      5572 ns/op
-BenchmarkThroughput/Depth3/Size10000-128       	  136897	     10708 ns/op
-BenchmarkThroughput/Depth5/Size10000-128       	  102446	     13686 ns/op
-
-BenchmarkJoinPerformance/Size5000-128          	   88474	     19748 ns/op
-```
+#### Scalability at 1M+ Items
+At a scale of 1,000,000 items, Fort maintains exceptional performance:
+- **Cloning Latency**: ~2.8 microseconds per snapshot.
+- **Update Latency**: ~28 microseconds for full propagation through a multi-stage pipeline.
 
 #### Key Observations
-1.  **Instantaneous O(1) Cloning**: By combining B-Tree structural COW with "NoReplay" registration, pipeline cloning is independent of dataset size. Cloning a pipeline with 1,000,000 objects takes approximately **2.8 microseconds**.
-2.  **Stable Update Throughput**: Throughput remains Dataset-Size Independent. Update latency scales linearly with pipeline depth (~5µs per transformation stage).
+1.  **Instantaneous O(1) Cloning**: Pipeline cloning is independent of dataset size.
+2.  **Stable Update Throughput**: Update latency scales with pipeline depth, not dataset size.
 3.  **Transactional Integrity**: Snapshots are "born hydrated" and immutable. Value-level COW ensures that snapshots remain consistent even as the parent pipeline continues to receive high-frequency updates.
-

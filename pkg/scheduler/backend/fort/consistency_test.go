@@ -138,7 +138,7 @@ func TestClone_AtomicSnapshot(t *testing.T) {
 	// The update should be blocked by the lock
 	select {
 	case <-updated:
-		t.Errorf("Update should have been blocked by LockInformerSet")
+		t.Errorf("Update should have been blocked by SnapshotLockDomain")
 	case <-time.After(50 * time.Millisecond):
 		// Success: update is blocked
 	}
