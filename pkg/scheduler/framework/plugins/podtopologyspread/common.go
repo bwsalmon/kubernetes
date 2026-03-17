@@ -159,6 +159,23 @@ func countPodsMatchSelector(podInfos []fwk.PodInfo, selector labels.Selector, ns
 	return count
 }
 
+func countPodsMatchSelectors(podInfos []fwk.PodInfo, selectors []labels.Selector, ns string) []int {
+	counts := make([]int, len(selectors))
+	for _, p := range podInfos {
+		// Bypass terminating Pod (see #87621).
+		if p.GetPod().DeletionTimestamp != nil || p.GetPod().Namespace != ns {
+			continue
+		}
+		podLabels := labels.Set(p.GetPod().Labels)
+		for i, selector := range selectors {
+			if !selector.Empty() && selector.Matches(podLabels) {
+				counts[i]++
+			}
+		}
+	}
+	return counts
+}
+
 // podLabelsMatchSpreadConstraints returns whether tha labels matches with the selector in any of topologySpreadConstraint
 func podLabelsMatchSpreadConstraints(constraints []topologySpreadConstraint, labels labels.Set) bool {
 	for _, c := range constraints {

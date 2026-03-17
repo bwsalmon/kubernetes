@@ -24,9 +24,12 @@ import (
 	"sync/atomic"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	v1helper "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 )
 
 const preScoreStateKey = "PreScore" + Name
@@ -91,10 +94,6 @@ func (pl *PodTopologySpread) initPreScoreState(s *preScoreState, pod *v1.Pod, fi
 			continue
 		}
 		for i, constraint := range s.Constraints {
-			// per-node counts are calculated during Score.
-			if constraint.TopologyKey == v1.LabelHostname {
-				continue
-			}
 			value := node.Node().Labels[constraint.TopologyKey]
 			if s.TopologyValueToPodCounts[i][value] == nil {
 				s.TopologyValueToPodCounts[i][value] = new(int64)
@@ -168,23 +167,46 @@ func (pl *PodTopologySpread) PreScore(
 			return
 		}
 
+		// Optimization: iterate over pods once for all constraints.
+		// And also pre-calculate node inclusion matches.
+		selectors := make([]labels.Selector, len(state.Constraints))
+		for i := range state.Constraints {
+			selectors[i] = state.Constraints[i].Selector
+		}
+		counts := countPodsMatchSelectors(nodeInfo.GetPods(), selectors, pod.Namespace)
+
+		var nodeMatchesAffinity, nodeMatchesTaints *bool
 		for i, c := range state.Constraints {
-			if pl.enableNodeInclusionPolicyInPodTopologySpread &&
-				!c.matchNodeInclusionPolicies(logger, pod, node, requiredNodeAffinity,
-					pl.enableTaintTolerationComparisonOperators) {
-				continue
+			if pl.enableNodeInclusionPolicyInPodTopologySpread {
+				if c.NodeAffinityPolicy == v1.NodeInclusionPolicyHonor {
+					if nodeMatchesAffinity == nil {
+						m, _ := requiredNodeAffinity.Match(node)
+						nodeMatchesAffinity = &m
+					}
+					if !*nodeMatchesAffinity {
+						continue
+					}
+				}
+				if c.NodeTaintsPolicy == v1.NodeInclusionPolicyHonor {
+					if nodeMatchesTaints == nil {
+						_, untolerated := v1helper.FindMatchingUntoleratedTaint(logger, node.Spec.Taints, pod.Spec.Tolerations, helper.DoNotScheduleTaintsFilterFunc(), pl.enableTaintTolerationComparisonOperators)
+						t := !untolerated
+						nodeMatchesTaints = &t
+					}
+					if !*nodeMatchesTaints {
+						continue
+					}
+				}
 			}
 
 			value := node.Labels[c.TopologyKey]
 			// If current topology pair is not associated with any candidate node,
 			// continue to avoid unnecessary calculation.
-			// Per-node counts are also skipped, as they are done during Score.
 			tpCount := state.TopologyValueToPodCounts[i][value]
 			if tpCount == nil {
 				continue
 			}
-			count := countPodsMatchSelector(nodeInfo.GetPods(), c.Selector, pod.Namespace)
-			atomic.AddInt64(tpCount, int64(count))
+			atomic.AddInt64(tpCount, int64(counts[i]))
 		}
 	}
 	pl.parallelizer.Until(ctx, len(allNodes), processAllNode, pl.Name())
@@ -213,12 +235,7 @@ func (pl *PodTopologySpread) Score(ctx context.Context, cycleState fwk.CycleStat
 	var score float64
 	for i, c := range s.Constraints {
 		if tpVal, ok := node.Labels[c.TopologyKey]; ok {
-			var cnt int64
-			if c.TopologyKey == v1.LabelHostname {
-				cnt = int64(countPodsMatchSelector(nodeInfo.GetPods(), c.Selector, pod.Namespace))
-			} else {
-				cnt = *s.TopologyValueToPodCounts[i][tpVal]
-			}
+			cnt := *s.TopologyValueToPodCounts[i][tpVal]
 			score += scoreForCount(cnt, c.MaxSkew, s.TopologyNormalizingWeight[i])
 		}
 	}

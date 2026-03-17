@@ -24,9 +24,11 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	v1helper "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 )
 
 const preFilterStateKey = "PreFilter" + Name
@@ -272,19 +274,44 @@ func (pl *PodTopologySpread) calPreFilterState(ctx context.Context, pod *v1.Pod,
 			return
 		}
 
+		// Optimization: iterate over pods once for all constraints.
+		// And also pre-calculate node inclusion matches.
+		selectors := make([]labels.Selector, len(constraints))
+		for i := range constraints {
+			selectors[i] = constraints[i].Selector
+		}
+		counts := countPodsMatchSelectors(nodeInfo.GetPods(), selectors, pod.Namespace)
+
 		tpCounts := make([]topologyCount, 0, len(constraints))
+		var nodeMatchesAffinity, nodeMatchesTaints *bool
 		for i, c := range constraints {
-			if pl.enableNodeInclusionPolicyInPodTopologySpread &&
-				!c.matchNodeInclusionPolicies(logger, pod, node, requiredNodeAffinity, pl.enableTaintTolerationComparisonOperators) {
-				continue
+			if pl.enableNodeInclusionPolicyInPodTopologySpread {
+				if c.NodeAffinityPolicy == v1.NodeInclusionPolicyHonor {
+					if nodeMatchesAffinity == nil {
+						m, _ := requiredNodeAffinity.Match(node)
+						nodeMatchesAffinity = &m
+					}
+					if !*nodeMatchesAffinity {
+						continue
+					}
+				}
+				if c.NodeTaintsPolicy == v1.NodeInclusionPolicyHonor {
+					if nodeMatchesTaints == nil {
+						_, untolerated := v1helper.FindMatchingUntoleratedTaint(logger, node.Spec.Taints, pod.Spec.Tolerations, helper.DoNotScheduleTaintsFilterFunc(), pl.enableTaintTolerationComparisonOperators)
+						t := !untolerated
+						nodeMatchesTaints = &t
+					}
+					if !*nodeMatchesTaints {
+						continue
+					}
+				}
 			}
 
 			value := node.Labels[c.TopologyKey]
-			count := countPodsMatchSelector(nodeInfo.GetPods(), c.Selector, pod.Namespace)
 			tpCounts = append(tpCounts, topologyCount{
 				topologyValue: value,
 				constraintID:  i,
-				count:         count,
+				count:         counts[i],
 			})
 		}
 		tpCountsByNode[n] = tpCounts
