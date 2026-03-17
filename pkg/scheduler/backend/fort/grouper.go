@@ -1,9 +1,7 @@
 package fort
 
 import (
-	"context"
 	"fmt"
-	"time"
 
 	"k8s.io/client-go/tools/cache"
 )
@@ -11,7 +9,7 @@ import (
 // grouper implements GroupBy query. It aggregates objects from a source informer
 // into groups identified by a comparable key and evaluates aggregate fields.
 type grouper[Out, In any] struct {
-	handler ManualSharedInformer
+	*baseInformer
 	sel     GroupSelectFunc[Out]
 	groupBy SingleGroupByFunc[In]
 	where   SingleFilterFunc[In]
@@ -23,24 +21,12 @@ type grouper[Out, In any] struct {
 }
 
 var _ ManualSharedInformer = &grouper[int, int]{}
-var _ LockedResourceEventHandler = &grouper[int, int]{}
 
 // groupState maintains the current aggregation state for a single group.
-// It is stored in a B-Tree and must be treated as immutable once stored to support 
-// structural cloning. Any update to a group's state must first clone the state
-// object (including its internal collections like anyValues and distinct maps).
 type groupState[Out any] struct {
-	// count is the total number of items currently belonging to this group.
 	count   int
-	// fields stores the current accumulated values for each GroupField.
 	fields  []any
-	// lastOut is the last object emitted by this group. Used to generate OnUpdate events.
 	lastOut Out
-
-	// anyValues tracks all occurrences of AnyValue fields in the group.
-	// Indexed by: FieldIndex -> Value -> ReferenceCount.
-	// This allows picking a valid alternative value when the currently "picked"
-	// AnyValue is deleted from the group.
 	anyValues map[int]map[any]int
 }
 
@@ -61,41 +47,33 @@ func (s *groupState[Out]) clone() *groupState[Out] {
 }
 
 func newGrouper[Out, In any](lock LockGroup, sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In]) *grouper[Out, In] {
-	handler := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
-	handler.SetName("grouper-handler")
-	return newGrouperWithHandler(sel, groupBy, from, where, handler)
+	return newGrouperWithHandler(sel, groupBy, from, where, NewManualSharedInformerWithOptions(lock, DefaultKeyFunc))
 }
 
 func newGrouperWithHandler[Out, In any](sel GroupSelectFunc[Out], groupBy SingleGroupByFunc[In], from cache.SharedInformer, where SingleFilterFunc[In], handler ManualSharedInformer) *grouper[Out, In] {
 	g := &grouper[Out, In]{
-		handler: handler,
-		sel:     sel,
-		groupBy: groupBy,
-		where:   where,
-		source:  from,
-		groups:  NewBTreeMap[*groupState[Out]](),
+		baseInformer: newBaseInformer(handler.GetLockGroup(), handler.GetKeyFunc()),
+		sel:          sel,
+		groupBy:      groupBy,
+		where:        where,
+		source:       from,
+		groups:       NewBTreeMap[*groupState[Out]](),
 	}
+	g.baseInformer.parent = g
 
 	g.registration, _ = from.AddEventHandler(g)
 
 	// Sync propagation goroutine.
 	go func() {
 		check := g.registration.HasSyncedChecker()
-		
 		select {
 		case <-check.Done():
-			g.handler.SetHasSynced()
-		case <-g.handler.IsStoppedChan():
+			g.SetHasSynced()
+		case <-g.IsStoppedChan():
 		}
 	}()
 
 	return g
-}
-
-func (g *grouper[Out, In]) OnAdd(obj any, isInitial bool) {
-	g.handler.GetLockGroup().Lock()
-	defer g.handler.GetLockGroup().Unlock()
-	g.OnAddLocked(obj, isInitial)
 }
 
 func (g *grouper[Out, In]) OnAddLocked(obj any, isInitial bool) {
@@ -123,16 +101,10 @@ func (g *grouper[Out, In]) OnAddLocked(obj any, isInitial bool) {
 	g.groups.Set(keyStr, newState)
 
 	if ok {
-		g.handler.OnUpdateLocked(oldOut, newOut)
+		g.dispatchUpdate(oldOut, newOut)
 	} else {
-		g.handler.OnAddLocked(newOut, isInitial)
+		g.dispatchAdd(newOut, isInitial)
 	}
-}
-
-func (g *grouper[Out, In]) OnUpdate(oldObj, newObj any) {
-	g.handler.GetLockGroup().Lock()
-	defer g.handler.GetLockGroup().Unlock()
-	g.OnUpdateLocked(oldObj, newObj)
 }
 
 func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
@@ -154,7 +126,6 @@ func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
 		return
 	}
 
-	// Both pass filter
 	oldKey, oldFields := g.groupBy(oldInput)
 	newKey, newFields := g.groupBy(newInput)
 
@@ -175,17 +146,11 @@ func (g *grouper[Out, In]) OnUpdateLocked(oldObj, newObj any) {
 		newOut, _ := g.sel(resFields)
 		newState.lastOut = newOut
 		g.groups.Set(keyStr, newState)
-		g.handler.OnUpdateLocked(oldOut, newOut)
+		g.dispatchUpdate(oldOut, newOut)
 	} else {
 		g.OnDeleteLocked(oldObj)
 		g.OnAddLocked(newObj, false)
 	}
-}
-
-func (g *grouper[Out, In]) OnDelete(obj any) {
-	g.handler.GetLockGroup().Lock()
-	defer g.handler.GetLockGroup().Unlock()
-	g.OnDeleteLocked(obj)
 }
 
 func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
@@ -209,19 +174,39 @@ func (g *grouper[Out, In]) OnDeleteLocked(obj any) {
 
 	if newState.count == 0 {
 		g.groups.Delete(keyStr)
-		g.handler.OnDeleteLocked(oldOut)
+		g.dispatchDelete(oldOut)
 	} else {
 		newOut, _ := g.sel(newFields)
 		newState.lastOut = newOut
 		g.groups.Set(keyStr, newState)
-		g.handler.OnUpdateLocked(oldOut, newOut)
+		g.dispatchUpdate(oldOut, newOut)
 	}
 }
 
-// evaluateFields calculates or updates the values of aggregate fields for a group.
-// It modifies the provided groupState in-place (assumes state was already cloned if needed).
-// The 'adding' boolean indicates if we are adding a new object to the group (true) 
-// or removing an old one (false).
+func (g *grouper[Out, In]) dispatchAdd(obj Out, isInitial bool) {
+	for _, h := range g.handlers {
+		g.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnAdd(obj, isInitial) }, 
+			func(l LockedResourceEventHandler) { l.OnAddLocked(obj, isInitial) })
+	}
+}
+
+func (g *grouper[Out, In]) dispatchUpdate(oldObj, newObj Out) {
+	for _, h := range g.handlers {
+		g.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnUpdate(oldObj, newObj) }, 
+			func(l LockedResourceEventHandler) { l.OnUpdateLocked(oldObj, newObj) })
+	}
+}
+
+func (g *grouper[Out, In]) dispatchDelete(obj Out) {
+	for _, h := range g.handlers {
+		g.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnDelete(obj) }, 
+			func(l LockedResourceEventHandler) { l.OnDeleteLocked(obj) })
+	}
+}
+
 func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState[Out], input In, adding bool) []GroupField {
 	if state.fields == nil {
 		state.fields = make([]any, len(fields))
@@ -239,7 +224,6 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 		if gf.count {
 			res[i] = int64(state.count)
 		} else if gf.sum != nil {
-			// Sum aggregator: maintains a running total.
 			if state.fields[i] == nil {
 				state.fields[i] = int64(0)
 			}
@@ -251,11 +235,9 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			}
 			res[i] = state.fields[i]
 		} else if gf.distinct != nil {
-			// Distinct aggregator: maintains a set of unique values.
 			if state.fields[i] == nil {
 				state.fields[i] = make(map[any]int)
 			}
-			// COW for the distinct map to ensure isolation for existing snapshots.
 			m := state.fields[i].(map[any]int)
 			newM := make(map[any]int, len(m))
 			for k, v := range m {
@@ -278,7 +260,6 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			}
 			res[i] = distincts
 		} else if gf.anyValue != nil {
-			// AnyValue aggregator: picks one arbitrary value from the group.
 			if state.anyValues == nil {
 				state.anyValues = make(map[int]map[any]int)
 			}
@@ -295,8 +276,6 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 					delete(m, gf.anyValue)
 				}
 			}
-			// Pick one value from the remaining set (non-deterministic but consistent 
-			// until the set of available values changes).
 			var picked any
 			for k := range m {
 				picked = k
@@ -305,58 +284,26 @@ func (g *grouper[Out, In]) evaluateFields(fields []GroupField, state *groupState
 			state.fields[i] = picked
 			res[i] = picked
 		} else if gf.key != nil {
-			// Static key field (e.g., from the GroupBy key).
 			res[i] = gf.key
 		}
 	}
 	return res
 }
 
-func (g *grouper[Out, In]) GetLockGroup() LockGroup {
-	return g.handler.GetLockGroup()
-}
-
-func (g *grouper[Out, In]) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	return g.handler.AddEventHandler(h)
-}
-
-func (g *grouper[Out, In]) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
-	return g.handler.AddEventHandlerWithResyncPeriod(handler, resyncPeriod)
-}
-
-func (g *grouper[Out, In]) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
-	return g.handler.AddEventHandlerWithOptions(handler, options)
-}
-
-func (g *grouper[Out, In]) AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	return g.handler.AddEventHandlerNoReplay(h)
-}
-
-func (g *grouper[Out, In]) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
-	return g.handler.RemoveEventHandler(r)
-}
-
-func (g *grouper[Out, In]) HasSyncedChecker() cache.DoneChecker {
-	return g.handler.HasSyncedChecker()
-}
-
-// Clone creates a new instance of the grouper.
-// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
 func (g *grouper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
 	ns := newSources[0]
 	newLock := ns.(CloneableSharedInformerQuery).GetLockGroup()
 	
-	newHandler := g.handler.Clone(nil).(ManualSharedInformer)
-	newHandler.(*manualInformer).lock = newLock
-
 	ng := &grouper[Out, In]{
-		handler: newHandler,
-		sel:     g.sel,
-		groupBy: g.groupBy,
-		where:   g.where,
-		source:  ns,
-		groups:  g.groups.Clone(), // Fast O(1) B-Tree clone
+		baseInformer: g.baseInformer.clone(),
+		sel:          g.sel,
+		groupBy:      g.groupBy,
+		where:        g.where,
+		source:       ns,
+		groups:       g.groups.Clone(),
 	}
+	ng.baseInformer.lock = newLock
+	ng.baseInformer.parent = ng
 
 	if ms, ok := ns.(ManualSharedInformer); ok {
 		ng.registration, _ = ms.AddEventHandlerNoReplay(ng)
@@ -368,14 +315,16 @@ func (g *grouper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSha
 }
 
 func (g *grouper[Out, In]) GetStore() cache.Store {
-	return g.handler.GetStore()
+	return &grouperIndexer[Out]{
+		groups:  g.groups,
+		keyFunc: g.keyFunc,
+	}
 }
 
 func (g *grouper[Out, In]) GetController() cache.Controller {
 	return nil
 }
 
-// Run starts the informer and unregisters from source when stopCh is closed.
 func (g *grouper[Out, In]) Run(stopCh <-chan struct{}) {
 	defer g.SetIsStopped()
 	defer func() {
@@ -386,14 +335,6 @@ func (g *grouper[Out, In]) Run(stopCh <-chan struct{}) {
 	<-stopCh
 }
 
-func (g *grouper[Out, In]) RunWithContext(ctx context.Context) {
-	g.Run(ctx.Done())
-}
-
-func (g *grouper[Out, In]) LastSyncResourceVersion() string {
-	return g.handler.LastSyncResourceVersion()
-}
-
 func (g *grouper[Out, In]) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
 	return g.source.SetWatchErrorHandler(handler)
 }
@@ -402,42 +343,89 @@ func (g *grouper[Out, In]) SetWatchErrorHandlerWithContext(handler cache.WatchEr
 	return g.source.SetWatchErrorHandlerWithContext(handler)
 }
 
-func (g *grouper[Out, In]) SetTransform(handler cache.TransformFunc) error {
-	return fmt.Errorf("Group by queries don't support transform")
-}
-
-func (g *grouper[Out, In]) HasSynced() bool {
-	return g.handler.HasSynced()
-}
-
-func (g *grouper[Out, In]) IsStopped() bool {
-	return g.handler.IsStopped()
-}
-
-func (g *grouper[Out, In]) IsStoppedChan() <-chan struct{} {
-	return g.handler.(interface{ IsStoppedChan() <-chan struct{} }).IsStoppedChan()
-}
-
-func (g *grouper[Out, In]) SetIsStopped() {
-	g.handler.SetIsStopped()
-}
-
-func (g *grouper[Out, In]) SetHasSynced() {
-	g.handler.SetHasSynced()
-}
-
-func (g *grouper[Out, In]) GetKeyFunc() cache.KeyFunc {
-	return g.handler.GetKeyFunc()
-}
-
-func (g *grouper[Out, In]) TriggerWatchError(err error) {
-	g.handler.TriggerWatchError(err)
-}
-
-func (g *grouper[Out, In]) SetName(name string) {
-	g.handler.SetName(name)
-}
-
 func (g *grouper[Out, In]) GetSources() []cache.SharedInformer {
 	return []cache.SharedInformer{g.source}
+}
+
+type grouperIndexer[Out any] struct {
+	groups  BTreeMap[*groupState[Out]]
+	keyFunc cache.KeyFunc
+}
+
+func (i *grouperIndexer[Out]) Clone() CloneableIndexer {
+	return &grouperIndexer[Out]{
+		groups:  i.groups.Clone(),
+		keyFunc: i.keyFunc,
+	}
+}
+
+func (i *grouperIndexer[Out]) Add(obj any) error    { return fmt.Errorf("not supported") }
+func (i *grouperIndexer[Out]) Update(obj any) error { return fmt.Errorf("not supported") }
+func (i *grouperIndexer[Out]) Delete(obj any) error { return fmt.Errorf("not supported") }
+
+func (i *grouperIndexer[Out]) List() []any {
+	states := i.groups.List()
+	res := make([]any, len(states))
+	for idx, s := range states {
+		res[idx] = s.lastOut
+	}
+	return res
+}
+
+func (i *grouperIndexer[Out]) ListKeys() []string {
+	return i.groups.ListKeys()
+}
+
+func (i *grouperIndexer[Out]) Get(obj any) (item any, exists bool, err error) {
+	key, err := i.keyFunc(obj)
+	if err != nil {
+		return nil, false, err
+	}
+	return i.GetByKey(key)
+}
+
+func (i *grouperIndexer[Out]) GetByKey(key string) (item any, exists bool, err error) {
+	state, ok := i.groups.Get(key)
+	if !ok {
+		return nil, false, nil
+	}
+	return state.lastOut, true, nil
+}
+
+func (i *grouperIndexer[Out]) Replace(objs []any, rv string) error {
+	return fmt.Errorf("not supported")
+}
+
+func (i *grouperIndexer[Out]) Resync() error {
+	return nil
+}
+
+func (i *grouperIndexer[Out]) Bookmark(rv string) {}
+
+func (i *grouperIndexer[Out]) LastStoreSyncResourceVersion() string {
+	return ""
+}
+
+func (i *grouperIndexer[Out]) Index(indexName string, obj any) ([]any, error) {
+	return nil, fmt.Errorf("not supported")
+}
+
+func (i *grouperIndexer[Out]) IndexKeys(indexName, indexedValue string) ([]string, error) {
+	return nil, fmt.Errorf("not supported")
+}
+
+func (i *grouperIndexer[Out]) ListIndexFuncValues(indexName string) []string {
+	return nil
+}
+
+func (i *grouperIndexer[Out]) ByIndex(indexName, indexedValue string) ([]any, error) {
+	return nil, fmt.Errorf("not supported")
+}
+
+func (i *grouperIndexer[Out]) GetIndexers() cache.Indexers {
+	return nil
+}
+
+func (i *grouperIndexer[Out]) AddIndexers(newIndexers cache.Indexers) error {
+	return fmt.Errorf("not supported")
 }

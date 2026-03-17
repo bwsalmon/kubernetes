@@ -1,9 +1,6 @@
 package fort
 
 import (
-	"context"
-	"fmt"
-	"time"
 
 	"k8s.io/client-go/tools/cache"
 )
@@ -11,69 +8,49 @@ import (
 // flatMapper implements FlatMap query by applying a mapping function to each object
 // from a source informer. It uses a shared LockGroup for transactional consistency.
 type flatMapper[Out, In any] struct {
-	handler      ManualSharedInformer
+	*baseInformer
 	mapper       FlatMapFunc[Out, In]
 	registration cache.ResourceEventHandlerRegistration
 	source       cache.SharedInformer
+	indexer      CloneableIndexer
 }
 
 var _ ManualSharedInformer = &flatMapper[int, int]{}
 
 func newFlatMapper[Out, In any](lock LockGroup, mapper FlatMapFunc[Out, In], from cache.SharedInformer) *flatMapper[Out, In] {
-	handler := NewManualSharedInformerWithOptions(lock, DefaultKeyFunc)
-	handler.SetName("flatMap-handler")
-	return newFlatMapperWithHandler(mapper, from, handler)
+	return newFlatMapperWithHandler(mapper, from, NewManualSharedInformerWithOptions(lock, DefaultKeyFunc))
 }
 
 func newFlatMapperWithHandler[Out, In any](mapper FlatMapFunc[Out, In], from cache.SharedInformer, handler ManualSharedInformer) *flatMapper[Out, In] {
 	m := &flatMapper[Out, In]{
-		handler: handler,
-		mapper:  mapper,
-		source:  from,
+		baseInformer: newBaseInformer(handler.GetLockGroup(), handler.GetKeyFunc()),
+		mapper:       mapper,
+		source:       from,
+		indexer:      NewBTreeIndexer(handler.GetKeyFunc()),
 	}
+	m.baseInformer.parent = m
 
-	// Initial registration from constructor.
 	m.registration, _ = from.AddEventHandler(m)
 
-	// Sync propagation goroutine.
 	go func() {
 		check := m.registration.HasSyncedChecker()
-		syncedChan := check.Done()
-		
-		// Wait for sync or for the handler to be stopped.
 		select {
-		case <-syncedChan:
-			m.handler.SetHasSynced()
-		case <-m.handler.IsStoppedChan():
-			// Exit if the informer is stopped.
+		case <-check.Done():
+			m.SetHasSynced()
+		case <-m.IsStoppedChan():
 		}
 	}()
 
 	return m
 }
 
-func (m *flatMapper[Out, In]) GetLockGroup() LockGroup {
-	return m.handler.GetLockGroup()
-}
-
-func (m *flatMapper[O, I]) OnAdd(obj any, isInitial bool) {
-	m.handler.GetLockGroup().Lock()
-	defer m.handler.GetLockGroup().Unlock()
-	m.OnAddLocked(obj, isInitial)
-}
-
 func (m *flatMapper[O, I]) OnAddLocked(obj any, isInitial bool) {
 	input := obj.(I)
 	results, _ := m.mapper(input)
 	for _, r := range results {
-		m.handler.OnAddLocked(r, isInitial)
+		m.indexer.Add(r)
+		m.dispatchAdd(r, isInitial)
 	}
-}
-
-func (m *flatMapper[O, I]) OnUpdate(oldObj, newObj any) {
-	m.handler.GetLockGroup().Lock()
-	defer m.handler.GetLockGroup().Unlock()
-	m.OnUpdateLocked(oldObj, newObj)
 }
 
 func (m *flatMapper[O, I]) OnUpdateLocked(oldObj, newObj any) {
@@ -82,12 +59,7 @@ func (m *flatMapper[O, I]) OnUpdateLocked(oldObj, newObj any) {
 	oldResults, _ := m.mapper(oldInput)
 	newResults, _ := m.mapper(newInput)
 
-	// In FlatMap, one input object can map to many output objects.
-	// When the input is updated, we need to reconcile the old set of outputs 
-	// with the new set. To minimize downstream churn, we match objects by key
-	// and emit surgical OnUpdate events for persisting objects, while only
-	// emitting OnAdd/OnDelete for truly new or removed items.
-	keyFunc := m.handler.GetKeyFunc()
+	keyFunc := m.GetKeyFunc()
 	oldKeys := make(map[string]O)
 	for _, r := range oldResults {
 		key, _ := keyFunc(r)
@@ -102,60 +74,53 @@ func (m *flatMapper[O, I]) OnUpdateLocked(oldObj, newObj any) {
 
 	for key, oldR := range oldKeys {
 		if newR, ok := newKeys[key]; ok {
-			// Object still exists: propagate as an Update.
-			m.handler.OnUpdateLocked(oldR, newR)
+			m.indexer.Update(newR)
+			m.dispatchUpdate(oldR, newR)
 			delete(newKeys, key)
 		} else {
-			// Object was removed from the mapping result.
-			m.handler.OnDeleteLocked(oldR)
+			m.indexer.Delete(oldR)
+			m.dispatchDelete(oldR)
 		}
 	}
-	// Any remaining items in newKeys are truly new additions.
 	for _, newR := range newKeys {
-		m.handler.OnAddLocked(newR, false)
+		m.indexer.Add(newR)
+		m.dispatchAdd(newR, false)
 	}
-}
-
-func (m *flatMapper[O, I]) OnDelete(oldObj any) {
-	m.handler.GetLockGroup().Lock()
-	defer m.handler.GetLockGroup().Unlock()
-	m.OnDeleteLocked(oldObj)
 }
 
 func (m *flatMapper[O, I]) OnDeleteLocked(oldObj any) {
 	input := oldObj.(I)
 	results, _ := m.mapper(input)
 	for _, r := range results {
-		m.handler.OnDeleteLocked(r)
+		m.indexer.Delete(r)
+		m.dispatchDelete(r)
 	}
 }
 
-func (m *flatMapper[Out, In]) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	return m.handler.AddEventHandler(h)
+func (m *flatMapper[Out, In]) dispatchAdd(obj Out, isInitial bool) {
+	for _, h := range m.handlers {
+		m.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnAdd(obj, isInitial) }, 
+			func(l LockedResourceEventHandler) { l.OnAddLocked(obj, isInitial) })
+	}
 }
 
-func (m *flatMapper[Out, In]) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
-	return m.handler.AddEventHandlerWithResyncPeriod(handler, resyncPeriod)
+func (m *flatMapper[Out, In]) dispatchUpdate(oldObj, newObj Out) {
+	for _, h := range m.handlers {
+		m.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnUpdate(oldObj, newObj) }, 
+			func(l LockedResourceEventHandler) { l.OnUpdateLocked(oldObj, newObj) })
+	}
 }
 
-func (m *flatMapper[Out, In]) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
-	return m.handler.AddEventHandlerWithOptions(handler, options)
+func (m *flatMapper[Out, In]) dispatchDelete(obj Out) {
+	for _, h := range m.handlers {
+		m.dispatchEvent(h, 
+			func(h cache.ResourceEventHandler) { h.OnDelete(obj) }, 
+			func(l LockedResourceEventHandler) { l.OnDeleteLocked(obj) })
+	}
 }
 
-func (m *flatMapper[Out, In]) AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	return m.handler.AddEventHandlerNoReplay(h)
-}
-
-func (m *flatMapper[Out, In]) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
-	return m.handler.RemoveEventHandler(r)
-}
-
-func (m *flatMapper[Out, In]) HasSyncedChecker() cache.DoneChecker {
-	return m.handler.HasSyncedChecker()
-}
-
-// Clone creates a new instance of the flatMapper.
-// REQUIRES: Caller must hold the shared LockGroup (RLock or Lock) of the parent.
 func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) CloneableSharedInformerQuery {
 	var newSource cache.SharedInformer
 	if len(newSources) > 0 {
@@ -164,24 +129,16 @@ func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) Cloneable
 		newSource = m.source
 	}
 
-	var newLock LockGroup
-	if q, ok := newSource.(CloneableSharedInformerQuery); ok {
-		newLock = q.GetLockGroup()
-	} else {
-		newLock = NewLockGroup()
-	}
+	newLock := newSource.(CloneableSharedInformerQuery).GetLockGroup()
 
-	// Structural clone of the result handler (O(1) B-Tree copy).
-	newHandler := m.handler.Clone(nil).(ManualSharedInformer)
-	newHandler.(*manualInformer).lock = newLock
-
-	// Optimize: Use NoReplay during cloning to maintain the "born hydrated" state
-	// inherited from the COW structural copy. This avoids redundant O(N) hydration.
 	cloned := &flatMapper[Out, In]{
-		handler: newHandler,
-		mapper:  m.mapper,
-		source:  newSource,
+		baseInformer: m.baseInformer.clone(),
+		mapper:       m.mapper,
+		source:       newSource,
+		indexer:      m.indexer.Clone(),
 	}
+	cloned.baseInformer.lock = newLock
+	cloned.baseInformer.parent = cloned
 
 	if ms, ok := newSource.(ManualSharedInformer); ok {
 		cloned.registration, _ = ms.AddEventHandlerNoReplay(cloned)
@@ -193,17 +150,15 @@ func (m *flatMapper[Out, In]) Clone(newSources []cache.SharedInformer) Cloneable
 }
 
 func (m *flatMapper[Out, In]) GetStore() cache.Store {
-	return m.handler.GetStore()
+	return m.indexer
 }
 
 func (m *flatMapper[Out, In]) GetController() cache.Controller {
 	return nil
 }
 
-// Run starts the informer and unregisters from source when stopCh is closed.
 func (m *flatMapper[Out, In]) Run(stopCh <-chan struct{}) {
 	defer m.SetIsStopped()
-	// Unregister from source when stopped.
 	defer func() {
 		if m.source != nil && m.registration != nil {
 			_ = m.source.RemoveEventHandler(m.registration)
@@ -212,56 +167,12 @@ func (m *flatMapper[Out, In]) Run(stopCh <-chan struct{}) {
 	<-stopCh
 }
 
-func (m *flatMapper[Out, In]) RunWithContext(ctx context.Context) {
-	m.Run(ctx.Done())
-}
-
-func (m *flatMapper[Out, In]) LastSyncResourceVersion() string {
-	return m.handler.LastSyncResourceVersion()
-}
-
 func (m *flatMapper[Out, In]) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
 	return m.source.SetWatchErrorHandler(handler)
 }
 
 func (m *flatMapper[Out, In]) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
 	return m.source.SetWatchErrorHandlerWithContext(handler)
-}
-
-func (m *flatMapper[Out, In]) SetTransform(handler cache.TransformFunc) error {
-	return fmt.Errorf("Flat map queries don't support transform")
-}
-
-func (m *flatMapper[Out, In]) HasSynced() bool {
-	return m.handler.HasSynced()
-}
-
-func (m *flatMapper[Out, In]) IsStopped() bool {
-	return m.handler.IsStopped()
-}
-
-func (m *flatMapper[Out, In]) IsStoppedChan() <-chan struct{} {
-	return m.handler.(interface{ IsStoppedChan() <-chan struct{} }).IsStoppedChan()
-}
-
-func (m *flatMapper[Out, In]) SetIsStopped() {
-	m.handler.SetIsStopped()
-}
-
-func (m *flatMapper[Out, In]) SetHasSynced() {
-	m.handler.SetHasSynced()
-}
-
-func (m *flatMapper[Out, In]) GetKeyFunc() cache.KeyFunc {
-	return m.handler.GetKeyFunc()
-}
-
-func (m *flatMapper[Out, In]) TriggerWatchError(err error) {
-	m.handler.TriggerWatchError(err)
-}
-
-func (m *flatMapper[Out, In]) SetName(name string) {
-	m.handler.SetName(name)
 }
 
 func (m *flatMapper[Out, In]) GetSources() []cache.SharedInformer {

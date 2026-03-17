@@ -9,10 +9,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// manualInformer implements ManualSharedInformer using a shared LockGroup.
-// It is designed for testing and high-performance simulations where clones
-// can inherit populated state from a parent via B-Tree structural cloning.
-type manualInformer struct {
+// baseInformer implements common SharedInformer logic without storage.
+type baseInformer struct {
 	name string
 
 	lock LockGroup
@@ -31,16 +29,45 @@ type manualInformer struct {
 	transform cache.TransformFunc
 
 	keyFunc cache.KeyFunc
-	indexer CloneableIndexer
 
 	watchErrorHandler            cache.WatchErrorHandler
 	watchErrorHandlerWithContext cache.WatchErrorHandlerWithContext
+
+	// parent is the outer informer (e.g. manualInformer or a query informer).
+	// This allows baseInformer to delegate store-related calls back to the outer struct.
+	parent ManualSharedInformer
+}
+
+// manualInformer implements ManualSharedInformer using a shared LockGroup and a B-Tree indexer.
+type manualInformer struct {
+	*baseInformer
+	indexer CloneableIndexer
 }
 
 var _ ManualSharedInformer = &manualInformer{}
 
+func (p *baseInformer) GetLockGroup() LockGroup {
+	return p.lock
+}
+
+func (p *baseInformer) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return p.AddEventHandlerWithOptions(h, cache.HandlerOptions{})
+}
+
+func (p *baseInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
+	return p.AddEventHandler(handler)
+}
+
+func (p *baseInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
+	return p.addEventHandler(handler, true)
+}
+
+func (p *baseInformer) AddEventHandlerNoReplay(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	return p.addEventHandler(handler, false)
+}
+
 type manualInformerRegistration struct {
-	informer *manualInformer
+	informer ManualSharedInformer
 	id       int
 }
 
@@ -61,28 +88,8 @@ type manualDoneChecker struct {
 func (c *manualDoneChecker) Name() string { return "" }
 func (c *manualDoneChecker) Done() <-chan struct{} { return c.synced }
 
-func (p *manualInformer) GetLockGroup() LockGroup {
-	return p.lock
-}
-
-func (p *manualInformer) AddEventHandler(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	return p.AddEventHandlerWithOptions(h, cache.HandlerOptions{})
-}
-
-func (p *manualInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, resyncPeriod time.Duration) (cache.ResourceEventHandlerRegistration, error) {
-	return p.AddEventHandler(handler)
-}
-
-func (p *manualInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, options cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
-	return p.addEventHandler(handler, true)
-}
-
-func (p *manualInformer) AddEventHandlerNoReplay(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
-	return p.addEventHandler(handler, false)
-}
-
 // addEventHandler registers a handler, optionally replaying the entire current state.
-func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, replay bool) (cache.ResourceEventHandlerRegistration, error) {
+func (p *baseInformer) addEventHandler(handler cache.ResourceEventHandler, replay bool) (cache.ResourceEventHandlerRegistration, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -92,20 +99,20 @@ func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, rep
 
 	p.nextHandlerId++
 	r := &manualInformerRegistration{
-		informer: p,
+		informer: p.parent,
 		id:       p.nextHandlerId,
 	}
 	p.handlers[p.nextHandlerId] = handler
 
 	if replay {
 		// Atomic replay of current state to ensure the new handler is fully hydrated.
-		// Since we hold the exclusive lock, the replayed state is consistent.
-		list := p.indexer.List()
-		for _, obj := range list {
-			// Use dispatchEvent to handle Locked handlers correctly and avoid re-entrant deadlocks.
-			p.dispatchEvent(handler, 
-				func(h cache.ResourceEventHandler) { h.OnAdd(obj, true) }, 
-				func(l LockedResourceEventHandler) { l.OnAddLocked(obj, true) })
+		if store := p.parent.GetStore(); store != nil {
+			list := store.List()
+			for _, obj := range list {
+				p.dispatchEvent(handler, 
+					func(h cache.ResourceEventHandler) { h.OnAdd(obj, true) }, 
+					func(l LockedResourceEventHandler) { l.OnAddLocked(obj, true) })
+			}
 		}
 	}
 
@@ -114,12 +121,7 @@ func (p *manualInformer) addEventHandler(handler cache.ResourceEventHandler, rep
 
 // dispatchEvent selects the appropriate handler method based on whether the handler
 // supports the Locked interface. 
-// 
-// Internal Fort query stages implement LockedResourceEventHandler to allow 
-// processing events WITHOUT re-acquiring the shared LockGroup. This is critical 
-// for avoiding re-entrant deadlocks, as the event emitter (like manualInformer) 
-// already holds the lock.
-func (p *manualInformer) dispatchEvent(h cache.ResourceEventHandler, std func(cache.ResourceEventHandler), locked func(LockedResourceEventHandler)) {
+func (p *baseInformer) dispatchEvent(h cache.ResourceEventHandler, std func(cache.ResourceEventHandler), locked func(LockedResourceEventHandler)) {
 	defer utilruntime.HandleCrash()
 	if m, ok := h.(LockedResourceEventHandler); ok {
 		locked(m)
@@ -128,7 +130,7 @@ func (p *manualInformer) dispatchEvent(h cache.ResourceEventHandler, std func(ca
 	}
 }
 
-func (p *manualInformer) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
+func (p *baseInformer) RemoveEventHandler(r cache.ResourceEventHandlerRegistration) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -137,43 +139,34 @@ func (p *manualInformer) RemoveEventHandler(r cache.ResourceEventHandlerRegistra
 	return nil
 }
 
-func (p *manualInformer) GetStore() cache.Store {
-	return p.indexer
-}
-
-func (p *manualInformer) GetController() cache.Controller {
-	return nil
-}
-
-// Run starts the informer and unregisters from sources when stopCh is closed.
-func (p *manualInformer) Run(stopCh <-chan struct{}) {
+func (p *baseInformer) Run(stopCh <-chan struct{}) {
 	defer p.SetIsStopped()
 	<-stopCh
 }
 
-func (p *manualInformer) RunWithContext(ctx context.Context) {
+func (p *baseInformer) RunWithContext(ctx context.Context) {
 	p.Run(ctx.Done())
 }
 
-func (p *manualInformer) LastSyncResourceVersion() string {
+func (p *baseInformer) LastSyncResourceVersion() string {
 	return p.lastSyncResourceVersion
 }
 
-func (p *manualInformer) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
+func (p *baseInformer) SetWatchErrorHandler(handler cache.WatchErrorHandler) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	p.watchErrorHandler = handler
 	return nil
 }
 
-func (p *manualInformer) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
+func (p *baseInformer) SetWatchErrorHandlerWithContext(handler cache.WatchErrorHandlerWithContext) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	p.watchErrorHandlerWithContext = handler
 	return nil
 }
 
-func (p *manualInformer) TriggerWatchError(err error) {
+func (p *baseInformer) TriggerWatchError(err error) {
 	p.lock.RLock()
 	h := p.watchErrorHandler
 	hc := p.watchErrorHandlerWithContext
@@ -187,7 +180,7 @@ func (p *manualInformer) TriggerWatchError(err error) {
 	}
 }
 
-func (p *manualInformer) SetTransform(handler cache.TransformFunc) error {
+func (p *baseInformer) SetTransform(handler cache.TransformFunc) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -198,23 +191,23 @@ func (p *manualInformer) SetTransform(handler cache.TransformFunc) error {
 	return nil
 }
 
-func (p *manualInformer) HasSynced() bool {
+func (p *baseInformer) HasSynced() bool {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 	return p.hasSynced
 }
 
-func (p *manualInformer) IsStopped() bool {
+func (p *baseInformer) IsStopped() bool {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 	return p.isStopped
 }
 
-func (p *manualInformer) IsStoppedChan() <-chan struct{} {
+func (p *baseInformer) IsStoppedChan() <-chan struct{} {
 	return p.isStoppedChan
 }
 
-func (p *manualInformer) SetHasSynced() {
+func (p *baseInformer) SetHasSynced() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -226,7 +219,7 @@ func (p *manualInformer) SetHasSynced() {
 	close(p.synced)
 }
 
-func (p *manualInformer) SetIsStopped() {
+func (p *baseInformer) SetIsStopped() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -237,18 +230,38 @@ func (p *manualInformer) SetIsStopped() {
 	close(p.isStoppedChan)
 }
 
-func (p *manualInformer) GetKeyFunc() cache.KeyFunc {
+func (p *baseInformer) GetKeyFunc() cache.KeyFunc {
 	return p.keyFunc
 }
 
-func (i *manualInformer) HasSyncedChecker() cache.DoneChecker {
-	return &manualDoneChecker{synced: i.synced}
+func (p *baseInformer) HasSyncedChecker() cache.DoneChecker {
+	return &manualDoneChecker{synced: p.synced}
 }
 
-func (p *manualInformer) OnAdd(obj any, isInInitialList bool) {
+func (p *baseInformer) OnAdd(obj any, isInInitialList bool) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	p.OnAddLocked(obj, isInInitialList)
+	p.parent.OnAddLocked(obj, isInInitialList)
+}
+
+func (p *baseInformer) OnUpdate(oldObj, newObj any) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.parent.OnUpdateLocked(oldObj, newObj)
+}
+
+func (p *baseInformer) OnDelete(oldObj any) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.parent.OnDeleteLocked(oldObj)
+}
+
+func (p *manualInformer) GetStore() cache.Store {
+	return p.indexer
+}
+
+func (p *manualInformer) GetController() cache.Controller {
+	return nil
 }
 
 func (p *manualInformer) OnAddLocked(obj any, isInInitialList bool) {
@@ -266,12 +279,6 @@ func (p *manualInformer) OnAddLocked(obj any, isInInitialList bool) {
 	}
 }
 
-func (p *manualInformer) OnUpdate(oldObj, newObj any) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	p.OnUpdateLocked(oldObj, newObj)
-}
-
 func (p *manualInformer) OnUpdateLocked(oldObj, newObj any) {
 	oldTransformed := oldObj
 	newTransformed := newObj
@@ -284,7 +291,6 @@ func (p *manualInformer) OnUpdateLocked(oldObj, newObj any) {
 	newKey, _ := p.keyFunc(newTransformed)
 
 	if oldKey != newKey {
-		// Identity changed: perform atomic Delete + Add to maintain consistency.
 		p.OnDeleteLocked(oldObj)
 		p.OnAddLocked(newObj, false)
 		return
@@ -297,12 +303,6 @@ func (p *manualInformer) OnUpdateLocked(oldObj, newObj any) {
 			func(h cache.ResourceEventHandler) { h.OnUpdate(oldTransformed, newTransformed) }, 
 			func(l LockedResourceEventHandler) { l.OnUpdateLocked(oldTransformed, newTransformed) })
 	}
-}
-
-func (p *manualInformer) OnDelete(oldObj any) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	p.OnDeleteLocked(oldObj)
 }
 
 func (p *manualInformer) OnDeleteLocked(oldObj any) {
@@ -321,15 +321,17 @@ func (p *manualInformer) OnDeleteLocked(oldObj any) {
 	}
 }
 
-// Clone creates a new instance of the manualInformer.
-//
-// REQUIRES: The caller MUST hold the shared LockGroup exclusively (p.lock.Lock()). 
-// This is because structural cloning of the underlying B-Tree indexer is NOT 
-// thread-safe against concurrent read-only clones, even if they don't mutate 
-// the data. The exclusive lock ensures that the cloning process completes 
-// without interference.
 func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformerQuery {
-	newInformer := &manualInformer{
+	res := &manualInformer{
+		baseInformer: p.baseInformer.clone(),
+		indexer:      p.indexer.Clone(),
+	}
+	res.baseInformer.parent = res
+	return res
+}
+
+func (p *baseInformer) clone() *baseInformer {
+	newB := &baseInformer{
 		name:                    p.name,
 		handlers:                map[int]cache.ResourceEventHandler{},
 		transform:               p.transform,
@@ -337,25 +339,48 @@ func (p *manualInformer) Clone(_ []cache.SharedInformer) CloneableSharedInformer
 		hasSynced:               p.hasSynced,
 		lastSyncResourceVersion: p.lastSyncResourceVersion,
 		keyFunc:                 p.keyFunc,
-		indexer:                 p.indexer.Clone(), // Fast O(1) B-Tree clone
 		lock:                    NewLockGroup(),
 		synced:                  make(chan struct{}),
 		isStoppedChan:           make(chan struct{}),
 	}
 	if p.hasSynced {
-		close(newInformer.synced)
+		close(newB.synced)
 	}
 	if p.isStopped {
-		close(newInformer.isStoppedChan)
+		close(newB.isStoppedChan)
 	}
-
-	return newInformer
+	return newB
 }
 
-func (p *manualInformer) SetName(name string) {
+func (p *baseInformer) SetName(name string) {
 	p.name = name
 }
 
-func (p *manualInformer) GetSources() []cache.SharedInformer {
+func (p *baseInformer) GetSources() []cache.SharedInformer {
 	return nil
+}
+
+func newBaseInformer(lock LockGroup, keyFunc cache.KeyFunc) *baseInformer {
+	return &baseInformer{
+		handlers:      map[int]cache.ResourceEventHandler{},
+		keyFunc:       keyFunc,
+		lock:          lock,
+		synced:        make(chan struct{}),
+		isStoppedChan: make(chan struct{}),
+	}
+}
+
+// NewManualSharedInformer creates a ManualSharedInformer with a default lock and keyfunc.
+func NewManualSharedInformer() ManualSharedInformer {
+	return NewManualSharedInformerWithOptions(NewLockGroup(), DefaultKeyFunc)
+}
+
+// NewManualSharedInformerWithOptions creates a ManualSharedInformer with specific options.
+func NewManualSharedInformerWithOptions(lock LockGroup, keyFunc cache.KeyFunc) ManualSharedInformer {
+	res := &manualInformer{
+		baseInformer: newBaseInformer(lock, keyFunc),
+		indexer:      NewBTreeIndexer(keyFunc),
+	}
+	res.baseInformer.parent = res
+	return res
 }

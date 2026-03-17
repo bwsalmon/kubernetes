@@ -212,23 +212,6 @@ type ManualSharedInformer interface {
 	AddEventHandlerNoReplay(h cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error)
 }
 
-// NewManualSharedInformer creates a ManualSharedInformer with a default lock and keyfunc.
-func NewManualSharedInformer() ManualSharedInformer {
-	return NewManualSharedInformerWithOptions(NewLockGroup(), DefaultKeyFunc)
-}
-
-// NewManualSharedInformerWithOptions creates a ManualSharedInformer with specific options.
-func NewManualSharedInformerWithOptions(lock LockGroup, keyFunc cache.KeyFunc) ManualSharedInformer {
-	return &manualInformer{
-		handlers:      map[int]cache.ResourceEventHandler{},
-		keyFunc:       keyFunc,
-		indexer:       NewBTreeIndexer(keyFunc),
-		lock:          lock,
-		synced:        make(chan struct{}),
-		isStoppedChan: make(chan struct{}),
-	}
-}
-
 // SnapshotLockDomain acquires an exclusive Lock on the domain (LockGroup), 
 // enabling a consistent and safe snapshot. Exclusive lock is REQUIRED because 
 // B-Tree structural cloning is not thread-safe for concurrent read-only clones.
