@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	goruntime "runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -477,6 +478,7 @@ func TestNotRestRoutesHaveAuth(t *testing.T) {
 		{"/debug/pprof/"},
 		{"/debug/flags/"},
 		{"/version"},
+		{"/zork"},
 	} {
 		resp := httptest.NewRecorder()
 		req, _ := http.NewRequest("GET", test.route, nil)
@@ -489,6 +491,57 @@ func TestNotRestRoutesHaveAuth(t *testing.T) {
 		if authz.lastURI != test.route {
 			t.Errorf("route %q expected to go through authorization, last route did: %q", test.route, authz.lastURI)
 		}
+	}
+}
+
+// TestZorkRoute checks how the text adventure at /zork is wired in: it is
+// served when enabled, absent when it is not, and never listed among the paths
+// a client discovers at "/".
+func TestZorkRoute(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		enable     bool
+		wantStatus int
+	}{
+		{name: "enabled", enable: true, wantStatus: http.StatusOK},
+		{name: "disabled", enable: false, wantStatus: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, _ := setUp(t)
+			config.EnableZork = test.enable
+
+			s, err := config.Complete(nil).New("test", NewEmptyDelegate())
+			if err != nil {
+				t.Fatalf("Error in bringing up the server: %v", err)
+			}
+
+			resp := httptest.NewRecorder()
+			s.Handler.ServeHTTP(resp, httptest.NewRequest("GET", "/zork", nil))
+			if resp.Code != test.wantStatus {
+				t.Fatalf("GET /zork returned %d, want %d", resp.Code, test.wantStatus)
+			}
+			if test.enable {
+				if !strings.Contains(resp.Body.String(), "West of House") {
+					t.Fatalf("GET /zork did not start a game:\n%s", resp.Body.String())
+				}
+				// The session handed out by the first request has to
+				// come back through the whole handler chain.
+				session := resp.Header().Get("X-Zork-Session")
+				if session == "" {
+					t.Fatal("GET /zork handed out no session id")
+				}
+				resp = httptest.NewRecorder()
+				s.Handler.ServeHTTP(resp, httptest.NewRequest("GET", "/zork?session="+session+"&cmd=open+mailbox", nil))
+				if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "reveals a leaflet") {
+					t.Errorf("playing a turn returned %d:\n%s", resp.Code, resp.Body.String())
+				}
+			}
+			for _, path := range s.listedPathProvider.ListedPaths() {
+				if path == "/zork" {
+					t.Errorf("/zork should not be listed among the server's paths: %v", s.listedPathProvider.ListedPaths())
+				}
+			}
+		})
 	}
 }
 

@@ -68,6 +68,7 @@ import (
 	"k8s.io/apiserver/pkg/server/routes"
 	"k8s.io/apiserver/pkg/server/routine"
 	serverstore "k8s.io/apiserver/pkg/server/storage"
+	"k8s.io/apiserver/pkg/server/zork"
 	storagevalue "k8s.io/apiserver/pkg/storage/value"
 	"k8s.io/apiserver/pkg/storageversion"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -143,6 +144,11 @@ type Config struct {
 	EnableProfiling bool
 	DebugSocketPath string
 	EnableDiscovery bool
+	// EnableZork serves a text adventure at /zork. The endpoint is
+	// unlisted, so it changes nothing a client can discover, and like every
+	// other non-resource path it is only reachable by a user authorized for
+	// it.
+	EnableZork bool
 
 	// Requires generic profiling enabled
 	EnableContentionProfiling bool
@@ -438,6 +444,7 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 		EnableIndex:                    true,
 		EnableDiscovery:                true,
 		EnableProfiling:                true,
+		EnableZork:                     true,
 		DebugSocketPath:                "",
 		EnableMetrics:                  true,
 		MaxRequestsInFlight:            400,
@@ -1140,6 +1147,10 @@ func installAPI(name string, s *GenericAPIServer, c *Config) {
 	}
 
 	routes.Version{Version: c.EffectiveVersion.Info()}.Install(s.Handler.GoRestfulContainer)
+
+	if c.EnableZork {
+		zork.Install(s.Handler.NonGoRestfulMux)
+	}
 
 	if c.EnableDiscovery {
 		wrapped := discoveryendpoint.WrapAggregatedDiscoveryToHandler(s.DiscoveryGroupManager, s.AggregatedDiscoveryGroupManager, s.PeerAggregatedDiscoveryManager)
