@@ -520,8 +520,21 @@ func TestZorkRoute(t *testing.T) {
 			if resp.Code != test.wantStatus {
 				t.Fatalf("GET /zork returned %d, want %d", resp.Code, test.wantStatus)
 			}
-			if test.enable && !strings.Contains(resp.Body.String(), "West of House") {
-				t.Errorf("GET /zork did not start a game:\n%s", resp.Body.String())
+			if test.enable {
+				if !strings.Contains(resp.Body.String(), "West of House") {
+					t.Fatalf("GET /zork did not start a game:\n%s", resp.Body.String())
+				}
+				// The session handed out by the first request has to
+				// come back through the whole handler chain.
+				session := resp.Header().Get("X-Zork-Session")
+				if session == "" {
+					t.Fatal("GET /zork handed out no session id")
+				}
+				resp = httptest.NewRecorder()
+				s.Handler.ServeHTTP(resp, httptest.NewRequest("GET", "/zork?session="+session+"&cmd=open+mailbox", nil))
+				if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "reveals a leaflet") {
+					t.Errorf("playing a turn returned %d:\n%s", resp.Code, resp.Body.String())
+				}
 			}
 			for _, path := range s.listedPathProvider.ListedPaths() {
 				if path == "/zork" {

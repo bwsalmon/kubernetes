@@ -132,7 +132,7 @@ func TestPlural(t *testing.T) {
 
 func TestItemMatches(t *testing.T) {
 	lamp := newWorld().items["lamp"]
-	for _, words := range [][]string{{"lamp"}, {"lantern"}, {"brass", "lantern"}, {"turn", "on", "lamp"}} {
+	for _, words := range [][]string{{"lamp"}, {"lantern"}, {"brass"}, {"brass", "lantern"}, {"turn", "on", "lamp"}} {
 		if !lamp.matches(words) {
 			t.Errorf("the brass lantern should answer to %q", words)
 		}

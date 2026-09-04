@@ -149,8 +149,8 @@ func (i *item) matches(words []string) bool {
 				return true
 			}
 		}
-		for _, n := range strings.Fields(i.name) {
-			if strings.Trim(n, "'s") == w {
+		for _, n := range strings.Fields(strings.ToLower(i.name)) {
+			if strings.TrimSuffix(n, "'s") == w {
 				return true
 			}
 		}

@@ -165,10 +165,11 @@ func (g *Game) execOne(input string) string {
 
 	g.moves++
 
-	// Bare directions, and "go"/"walk"/"climb" with one.
+	// A bare direction is a command all by itself.
 	if d, ok := asDirection(verb); ok {
 		return g.move(d)
 	}
+
 	switch verb {
 	case "go", "walk", "run", "travel", "head", "climb":
 		if len(rest) == 0 {
@@ -189,16 +190,12 @@ func (g *Game) execOne(input string) string {
 			return "There is nothing here worth climbing."
 		}
 		return "You cannot go that way."
-	}
 
-	switch verb {
 	case "look", "l", "stare":
 		if len(rest) > 0 {
 			// "look at rug", "look in sack", "look under rug".
 			switch rest[0] {
-			case "at":
-				return g.examine(rest[1:])
-			case "in", "inside", "into":
+			case "at", "in", "inside", "into":
 				return g.examine(rest[1:])
 			case "under", "behind", "beneath":
 				return g.moveItem(rest[1:])
