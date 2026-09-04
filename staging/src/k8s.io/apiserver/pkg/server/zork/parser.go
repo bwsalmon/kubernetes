@@ -109,22 +109,25 @@ func (g *Game) resolve(words []string) (*item, string) {
 	dark := g.room().dark && !g.hasLight()
 
 	var scope []*item
-	add := func(candidates []*item, requireVisible bool) {
+	// add collects the items themselves and, for containers you can see
+	// into, whatever they hold, however deeply nested.
+	var add func(candidates []*item, depth int)
+	add = func(candidates []*item, depth int) {
+		if depth > 8 {
+			return
+		}
 		for _, it := range candidates {
-			if requireVisible && dark {
-				continue
-			}
 			scope = append(scope, it)
 			if it.container && (it.open || it.transparent) {
-				for _, inner := range g.w.itemsIn(it.id) {
-					scope = append(scope, inner)
-				}
+				add(g.w.itemsIn(it.id), depth+1)
 			}
 		}
 	}
 	// What you are holding can be found by touch, even in the dark.
-	add(g.carried(), false)
-	add(g.w.itemsIn(g.here), true)
+	add(g.carried(), 0)
+	if !dark {
+		add(g.w.itemsIn(g.here), 0)
+	}
 
 	for _, it := range scope {
 		if it.matches(words) {

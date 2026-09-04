@@ -262,7 +262,7 @@ func newWorld() *world {
 		{
 			id:   "attic",
 			name: "Attic",
-			desc: "This is the attic. There is no light here at all, and the only way out is the staircase going down.",
+			desc: "This is the attic. There are no windows up here, and the only way out is the staircase going down.",
 			dark: true,
 			exits: map[direction]exit{
 				down: {to: "kitchen"},
@@ -477,7 +477,7 @@ func newWorld() *world {
 			name:      "trophy case",
 			nouns:     []string{"case", "trophy"},
 			loc:       "living-room",
-			desc:      "A handsome glass-fronted trophy case, empty and expectant. A small brass plate reads \"DESIRED STATE\".",
+			desc:      "A handsome glass-fronted trophy case, waiting for something worth putting in it. A small brass plate on the front reads \"DESIRED STATE\".",
 			scenery:   true,
 			container: true,
 			openable:  true,

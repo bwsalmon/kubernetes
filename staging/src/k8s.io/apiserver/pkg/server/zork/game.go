@@ -452,7 +452,7 @@ func (g *Game) examine(words []string) string {
 		case len(g.w.itemsIn(it.id)) == 0:
 			b.WriteString(fmt.Sprintf(" The %s is empty.", it.name))
 		default:
-			b.WriteString("\n" + strings.TrimPrefix(contentsListing(g.w, it, "  "), "\n"))
+			b.WriteString(contentsListing(g.w, it, ""))
 		}
 	}
 	return b.String()
@@ -606,20 +606,45 @@ func (g *Game) put(words []string) string {
 	}
 	it.loc = target.id
 	out := "Done."
-	if target.id == "trophy-case" && it.treasure && !g.awarded["case:"+it.id] {
-		g.awarded["case:"+it.id] = true
-		g.score += it.caseValue
-	}
+	g.awardTreasuresInCase()
 	if won := g.checkVictory(); won != "" {
 		out += "\n\n" + won
 	}
 	return out
 }
 
+// inTrophyCase reports whether an item has ended up in the trophy case, either
+// on its own or inside something else that is in there. A treasure still in the
+// nest it was found in has been delivered just the same.
+func (g *Game) inTrophyCase(it *item) bool {
+	loc := it.loc
+	for depth := 0; depth < 8; depth++ {
+		if loc == "trophy-case" {
+			return true
+		}
+		holder, ok := g.w.items[loc]
+		if !ok {
+			return false
+		}
+		loc = holder.loc
+	}
+	return false
+}
+
+// awardTreasuresInCase pays out for every treasure now in the case, once each.
+func (g *Game) awardTreasuresInCase() {
+	for _, t := range g.w.treasures() {
+		if g.inTrophyCase(t) && !g.awarded["case:"+t.id] {
+			g.awarded["case:"+t.id] = true
+			g.score += t.caseValue
+		}
+	}
+}
+
 // checkVictory returns the ending text once every treasure is in the case.
 func (g *Game) checkVictory() string {
 	for _, t := range g.w.treasures() {
-		if t.loc != "trophy-case" {
+		if !g.inTrophyCase(t) {
 			return ""
 		}
 	}

@@ -256,6 +256,70 @@ func TestTreasuresScoreOnceEach(t *testing.T) {
 	}
 }
 
+// TestTreasureDeliveredInsideSomethingElse covers the player who never takes
+// the egg out of the nest: what is in the case is in the case, however it got
+// there.
+func TestTreasureDeliveredInsideSomethingElse(t *testing.T) {
+	g := New()
+	run(g, "north", "north", "up", "take nest", "down", "south")
+	run(g, toLivingRoom[1:]...)
+	play(t, g, []step{
+		{cmd: "open case", want: []string{"empty"}},
+		{cmd: "put nest in case", want: []string{"Done."}},
+		{cmd: "examine case", want: []string{"The trophy case contains:", "A birds nest"}},
+	})
+	if g.Score() != 5 {
+		t.Errorf("the egg in its nest in the case should be worth its 5 points, got %d", g.Score())
+	}
+	// Taking it back out and putting it in on its own pays the points for
+	// picking a treasure up, but not for the case a second time.
+	run(g, "take egg")
+	if g.Score() != 10 {
+		t.Errorf("picking up the egg should add its 5 points, got %d", g.Score())
+	}
+	run(g, "put egg in case")
+	if g.Score() != 10 {
+		t.Errorf("the case should not pay for the egg twice, got %d", g.Score())
+	}
+}
+
+func TestEnterAndExit(t *testing.T) {
+	g := New()
+	play(t, g, []step{
+		{cmd: "enter", want: []string{"boarded shut"}},
+		{cmd: "north", want: []string{"North of House"}},
+		{cmd: "east", want: []string{"Behind House"}},
+		{cmd: "enter", want: []string{"The window is closed."}},
+		{cmd: "open window", want: []string{"Opened."}},
+		{cmd: "enter", want: []string{"Kitchen"}},
+		{cmd: "out", want: []string{"Behind House"}},
+		{cmd: "in", want: []string{"Kitchen"}},
+		// The window can only be reached from the side it is on.
+		{cmd: "close window", want: []string{"cannot see any window here"}},
+		{cmd: "out", want: []string{"Behind House"}},
+		{cmd: "close window", want: []string{"Closed."}},
+		{cmd: "in", want: []string{"The window is closed."}},
+	})
+}
+
+func TestTakeAllAndDropAll(t *testing.T) {
+	g := New()
+	run(g, toLivingRoom...)
+	play(t, g, []step{
+		{cmd: "take all", want: []string{"brass lantern: Taken.", "elvish sword: Taken."}, notWant: []string{"trophy case", "oriental rug"}},
+		{cmd: "drop all", want: []string{"Dropped."}},
+		{cmd: "inventory", want: []string{"empty-handed"}},
+		{cmd: "look", want: []string{"There is a brass lantern here.", "There is an elvish sword here."}},
+		{cmd: "take all", want: []string{"Taken."}},
+	})
+	// The rug is worth moving, not carrying.
+	play(t, g, []step{
+		{cmd: "take rug", want: []string{"far too heavy"}},
+		{cmd: "look under rug", want: []string{"uncovering a closed"}},
+		{cmd: "move rug", want: []string{"refuses to move any further"}},
+	})
+}
+
 func TestExamineAndRead(t *testing.T) {
 	g := New()
 	play(t, g, []step{

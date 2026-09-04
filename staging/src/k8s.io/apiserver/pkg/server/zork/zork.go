@@ -25,7 +25,9 @@ limitations under the License.
 //
 // Games are held in memory, one per session, and a session is forgotten once it
 // has been idle for a while or once the server is restarted -- which is to say
-// the game has no save file, and neither does it need one.
+// the game has no save file, and neither does it need one. Because the games
+// live in one process, a player whose requests are spread over several API
+// servers will find a different game behind each of them.
 //
 // The endpoint is registered unlisted, so it does not appear at "/" or in the
 // paths reported by /statusz: no client discovering the API surface has to
@@ -55,6 +57,9 @@ const DefaultZorkPath = "/zork"
 const (
 	// maxCommandBytes is the longest command accepted in one request.
 	maxCommandBytes = 512
+	// maxSessionIDBytes is how much of a session id is worth reading, and
+	// worth quoting back when there is no such game.
+	maxSessionIDBytes = 64
 	// defaultMaxSessions bounds how many games the server holds at once.
 	// Reaching the limit retires the game nobody has touched for longest.
 	defaultMaxSessions = 64
@@ -148,6 +153,9 @@ func NewHandler(opts ...Option) http.Handler {
 	for _, opt := range opts {
 		opt(h)
 	}
+	if h.maxSessions < 1 {
+		h.maxSessions = 1
+	}
 	return h
 }
 
@@ -218,6 +226,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // already forgotten, is an error: session ids are handed out, not chosen.
 func (h *handler) session(req *http.Request) (s *session, fresh bool, err error) {
 	id := req.URL.Query().Get("session")
+	if len(id) > maxSessionIDBytes {
+		// Session ids are handed out by this server and are short. Do not
+		// echo an arbitrarily long one back in the answer.
+		id = id[:maxSessionIDBytes] + "..."
+	}
 
 	h.lock.Lock()
 	defer h.lock.Unlock()
