@@ -267,7 +267,7 @@ type podSyncer interface {
 	// pod has reached a terminal state and the presence of the error indicates succeeded or failed.
 	// If an error is returned, the sync was not successful and should be rerun in the future. This
 	// is a long running method and should exit early with context.Canceled if the context is canceled.
-	SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error)
+	SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, func(), error)
 	// SyncTerminatingPod attempts to ensure the pod's containers are no longer running and to collect
 	// any final status. This method is repeatedly invoked with diminishing grace periods until it exits
 	// without error. Once this method exits with no error other components are allowed to tear down
@@ -285,7 +285,7 @@ type podSyncer interface {
 	SyncTerminatedPod(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus) error
 }
 
-type syncPodFnType func(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error)
+type syncPodFnType func(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, func(), error)
 type syncTerminatingPodFnType func(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, gracePeriod *int64, podStatusFn func(*v1.PodStatus)) error
 type syncTerminatingRuntimePodFnType func(ctx context.Context, runningPod *kubecontainer.Pod) error
 type syncTerminatedPodFnType func(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus) error
@@ -309,7 +309,7 @@ func newPodSyncerFuncs(s podSyncer) podSyncerFuncs {
 
 var _ podSyncer = podSyncerFuncs{}
 
-func (f podSyncerFuncs) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
+func (f podSyncerFuncs) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, func(), error) {
 	return f.syncPod(ctx, updateType, pod, mirrorPod, podStatus)
 }
 func (f podSyncerFuncs) SyncTerminatingPod(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, gracePeriod *int64, podStatusFn func(*v1.PodStatus)) error {
@@ -336,6 +336,16 @@ const (
 // podSyncStatus tracks per-pod transitions through the three phases of pod
 // worker sync (setup, terminating, terminated).
 type podSyncStatus struct {
+	// ctx is reused across normal pod syncs.
+	// A new ctx is created on the next startPodSync after explicit cancellation.
+	//
+	// TODO: remove this from the struct by having the context initialized
+	// in startPodSync, the cancelFn used by UpdatePod, and cancellation of
+	// a parent context for tearing down workers (if needed) on shutdown.
+	// Be careful not to leak contexts (see #139823).
+	// Be careful that long-lived goroutines (such as prober workers) outlive
+	// the lifetime of a single startPodSync cancellation context.
+	ctx context.Context
 	// cancelFn if set is expected to cancel the current podSyncer operation.
 	cancelFn context.CancelFunc
 
@@ -602,7 +612,7 @@ type podWorkers struct {
 	resyncInterval time.Duration
 
 	// podCache stores kubecontainer.PodStatus for all pods.
-	podCache kubecontainer.Cache
+	podCache kubecontainer.ROCache
 
 	// allocationManager is used to allocate resources for pods
 	allocationManager allocation.Manager
@@ -616,7 +626,7 @@ func newPodWorkers(
 	recorder record.EventRecorder,
 	workQueue queue.WorkQueue,
 	resyncInterval, backOffPeriod time.Duration,
-	podCache kubecontainer.Cache,
+	podCache kubecontainer.ROCache,
 	allocationManager allocation.Manager,
 ) PodWorkers {
 	return &podWorkers{
@@ -1152,7 +1162,11 @@ func (p *podWorkers) startPodSync(parentCtx context.Context, podUID types.UID) (
 	default:
 	}
 
-	ctx, status.cancelFn = context.WithCancel(parentCtx)
+	if status.ctx == nil || status.ctx.Err() != nil {
+		// create a context with parentCtx's values, and reuse it until it is canceled
+		status.ctx, status.cancelFn = context.WithCancel(context.WithoutCancel(parentCtx))
+	}
+	ctx = status.ctx
 
 	// if we are already started, make our state visible to downstream components
 	if status.IsStarted() {
@@ -1282,6 +1296,7 @@ func (p *podWorkers) podWorkerLoop(parentCtx context.Context, podUID types.UID, 
 			}
 
 			// Take the appropriate action (illegal phases are prevented by UpdatePod)
+			var postSync func()
 			switch {
 			case update.WorkType == TerminatedPod:
 				err = p.podSyncer.SyncTerminatedPod(ctx, update.Options.Pod, status)
@@ -1301,10 +1316,14 @@ func (p *podWorkers) podWorkerLoop(parentCtx context.Context, podUID types.UID, 
 				}
 
 			default:
-				isTerminal, err = p.podSyncer.SyncPod(ctx, update.Options.UpdateType, update.Options.Pod, update.Options.MirrorPod, status)
+				isTerminal, postSync, err = p.podSyncer.SyncPod(ctx, update.Options.UpdateType, update.Options.Pod, update.Options.MirrorPod, status)
 			}
 
 			lastSyncTime = p.clock.Now()
+			if postSync != nil {
+				postSync()
+			}
+
 			return err
 		}()
 

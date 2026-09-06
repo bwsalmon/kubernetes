@@ -57,7 +57,8 @@ var pluginConfigs = []configv1.PluginConfig{
 				Kind:       "DynamicResourcesArgs",
 				APIVersion: "kubescheduler.config.k8s.io/v1",
 			},
-			FilterTimeout: &metav1.Duration{Duration: 10 * time.Second},
+			FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+			BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
 		}},
 	},
 	{
@@ -121,6 +122,10 @@ var pluginConfigs = []configv1.PluginConfig{
 				APIVersion: "kubescheduler.config.k8s.io/v1",
 			},
 			BindTimeoutSeconds: ptr.To[int64](600),
+			Shape: []configv1.UtilizationShapePoint{
+				{Utilization: 0, Score: 10},
+				{Utilization: 100, Score: 0},
+			},
 		}},
 	},
 }
@@ -279,7 +284,8 @@ func TestSchedulerDefaults(t *testing.T) {
 										Kind:       "DynamicResourcesArgs",
 										APIVersion: "kubescheduler.config.k8s.io/v1",
 									},
-									FilterTimeout: &metav1.Duration{Duration: 10 * time.Second},
+									FilterTimeout:  &metav1.Duration{Duration: 10 * time.Second},
+									BindingTimeout: &metav1.Duration{Duration: 10 * time.Minute},
 								}},
 							},
 							{
@@ -343,6 +349,10 @@ func TestSchedulerDefaults(t *testing.T) {
 										APIVersion: "kubescheduler.config.k8s.io/v1",
 									},
 									BindTimeoutSeconds: ptr.To[int64](600),
+									Shape: []configv1.UtilizationShapePoint{
+										{Utilization: 0, Score: 10},
+										{Utilization: 100, Score: 0},
+									},
 								}},
 							},
 						},
@@ -354,8 +364,8 @@ func TestSchedulerDefaults(t *testing.T) {
 								Enabled: []configv1.Plugin{
 									{Name: names.SchedulingGates},
 									{Name: names.PrioritySort},
-									{Name: names.NodeUnschedulable},
 									{Name: names.NodeName},
+									{Name: names.NodeUnschedulable},
 									{Name: names.TaintToleration, Weight: ptr.To[int32](3)},
 									{Name: names.NodeAffinity, Weight: ptr.To[int32](2)},
 									{Name: names.NodePorts},
@@ -371,6 +381,7 @@ func TestSchedulerDefaults(t *testing.T) {
 									{Name: names.NodeResourcesBalancedAllocation, Weight: ptr.To[int32](1)},
 									{Name: names.ImageLocality, Weight: ptr.To[int32](1)},
 									{Name: names.DefaultBinder},
+									{Name: names.NodeDeclaredFeatures},
 								},
 							},
 							Bind: configv1.PluginSet{

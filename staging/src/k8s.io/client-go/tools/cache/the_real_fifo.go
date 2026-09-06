@@ -72,7 +72,7 @@ type RealFIFOOptions struct {
 	Identifier InformerNameAndResource
 
 	// MetricsProvider is used to create metrics for the FIFO.
-	MetricsProvider FIFOMetricsProvider
+	MetricsProvider InformerMetricsProvider
 
 	// EmitDeltaTypeBookmark is used to specify whether the RealFIFO will emit
 	// bookmark deltas or not. This can only be set if AtomicEvents is true.
@@ -779,7 +779,7 @@ func (f *RealFIFO) Resync() error {
 
 		retErr := f.addToItems_locked(Sync, true, knownObj)
 		if retErr != nil {
-			return fmt.Errorf("couldn't queue object: %w", err)
+			return fmt.Errorf("couldn't queue object: %w", retErr)
 		}
 	}
 

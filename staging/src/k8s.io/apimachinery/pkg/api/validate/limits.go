@@ -70,10 +70,47 @@ func MaxBytes[T ~string](_ context.Context, _ operation.Operation, fldPath *fiel
 	return nil
 }
 
+// MaxBytesSlice verifies that the specified byte slice is not longer than max
+// bytes.
+func MaxBytesSlice[T ~byte](_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []T, max int) field.ErrorList {
+	if len(value) > max {
+		return field.ErrorList{field.TooLong(fldPath, "", max).WithOrigin("maxBytes")}
+	}
+	return nil
+}
+
 // MaxItems verifies that the specified slice is not longer than max items.
 func MaxItems[T any](_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []T, max int) field.ErrorList {
 	if len(value) > max {
 		return field.ErrorList{field.TooMany(fldPath, len(value), max).WithOrigin("maxItems")}
+	}
+	return nil
+}
+
+// MaxProperties verifies that the specified map has no more than max keys.
+func MaxProperties[K comparable, V any](_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ map[K]V, max int) field.ErrorList {
+	if value == nil {
+		return nil
+	}
+
+	if len(value) > max {
+		return field.ErrorList{field.TooMany(fldPath, len(value), max).WithOrigin("maxProperties")}
+	}
+	return nil
+}
+
+// MinItems verifies that the specified slice is not shorter than min items.
+func MinItems[T any](_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ []T, min int) field.ErrorList {
+	if len(value) < min {
+		return field.ErrorList{field.TooFew(fldPath, len(value), min).WithOrigin("minItems")}
+	}
+	return nil
+}
+
+// MinProperties verifies that the specified map is not shorter than min properties.
+func MinProperties[K comparable, V any](_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ map[K]V, min int) field.ErrorList {
+	if len(value) < min {
+		return field.ErrorList{field.TooFew(fldPath, len(value), min).WithOrigin("minProperties")}
 	}
 	return nil
 }
@@ -85,6 +122,48 @@ func Minimum[T constraints.Integer](_ context.Context, _ operation.Operation, fl
 	}
 	if *value < min {
 		return field.ErrorList{field.Invalid(fldPath, *value, content.MinError(min)).WithOrigin("minimum")}
+	}
+	return nil
+}
+
+// Maximum verifies that the specified value is less than or equal to max.
+func Maximum[T constraints.Integer](_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *T, max T) field.ErrorList {
+	if value == nil {
+		return nil
+	}
+	if *value > max {
+		return field.ErrorList{field.Invalid(fldPath, *value, content.MaxError(max)).WithOrigin("maximum")}
+	}
+	return nil
+}
+
+// MinLength verifies that the specified value is at least min characters, if non-nil.
+func MinLength[T ~string](_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *T, min int) field.ErrorList {
+	if value == nil {
+		return nil
+	}
+
+	byteLength := len(*value)
+
+	// because runes are up to 4 byte characters, if we assume all characters
+	// in the input are 4 byte runes, the minimum number of characters that
+	// are specified is len(value)/4. If the minimum multi-byte
+	// character count is greater than or equal to our enforced minimum, we
+	// can confidently say that the value is valid without having
+	// to actually perform the more expensive rune counting step
+	if int(math.Ceil(float64(byteLength)/4.0)) >= min {
+		return nil
+	}
+
+	// if the length of the value in bytes is less
+	// than the minimum size then we can confidently
+	// say that this value is not within the bounds
+	// enforced by the maximum value regardless
+	// of the actual makeup of characters in the value.
+	// Otherwise, perform a rune count to determine if the
+	// number of characters is less than the minimum.
+	if byteLength < min || utf8.RuneCountInString(string(*value)) < min {
+		return field.ErrorList{field.TooShort(fldPath, *value, min).WithOrigin("minLength")}
 	}
 	return nil
 }

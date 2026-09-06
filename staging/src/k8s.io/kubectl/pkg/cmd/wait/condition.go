@@ -59,7 +59,10 @@ func (w ConditionalWait) checkCondition(obj *unstructured.Unstructured) (bool, e
 		return false, nil
 	}
 	for _, conditionUncast := range conditions {
-		condition := conditionUncast.(map[string]interface{})
+		condition, ok := conditionUncast.(map[string]interface{})
+		if !ok {
+			continue
+		}
 		name, found, err := unstructured.NestedString(condition, "type")
 		if !found || err != nil || !strings.EqualFold(name, w.conditionName) {
 			continue
@@ -184,7 +187,7 @@ func getObjAndCheckCondition(ctx context.Context, info *resource.Info, o *WaitOp
 }
 
 func extendErrWaitTimeout(err error, info *resource.Info) error {
-	return fmt.Errorf("%s on %s/%s", err.Error(), info.Mapping.Resource.Resource, info.Name)
+	return fmt.Errorf("%w on %s/%s", err, info.Mapping.Resource.Resource, info.Name)
 }
 
 func getObservedGeneration(obj *unstructured.Unstructured, condition map[string]interface{}) (int64, bool) {

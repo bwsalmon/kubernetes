@@ -50,7 +50,7 @@ import (
 type fakePodWorkers struct {
 	lock      sync.Mutex
 	syncPodFn syncPodFnType
-	cache     kubecontainer.Cache
+	cache     kubecontainer.ROCache
 	t         TestingInterface
 
 	triggeredDeletion []types.UID
@@ -87,7 +87,7 @@ func (f *fakePodWorkers) UpdatePod(ctx context.Context, options UpdatePodOptions
 	case kubetypes.SyncPodKill:
 		f.triggeredDeletion = append(f.triggeredDeletion, uid)
 	default:
-		isTerminal, err := f.syncPodFn(ctx, options.UpdateType, options.Pod, options.MirrorPod, status)
+		isTerminal, _, err := f.syncPodFn(ctx, options.UpdateType, options.Pod, options.MirrorPod, status)
 		if err != nil {
 			f.t.Errorf("Unexpected error: %v", err)
 		}
@@ -397,7 +397,7 @@ func createPodWorkers(logger klog.Logger) (*podWorkers, *containertest.FakeRunti
 	return createPodWorkersWithLogger(logger)
 }
 
-func createPodWorkersWithLogger(_ klog.Logger) (*podWorkers, *containertest.FakeRuntime, map[types.UID][]syncPodRecord) {
+func createPodWorkersWithLogger(logger klog.Logger) (*podWorkers, *containertest.FakeRuntime, map[types.UID][]syncPodRecord) {
 	lock := sync.Mutex{}
 	processed := make(map[types.UID][]syncPodRecord)
 	fakeRecorder := &record.FakeRecorder{}
@@ -407,7 +407,7 @@ func createPodWorkersWithLogger(_ klog.Logger) (*podWorkers, *containertest.Fake
 	clock := clocktesting.NewFakePassiveClock(time.Unix(1, 0))
 	w := newPodWorkers(
 		&podSyncerFuncs{
-			syncPod: func(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
+			syncPod: func(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, func(), error) {
 				func() {
 					lock.Lock()
 					defer lock.Unlock()
@@ -417,7 +417,7 @@ func createPodWorkersWithLogger(_ klog.Logger) (*podWorkers, *containertest.Fake
 						updateType: updateType,
 					})
 				}()
-				return false, nil
+				return false, nil, nil
 			},
 			syncTerminatingPod: func(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, gracePeriod *int64, podStatusFn func(*v1.PodStatus)) error {
 				func() {
@@ -460,7 +460,7 @@ func createPodWorkersWithLogger(_ klog.Logger) (*podWorkers, *containertest.Fake
 		time.Second,
 		time.Millisecond,
 		fakeCache,
-		allocation.NewInMemoryManager(nil, nil, nil, nil, nil, nil),
+		allocation.NewInMemoryManager(logger, nil, nil, nil, nil, nil, nil),
 	)
 	workers := w.(*podWorkers)
 	workers.clock = clock
@@ -602,6 +602,7 @@ func TestUpdatePod(t *testing.T) {
 			} else {
 				expected.cancelFn, status.cancelFn = nil, nil
 			}
+			expected.ctx, status.ctx = nil, nil
 		}
 		if e, a := expected, status; !reflect.DeepEqual(e, a) {
 			t.Fatalf("unexpected status: %s", cmp.Diff(e, a, cmp.AllowUnexported(podSyncStatus{})))
@@ -1204,17 +1205,17 @@ type terminalPhaseSync struct {
 	terminal sets.Set[string]
 }
 
-func (s *terminalPhaseSync) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
-	isTerminal, err := s.fn(ctx, updateType, pod, mirrorPod, podStatus)
+func (s *terminalPhaseSync) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod *v1.Pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, func(), error) {
+	isTerminal, _, err := s.fn(ctx, updateType, pod, mirrorPod, podStatus)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if !isTerminal {
 		s.lock.Lock()
 		defer s.lock.Unlock()
 		isTerminal = s.terminal.Has(string(pod.UID))
 	}
-	return isTerminal, nil
+	return isTerminal, nil, nil
 }
 
 func (s *terminalPhaseSync) SetTerminal(uid types.UID) {
@@ -2125,15 +2126,15 @@ type simpleFakeKubelet struct {
 	wg        sync.WaitGroup
 }
 
-func (kl *simpleFakeKubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
+func (kl *simpleFakeKubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, func(), error) {
 	kl.pod, kl.mirrorPod, kl.podStatus = pod, mirrorPod, podStatus
-	return false, nil
+	return false, nil, nil
 }
 
-func (kl *simpleFakeKubelet) SyncPodWithWaitGroup(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, error) {
+func (kl *simpleFakeKubelet) SyncPodWithWaitGroup(ctx context.Context, updateType kubetypes.SyncPodType, pod, mirrorPod *v1.Pod, podStatus *kubecontainer.PodStatus) (bool, func(), error) {
 	kl.pod, kl.mirrorPod, kl.podStatus = pod, mirrorPod, podStatus
 	kl.wg.Done()
-	return false, nil
+	return false, nil, nil
 }
 
 func (kl *simpleFakeKubelet) SyncTerminatingPod(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, gracePeriod *int64, podStatusFn func(*v1.PodStatus)) error {
@@ -2151,7 +2152,7 @@ func (kl *simpleFakeKubelet) SyncTerminatedPod(ctx context.Context, pod *v1.Pod,
 // TestFakePodWorkers verifies that the fakePodWorkers behaves the same way as the real podWorkers
 // for their invocation of the syncPodFn.
 func TestFakePodWorkers(t *testing.T) {
-	tCtx := ktesting.Init(t)
+	logger, tCtx := ktesting.NewTestContext(t)
 	fakeRecorder := &record.FakeRecorder{}
 	fakeRuntime := &containertest.FakeRuntime{}
 	fakeCache := containertest.NewFakeCache(fakeRuntime)
@@ -2168,7 +2169,7 @@ func TestFakePodWorkers(t *testing.T) {
 		time.Second,
 		time.Second,
 		fakeCache,
-		allocation.NewInMemoryManager(nil, nil, nil, nil, nil, nil),
+		allocation.NewInMemoryManager(logger, nil, nil, nil, nil, nil, nil),
 	)
 	fakePodWorkers := &fakePodWorkers{
 		syncPodFn: kubeletForFakeWorkers.SyncPod,
