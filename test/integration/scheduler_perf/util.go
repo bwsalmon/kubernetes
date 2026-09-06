@@ -36,6 +36,8 @@ import (
 	resourcealpha "k8s.io/api/resource/v1alpha3"
 	resourcev1beta1 "k8s.io/api/resource/v1beta1"
 	resourcev1beta2 "k8s.io/api/resource/v1beta2"
+	schedulingapiv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	schedulingapiv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -54,11 +56,11 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	kubeschedulerscheme "k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
+	schedulermetrics "k8s.io/kubernetes/pkg/scheduler/metrics"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/kubernetes/test/integration/framework"
 	"k8s.io/kubernetes/test/integration/util"
-	testutils "k8s.io/kubernetes/test/utils"
-	"k8s.io/kubernetes/test/utils/ktesting"
+	"k8s.io/kubernetes/test/utils/client-go/ktesting"
 )
 
 const (
@@ -68,7 +70,7 @@ const (
 	throughputSampleInterval = time.Second
 )
 
-var dataItemsDir = flag.String("data-items-dir", "", "destination directory for storing generated data items for perf dashboard")
+var dataItemsDir = flag.String("data-items-dir", "", "destination directory for storing generated data items for perf dashboard or performance profiles")
 
 var runID = time.Now().Format(dateFormat)
 
@@ -91,13 +93,19 @@ func newDefaultComponentConfig() (*config.KubeSchedulerConfiguration, error) {
 // remove resources after finished.
 // Notes on rate limiter:
 //   - client rate limit is set to 5000.
-func mustSetupCluster(tCtx ktesting.TContext, config *config.KubeSchedulerConfiguration, enabledFeatures map[featuregate.Feature]bool, opts *schedulerPerfOptions) (*scheduler.Scheduler, informers.SharedInformerFactory, ktesting.TContext) {
+func mustSetupCluster(tCtx ktesting.TContext, config *config.KubeSchedulerConfiguration, enabledFeatures map[featuregate.Feature]bool, opts *schedulerPerfOptions) (*scheduler.Scheduler, informers.SharedInformerFactory, <-chan struct{}, ktesting.TContext) {
 	var runtimeConfig []string
 	if enabledFeatures[features.DynamicResourceAllocation] {
 		runtimeConfig = append(runtimeConfig, fmt.Sprintf("%s=true", resourceapi.SchemeGroupVersion))
 		runtimeConfig = append(runtimeConfig, fmt.Sprintf("%s=true", resourcev1beta2.SchemeGroupVersion))
 		runtimeConfig = append(runtimeConfig, fmt.Sprintf("%s=true", resourcev1beta1.SchemeGroupVersion))
 		runtimeConfig = append(runtimeConfig, fmt.Sprintf("%s=true", resourcealpha.SchemeGroupVersion))
+	}
+	if enabledFeatures[features.GenericWorkload] {
+		runtimeConfig = append(runtimeConfig, fmt.Sprintf("%s=true", schedulingapiv1beta1.SchemeGroupVersion))
+	}
+	if enabledFeatures[features.CompositePodGroup] {
+		runtimeConfig = append(runtimeConfig, fmt.Sprintf("%s=true", schedulingapiv1alpha3.SchemeGroupVersion))
 	}
 	customFlags := []string{
 		// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
@@ -112,9 +120,12 @@ func mustSetupCluster(tCtx ktesting.TContext, config *config.KubeSchedulerConfig
 		tCtx.Fatalf("start apiserver: %v", err)
 	}
 	// Cleanup will be in reverse order: first the clients by canceling the
-	// child context (happens automatically), then the server.
+	// child context, then the server.
 	tCtx.Cleanup(server.TearDownFn)
 	tCtx = tCtx.WithCancel()
+	tCtx.Cleanup(func() {
+		tCtx.Cancel("test is done")
+	})
 
 	// TODO: client connection configuration, such as QPS or Burst is configurable in theory, this could be derived from the `config`, need to
 	// support this when there is any testcase that depends on such configuration.
@@ -135,11 +146,10 @@ func mustSetupCluster(tCtx ktesting.TContext, config *config.KubeSchedulerConfig
 
 	// Not all config options will be effective but only those mostly related with scheduler performance will
 	// be applied to start a scheduler, most of them are defined in `scheduler.schedulerOptions`.
-	scheduler, informerFactory := util.StartScheduler(tCtx, config, opts.outOfTreePluginRegistry)
+	scheduler, informerFactory, done := util.StartSchedulerWithDone(tCtx, config, opts.outOfTreePluginRegistry)
 	util.StartFakePVController(tCtx, tCtx.Client(), informerFactory)
 	runGC := util.CreateGCController(tCtx, tCtx, *cfg, informerFactory)
 	runNS := util.CreateNamespaceController(tCtx, tCtx, *cfg, informerFactory)
-
 	runResourceClaimController := func() {}
 	if enabledFeatures[features.DynamicResourceAllocation] {
 		// Testing of DRA with inline resource claims depends on this
@@ -153,7 +163,7 @@ func mustSetupCluster(tCtx ktesting.TContext, config *config.KubeSchedulerConfig
 	go runNS()
 	go runResourceClaimController()
 
-	return scheduler, informerFactory, tCtx
+	return scheduler, informerFactory, done, tCtx
 }
 
 func isAttempted(pod *v1.Pod) bool {
@@ -222,6 +232,10 @@ type podScheduling struct {
 	completed     int
 	observedTotal int
 	observedRate  float64
+	activePods    int
+	backoffPods   int
+	unschedulable int
+	gatedPods     int
 }
 
 // makeBasePod creates a Pod object to be used as a template.
@@ -230,7 +244,7 @@ func makeBasePod() *v1.Pod {
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "pod-",
 		},
-		Spec: testutils.MakePodSpec(),
+		Spec: MakePodSpec(),
 	}
 	return basePod
 }
@@ -303,15 +317,20 @@ func dataItems2JSONFile(dataItems DataItems, namePrefix string) error {
 	return os.WriteFile(destFile, formatted.Bytes(), 0644)
 }
 
-func dataFilename(destFile string) (string, error) {
+func createOutputFile(suffix string) (*os.File, error) {
+	destFile := perTestFilePrefix + suffix
 	if *dataItemsDir != "" {
 		// Ensure the "dataItemsDir" path is valid.
 		if err := os.MkdirAll(*dataItemsDir, 0750); err != nil {
-			return "", fmt.Errorf("dataItemsDir path %v does not exist and cannot be created: %w", *dataItemsDir, err)
+			return nil, fmt.Errorf("dataItemsDir path %v does not exist and cannot be created: %w", *dataItemsDir, err)
 		}
 		destFile = path.Join(*dataItemsDir, destFile)
 	}
-	return destFile, nil
+	f, err := os.Create(destFile)
+	if err != nil {
+		return nil, fmt.Errorf("create output file: %w", err)
+	}
+	return f, nil
 }
 
 type labelValues struct {
@@ -359,17 +378,23 @@ func (*metricsCollector) run(tCtx ktesting.TContext) {
 }
 
 func (mc *metricsCollector) collect() []DataItem {
+	gm, err := testutil.GatherMetrics(legacyregistry.DefaultGatherer)
+	if err != nil {
+		klog.ErrorS(err, "failed to gather metrics for collection")
+		return nil
+	}
+
 	var dataItems []DataItem
 	for metric, labelValsSlice := range mc.Metrics {
 		// no filter is specified, aggregate all the metrics within the same metricFamily.
 		if labelValsSlice == nil {
-			dataItem := collectHistogramVec(metric, mc.labels, nil)
+			dataItem := collectHistogramVec(gm, metric, mc.labels, nil)
 			if dataItem != nil {
 				dataItems = append(dataItems, *dataItem)
 			}
 		} else {
 			for _, lvMap := range uniqueLVCombos(labelValsSlice) {
-				dataItem := collectHistogramVec(metric, mc.labels, lvMap)
+				dataItem := collectHistogramVec(gm, metric, mc.labels, lvMap)
 				if dataItem != nil {
 					dataItems = append(dataItems, *dataItem)
 				}
@@ -405,8 +430,8 @@ func uniqueLVCombos(lvs []*labelValues) []map[string]string {
 	return results
 }
 
-func collectHistogramVec(metric string, labels map[string]string, lvMap map[string]string) *DataItem {
-	vec, err := testutil.GetHistogramVecFromGatherer(legacyregistry.DefaultGatherer, metric, lvMap)
+func collectHistogramVec(gm *testutil.GatheredMetrics, metric string, labels map[string]string, lvMap map[string]string) *DataItem {
+	vec, err := gm.GetHistogramVec(metric, lvMap)
 	if err != nil {
 		// "metric ... not found" is pretty normal. Don't spam the output with it!
 		if !strings.HasSuffix(err.Error(), "not found") {
@@ -555,6 +580,11 @@ func (tc *throughputCollector) run(tCtx ktesting.TContext) {
 	started := false
 	skipped := 0
 
+	activePods := schedulermetrics.ActivePods()
+	backoffPods := schedulermetrics.BackoffPods()
+	unschedulablePods := schedulermetrics.UnschedulablePods()
+	gatedPods := schedulermetrics.GatedPods()
+
 	for {
 		select {
 		case <-tCtx.Done():
@@ -612,12 +642,20 @@ func (tc *throughputCollector) run(tCtx ktesting.TContext) {
 			if err != nil {
 				klog.Error(err)
 			}
+			activePods, _ := testutil.GetGaugeMetricValue(activePods)
+			backoffPods, _ := testutil.GetGaugeMetricValue(backoffPods)
+			unschedulable, _ := testutil.GetGaugeMetricValue(unschedulablePods)
+			gatedPods, _ := testutil.GetGaugeMetricValue(gatedPods)
 			tc.progress = append(tc.progress, podScheduling{
 				ts:            now,
 				attempts:      int(counters["unschedulable"] + counters["error"] + counters["scheduled"]),
 				completed:     int(counters["scheduled"]),
 				observedTotal: scheduled,
 				observedRate:  throughput,
+				activePods:    int(activePods),
+				backoffPods:   int(backoffPods),
+				unschedulable: int(unschedulable),
+				gatedPods:     int(gatedPods),
 			})
 
 			lastScheduledCount = scheduled

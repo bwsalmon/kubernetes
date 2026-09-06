@@ -53,6 +53,11 @@ func RegisterQueueSortPlugin(pluginName string, pluginNewFunc runtime.PluginFact
 	return RegisterPluginAsExtensions(pluginName, pluginNewFunc, "QueueSort")
 }
 
+// RegisterPreEnqueuePlugin returns a function to register a PreEnqueue Plugin to a given registry.
+func RegisterPreEnqueuePlugin(pluginName string, pluginNewFunc runtime.PluginFactory) RegisterPluginFunc {
+	return RegisterPluginAsExtensions(pluginName, pluginNewFunc, "PreEnqueue")
+}
+
 // RegisterPreFilterPlugin returns a function to register a PreFilter Plugin to a given registry.
 func RegisterPreFilterPlugin(pluginName string, pluginNewFunc runtime.PluginFactory) RegisterPluginFunc {
 	return RegisterPluginAsExtensions(pluginName, pluginNewFunc, "PreFilter")
@@ -66,6 +71,11 @@ func RegisterFilterPlugin(pluginName string, pluginNewFunc runtime.PluginFactory
 // RegisterPostFilterPlugin returns a function to register a PostFilter Plugin to a given registry.
 func RegisterPostFilterPlugin(pluginName string, pluginNewFunc runtime.PluginFactory) RegisterPluginFunc {
 	return RegisterPluginAsExtensions(pluginName, pluginNewFunc, "PostFilter")
+}
+
+// RegisterPodGroupPostFilterPlugin returns a function to register a PodGroupPostFilter Plugin to a given registry.
+func RegisterPodGroupPostFilterPlugin(pluginName string, pluginNewFunc runtime.PluginFactory) RegisterPluginFunc {
+	return RegisterPluginAsExtensions(pluginName, pluginNewFunc, "PodGroupPostFilter")
 }
 
 // RegisterReservePlugin returns a function to register a Reserve Plugin to a given registry.
@@ -96,6 +106,16 @@ func RegisterPreScorePlugin(pluginName string, pluginNewFunc runtime.PluginFacto
 // RegisterBindPlugin returns a function to register a Bind Plugin to a given registry.
 func RegisterBindPlugin(pluginName string, pluginNewFunc runtime.PluginFactory) RegisterPluginFunc {
 	return RegisterPluginAsExtensions(pluginName, pluginNewFunc, "Bind")
+}
+
+// RegisterPlacementGeneratePlugin returns a function to register a PlacementGenerate Plugin to a given registry.
+func RegisterPlacementGeneratePlugin(pluginName string, pluginNewFunc runtime.PluginFactory) RegisterPluginFunc {
+	return RegisterPluginAsExtensions(pluginName, pluginNewFunc, "PlacementGenerate")
+}
+
+// RegisterPlacementScorePlugin returns a function to register a PlacementScore Plugin to a given registry.
+func RegisterPlacementScorePlugin(pluginName string, pluginNewFunc runtime.PluginFactory, weight int32) RegisterPluginFunc {
+	return RegisterPluginAsExtensionsWithWeight(pluginName, weight, pluginNewFunc, "PlacementScore")
 }
 
 // RegisterPluginAsExtensions returns a function to register a Plugin as given extensionPoints to a given registry.
@@ -130,6 +150,8 @@ func getPluginSetByExtension(plugins *schedulerapi.Plugins, extension string) *s
 	switch extension {
 	case "QueueSort":
 		return &plugins.QueueSort
+	case "PreEnqueue":
+		return &plugins.PreEnqueue
 	case "Filter":
 		return &plugins.Filter
 	case "PostFilter":
@@ -150,6 +172,10 @@ func getPluginSetByExtension(plugins *schedulerapi.Plugins, extension string) *s
 		return &plugins.PreBind
 	case "PostBind":
 		return &plugins.PostBind
+	case "PlacementGenerate":
+		return &plugins.PlacementGenerate
+	case "PlacementScore":
+		return &plugins.PlacementScore
 	default:
 		return nil
 	}

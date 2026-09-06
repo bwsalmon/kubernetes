@@ -193,7 +193,7 @@ func (gc *GarbageCollector) Sync(ctx context.Context, discoveryClient discovery.
 		logger := klog.FromContext(ctx)
 
 		// Get the current resource list from discovery.
-		newResources, err := GetDeletableResources(logger, discoveryClient)
+		newResources, err := GetDeletableResources(ctx, discovery.ToServerResourcesInterfaceWithContext(discoveryClient))
 
 		if len(newResources) == 0 {
 			logger.V(2).Info("no resources reported by discovery, skipping garbage collector sync")
@@ -625,7 +625,12 @@ func (gc *GarbageCollector) attemptToDeleteItem(ctx context.Context, item *node)
 		// FinalizerDeletingDependents from the item, resulting in the final
 		// deletion of the item.
 		policy := metav1.DeletePropagationForeground
-		return gc.deleteObject(item.identity, latest.ResourceVersion, latest.OwnerReferences, &policy)
+		err := gc.deleteObject(item.identity, latest.ResourceVersion, latest.OwnerReferences, &policy)
+		if errors.IsNotFound(err) {
+			gc.dependencyGraphBuilder.enqueueVirtualDeleteEvent(item.identity)
+			return enqueuedVirtualDeleteEventErr
+		}
+		return err
 	default:
 		// item doesn't have any solid owner, so it needs to be garbage
 		// collected. Also, none of item's owners is waiting for the deletion of
@@ -646,7 +651,12 @@ func (gc *GarbageCollector) attemptToDeleteItem(ctx context.Context, item *node)
 			"item", item.identity,
 			"propagationPolicy", policy,
 		)
-		return gc.deleteObject(item.identity, latest.ResourceVersion, latest.OwnerReferences, &policy)
+		err := gc.deleteObject(item.identity, latest.ResourceVersion, latest.OwnerReferences, &policy)
+		if errors.IsNotFound(err) {
+			gc.dependencyGraphBuilder.enqueueVirtualDeleteEvent(item.identity)
+			return enqueuedVirtualDeleteEventErr
+		}
+		return err
 	}
 }
 
@@ -783,8 +793,9 @@ func (gc *GarbageCollector) GraphHasUID(u types.UID) bool {
 // All discovery errors are considered temporary. Upon encountering any error,
 // GetDeletableResources will log and return any discovered resources it was
 // able to process (which may be none).
-func GetDeletableResources(logger klog.Logger, discoveryClient discovery.ServerResourcesInterface) (map[schema.GroupVersionResource]struct{}, error) {
-	preferredResources, lookupErr := discoveryClient.ServerPreferredResources()
+func GetDeletableResources(ctx context.Context, discoveryClient discovery.ServerResourcesInterfaceWithContext) (map[schema.GroupVersionResource]struct{}, error) {
+	logger := klog.FromContext(ctx)
+	preferredResources, lookupErr := discoveryClient.ServerPreferredResourcesWithContext(ctx)
 	if lookupErr != nil {
 		if groupLookupFailures, isLookupFailure := discovery.GroupDiscoveryFailedErrorGroups(lookupErr); isLookupFailure {
 			// Serialize groupLookupFailures here as map[schema.GroupVersion]error is not json encodable, otherwise the

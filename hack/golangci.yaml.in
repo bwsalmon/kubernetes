@@ -93,14 +93,14 @@ linters:
 
       # The Kubernetes naming convention for conversion functions uses underscores
       # and intentionally deviates from normal Go conventions to make those function
-      # names more readable. Same for SetDefaults_*.
+      # names more readable. Same for SetDefaults_* and ValidateCustom_*.
       #
       # https://github.com/kubernetes/kubernetes/issues/117288#issuecomment-1507028627
       # https://github.com/kubernetes/kubernetes/issues/117288#issuecomment-1514201592
       - linters:
           - staticcheck
           - revive
-        text: "(ST1003: should not use underscores in Go names; func ([cC]onvert_.*_To_.*|[sS]etDefaults_)|exported: exported function (Convert|SetDefaults)_.* should be of the form)"
+        text: "(ST1003: should not use underscores in Go names; func ([cC]onvert_.*_To_.*|[sS]etDefaults_|ValidateCustom_)|exported: exported function (Convert|SetDefaults|ValidateCustom)_.* should be of the form)"
 
       # The generated swagger docs also don't follow the naming convention.
       - linters:
@@ -153,7 +153,7 @@ linters:
       - linters:
         - kubeapilinter
         path-except: staging/src/k8s.io/api/.*
-        
+
       {{include "hack/kube-api-linter/exceptions.yaml" | indent 6 | trim}}
 
       - linters:
@@ -186,22 +186,23 @@ linters:
   settings: # please keep this alphabetized
     custom:
       logcheck:
-        # Installed there by hack/verify-golangci-lint.sh.
-        path: _output/local/bin/logcheck.so
+        # hack/tools/golangci-lint/main.go compiles this linter into golangci-lint.
+        type: module
         description: structured logging checker
         original-url: k8s.io/logtools/logcheck
         settings:
           config: |
             {{include "hack/logcheck.conf" | indent 12 | trim}}
       sorted:
-        # Installed there by hack/verify-golangci-lint.sh.
-        path: _output/local/bin/sorted.so
+        # hack/tools/golangci-lint/main.go compiles this linter into golangci-lint.
+        type: module
         description: check if feature gates are sorted
         original-url: k8s.io/kubernetes/hack/tools/golangci-lint/sorted
         settings:
           {{include "hack/tools/golangci-lint/sorted/config.yaml" | indent 10 | trim}}
       kubeapilinter:
-        path: _output/local/bin/kube-api-linter.so
+        # hack/tools/golangci-lint/main.go compiles this linter into golangci-lint.
+        type: module
         description: kube-api-linter and lints Kube like APIs based on API conventions and best practices.
         original-url: sigs.k8s.io/kube-api-linter
         settings:
@@ -229,6 +230,9 @@ linters:
     forbidigo:
       analyze-types: true
       forbid:
+        - pattern: \.AnnotatedEventf$
+          # https://github.com/kubernetes/kubernetes/pull/137270
+          msg: "Do not use AnnotatedEventf. Events are fire-and-forget and aggressively throttled; do not rely on them to pass state or metadata for programmatic triggers."
         - pattern: md5\.*
           # https://github.com/kubernetes/kubernetes/issues/129652
           msg: md5 is oudated, insecure, prefer a secure hash (such as sha256) or a non-cryptographic hash
@@ -239,7 +243,7 @@ linters:
           pkg: ^k8s\.io/client-go/applyconfigurations/
           msg: should not be used because managedFields was removed
         - pattern: \.Add$
-          pkg: ^k8s\.io/component-base/featuregate$         
+          pkg: ^k8s\.io/component-base/featuregate$
           msg: should not use Add, use AddVersioned instead
         - pattern: \.(ReportBeforeSuite|ReportAfterSuite)
           pkg: ^github\.com/onsi/ginkgo/v2$
@@ -251,7 +255,7 @@ linters:
           msg: "it does not produce a good failure message - use BeTrueBecause with an explicit printf-style failure message instead, or plain Go: if ... { ginkgo.Fail(...) }"
         - pattern: ^gomega\.BeFalse$
           pkg: ^github.com/onsi/gomega$
-          msg: "it does not produce a good failure message - use BeFalseBecause with an explicit printf-style failure message instead, or plain Go: if ... { ginkgo.Fail(...) }"        
+          msg: "it does not produce a good failure message - use BeFalseBecause with an explicit printf-style failure message instead, or plain Go: if ... { ginkgo.Fail(...) }"
       {{- end}}
       {{- if .Base }}
     gocritic:
@@ -291,12 +295,6 @@ linters:
         # and it's just syntactic sugar.
         - any
         {{- if .Base }}
-        # Replace []byte(fmt.Sprintf) with fmt.Appendf.
-        #
-        # A useful hint for new code, but
-        # should only be updated in old code
-        # where it really matters.
-        - fmtappendf
         # Replace explicit loops over maps with calls to maps package.
         #
         # Completely disabled because the benefit
@@ -306,15 +304,23 @@ linters:
         #
         # A useful hint for new code.
         - minmax
-        {{- end }}
-        # simplify code by using go1.26's new(expr)
-        # should only be updated in old code where it really matters (= always disable in base)
-        # and needs to remain disabled as hint until Go 1.26 is also available for backported code (https://github.com/kubernetes/kubernetes/issues/137595)
+
+        # Disable things that should only be updated in old code where it really matters.
+
+        # go 1.26: can simplify with new(expr)
         - newexpr
-        {{- if .Base }}
-        # use iterators instead of Len/At-style APIs
-        # should only be updated in old code where it really matters.
+        # go 1.26: can use iterators instead of Len/At-style APIs
         - stditerators
+        # go 1.27: can declare embedded fields inline
+        - embedlit
+        # go 1.27: can simplify with reflect.TypeAssert
+        - reflecttypeassert
+        # go 1.27: can simplify atomic int assignment/access
+        - atomictypes
+        # go 1.27: can simplify with errors.AsType
+        - errorsastype
+        # go 1.27: can simplify with slices.Backward
+        - slicesbackward
         {{- end }}
         # Suggest replacing omitempty with omitzero for struct fields.
         #
@@ -369,7 +375,7 @@ linters:
         # Please enable when all supported Kubernetes versions
         # are on GoLang 1.25+
         {{- end }}
-        - waitgroup
+        - waitgroupgo
 
     revive:
       # Only these rules are enabled.

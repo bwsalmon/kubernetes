@@ -17,10 +17,11 @@ limitations under the License.
 package pleg
 
 import (
+	"context"
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
-	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	"k8s.io/klog/v2"
 )
 
 // PodLifeCycleEventType define the event type of pod life cycle events.
@@ -63,34 +64,11 @@ type PodLifecycleEvent struct {
 
 // PodLifecycleEventGenerator contains functions for generating pod life cycle events.
 type PodLifecycleEventGenerator interface {
-	Start()
+	Start(ctx context.Context)
 	Watch() chan *PodLifecycleEvent
 	Healthy() (bool, error)
 	// RequestReinspect flags the pod for reinspection on the next Relist iteration.
 	RequestReinspect(podUID types.UID)
-}
-
-// podLifecycleEventGeneratorHandler contains functions that are useful for different PLEGs
-// and need not be exposed to rest of the kubelet
-type podLifecycleEventGeneratorHandler interface {
-	PodLifecycleEventGenerator
-	Stop()
-	Update(relistDuration *RelistDuration)
-	Relist()
-}
-
-// WatchCondition takes the latest PodStatus, and returns whether the condition is met.
-type WatchCondition = func(*kubecontainer.PodStatus) bool
-
-// RunningContainerWatchCondition wraps a condition on the container status to make a pod
-// WatchCondition. If the container is no longer running, the condition is implicitly cleared.
-func RunningContainerWatchCondition(containerName string, condition func(*kubecontainer.Status) bool) WatchCondition {
-	return func(podStatus *kubecontainer.PodStatus) bool {
-		status := podStatus.FindContainerStatusByName(containerName)
-		if status == nil || status.State != kubecontainer.ContainerStateRunning {
-			// Container isn't running. Consider the condition "completed" so it is cleared.
-			return true
-		}
-		return condition(status)
-	}
+	// RequestRelist queues up the pod for an on-demand relist.
+	RequestRelist(logger klog.Logger, podUID types.UID)
 }

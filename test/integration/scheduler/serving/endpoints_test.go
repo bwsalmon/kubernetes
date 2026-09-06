@@ -19,6 +19,7 @@ package serving
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,8 +28,11 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/wait"
 	apiserverfeat "k8s.io/apiserver/pkg/features"
 	flagzv1alpha1 "k8s.io/apiserver/pkg/server/flagz/api/v1alpha1"
 	flagzv1beta1 "k8s.io/apiserver/pkg/server/flagz/api/v1beta1"
@@ -41,10 +45,25 @@ import (
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/component-base/zpages/features"
 	"k8s.io/klog/v2/ktesting"
+	kubeschedulerconfigv1 "k8s.io/kube-scheduler/config/v1"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	kubeschedulertesting "k8s.io/kubernetes/cmd/kube-scheduler/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
 )
+
+const (
+	// handlerSyncPollInterval governs how often to poll for retry.
+	handlerSyncPollInterval = 100 * time.Millisecond
+	// handlerSyncTimeout is how long to wait for the scheduler to become ready.
+	handlerSyncTimeout = 5 * time.Second
+)
+
+// handlerSyncBackoff gives the scheduler time to report ready.
+var handlerSyncBackoff = wait.Backoff{
+	Duration: handlerSyncPollInterval,
+	Factor:   1.0,
+	Steps:    int(handlerSyncTimeout / handlerSyncPollInterval),
+}
 
 func TestEndpointHandlers(t *testing.T) {
 	server, configStr, _, err := startTestAPIServer(t)
@@ -163,7 +182,7 @@ func TestEndpointHandlers(t *testing.T) {
 			}
 
 			err = retry.OnError(
-				retry.DefaultBackoff,
+				handlerSyncBackoff,
 				func(err error) bool {
 					// the endpoint /readyz/sched-handler-sync needs some time to finish
 					// the initialization, so we need to retry
@@ -234,7 +253,7 @@ func TestSchedulerZPages(t *testing.T) {
 	_, ctx := ktesting.NewTestContext(t)
 	result, err := kubeschedulertesting.StartTestServer(
 		t, ctx,
-		[]string{"--kubeconfig", apiserverConfig.Name(), "--leader-elect=false", "--authorization-always-allow-paths=/statusz,/flagz"},
+		[]string{"--kubeconfig", apiserverConfig.Name(), "--leader-elect=false", "--authorization-always-allow-paths=/statusz,/flagz,/configz"},
 	)
 	if err != nil {
 		t.Fatalf("Failed to start kube-scheduler server: %v", err)
@@ -458,6 +477,18 @@ func TestSchedulerZPages(t *testing.T) {
 		},
 	}
 
+	configzTestCases := []struct {
+		name         string
+		acceptHeader string
+		wantStatus   int
+	}{
+		{
+			name:         "application/json response",
+			acceptHeader: "application/json",
+			wantStatus:   http.StatusOK,
+		},
+	}
+
 	for _, tc := range statuszTestCases {
 		t.Run("statusz_"+tc.name, func(t *testing.T) {
 			req, err := http.NewRequest(http.MethodGet, base+"/statusz", nil)
@@ -533,6 +564,60 @@ func TestSchedulerZPages(t *testing.T) {
 				if tc.wantBodyStructured != nil {
 					warnings := append([]string{}, r.Header.Values("Warning")...)
 					flagztesting.VerifyStructuredResponse(t, tc.acceptHeader, body, warnings, tc.wantBodyStructured, tc.wantDeprecationHeader)
+				}
+			}
+		})
+	}
+
+	for _, tc := range configzTestCases {
+		t.Run("configz_"+tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, base+"/configz", nil)
+			if err != nil {
+				t.Fatalf("failed to request: %v", err)
+			}
+
+			req.Header.Set("Accept", tc.acceptHeader)
+			r, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("failed to GET /configz: %v", err)
+			}
+
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("failed to read response body: %v", err)
+			}
+
+			if err = r.Body.Close(); err != nil {
+				t.Fatalf("failed to close response body: %v", err)
+			}
+
+			if r.StatusCode != tc.wantStatus {
+				t.Fatalf("want status %d, got %d", tc.wantStatus, r.StatusCode)
+			}
+
+			if tc.wantStatus == http.StatusOK {
+				var configz map[string]unstructured.Unstructured
+				if err := json.Unmarshal(body, &configz); err != nil {
+					t.Fatalf("failed to unmarshal configz: %v", err)
+				}
+				cfg, ok := configz["componentconfig"]
+				if !ok {
+					t.Fatalf("configz missing 'componentconfig' key")
+				}
+				if cfg.GetAPIVersion() != "kubescheduler.config.k8s.io/v1" {
+					t.Errorf("unexpected APIVersion: %s", cfg.GetAPIVersion())
+				}
+				if cfg.GetKind() != "KubeSchedulerConfiguration" {
+					t.Errorf("unexpected Kind: %s", cfg.GetKind())
+				}
+
+				// confirm that they expose public config type
+				var schedulerConfig kubeschedulerconfigv1.KubeSchedulerConfiguration
+				err = json.Unmarshal(body, &struct {
+					ComponentConfig *kubeschedulerconfigv1.KubeSchedulerConfiguration `json:"componentconfig"`
+				}{ComponentConfig: &schedulerConfig})
+				if err != nil {
+					t.Errorf("failed to deserialize into public config type: %v", err)
 				}
 			}
 		})

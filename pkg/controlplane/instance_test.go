@@ -31,8 +31,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	autoscalingrest "k8s.io/kubernetes/pkg/registry/autoscaling/rest"
-	resourcerest "k8s.io/kubernetes/pkg/registry/resource/rest"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
 
 	batchapiv1beta1 "k8s.io/api/batch/v1beta1"
 	certificatesapiv1beta1 "k8s.io/api/certificates/v1beta1"
@@ -50,6 +49,8 @@ import (
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
+	"k8s.io/apiserver/pkg/registry/generic/registry"
+	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/options"
 	"k8s.io/apiserver/pkg/server/resourceconfig"
@@ -72,14 +73,17 @@ import (
 	"k8s.io/kubernetes/pkg/kubeapiserver"
 	kubeletclient "k8s.io/kubernetes/pkg/kubelet/client"
 	appsrest "k8s.io/kubernetes/pkg/registry/apps/rest"
+	autoscalingrest "k8s.io/kubernetes/pkg/registry/autoscaling/rest"
 	batchrest "k8s.io/kubernetes/pkg/registry/batch/rest"
 	certificatesrest "k8s.io/kubernetes/pkg/registry/certificates/rest"
 	corerest "k8s.io/kubernetes/pkg/registry/core/rest"
 	discoveryrest "k8s.io/kubernetes/pkg/registry/discovery/rest"
+	lifecyclerest "k8s.io/kubernetes/pkg/registry/lifecycle/rest"
 	networkingrest "k8s.io/kubernetes/pkg/registry/networking/rest"
 	noderest "k8s.io/kubernetes/pkg/registry/node/rest"
 	policyrest "k8s.io/kubernetes/pkg/registry/policy/rest"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
+	resourcerest "k8s.io/kubernetes/pkg/registry/resource/rest"
 	schedulingrest "k8s.io/kubernetes/pkg/registry/scheduling/rest"
 	storagerest "k8s.io/kubernetes/pkg/registry/storage/rest"
 )
@@ -538,7 +542,7 @@ func TestGenericStorageProviders(t *testing.T) {
 		}
 
 		// special case: we identify full core and generic core
-		if kt.Kind() == reflect.Ptr && kt.Elem().PkgPath() == reflect.TypeOf(corerest.Config{}).PkgPath() {
+		if kt.Kind() == reflect.Pointer && kt.Elem().PkgPath() == reflect.TypeOf(corerest.Config{}).PkgPath() {
 			kt = reflect.TypeOf(&corerest.GenericConfig{})
 		}
 
@@ -557,7 +561,8 @@ func TestGenericStorageProviders(t *testing.T) {
 			schedulingrest.RESTStorageProvider,
 			storagerest.RESTStorageProvider,
 			appsrest.StorageProvider,
-			resourcerest.RESTStorageProvider:
+			resourcerest.RESTStorageProvider,
+			lifecyclerest.RESTStorageProvider:
 			// all these are non-generic, but kube specific
 			continue
 		default:
@@ -568,6 +573,148 @@ func TestGenericStorageProviders(t *testing.T) {
 	if g != len(generic) {
 		t.Errorf("Unexpected, generic APIs found: %#v", generic[g:])
 	}
+}
+
+// TestGetResetFieldsHasAllVersions verifies that every storage implementing
+// ResetFieldsStrategy or ResetFieldsFilterStrategy returns entries for all
+// served API versions of that resource.
+func TestGetResetFieldsHasAllVersions(t *testing.T) {
+	_, config, _ := setUp(t)
+
+	client, err := kubernetes.NewForConfig(config.ControlPlane.Generic.LoopbackClientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	providers, err := config.Complete().StorageProviders(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enable all versions (including alpha and beta) to test comprehensively.
+	allVersionsConfig := DefaultAPIResourceConfigSource()
+	allVersionsConfig.EnableVersions(betaAPIGroupVersionsDisabledByDefault...)
+	allVersionsConfig.EnableVersions(alphaAPIGroupVersionsDisabledByDefault...)
+
+	for _, provider := range providers {
+		groupName := provider.GroupName()
+		apiGroupInfo, err := provider.NewRESTStorage(allVersionsConfig, config.ControlPlane.Generic.RESTOptionsGetter)
+		if err != nil {
+			t.Errorf("error creating REST storage for %s: %v", groupName, err)
+			continue
+		}
+
+		allServedVersionsByResource := map[string][]string{}
+		for v, resourcesInVersion := range apiGroupInfo.VersionedResourcesStorageMap {
+			for resource := range resourcesInVersion {
+				var apiVersion string
+				if len(groupName) == 0 {
+					apiVersion = v
+				} else {
+					apiVersion = groupName + "/" + v
+				}
+				allServedVersionsByResource[resource] = append(allServedVersionsByResource[resource], apiVersion)
+			}
+		}
+
+		// Check every storage that implements GetResetFields or GetResetFieldsFilter.
+		for v, resourcesInVersion := range apiGroupInfo.VersionedResourcesStorageMap {
+			for resource, storage := range resourcesInVersion {
+				servedVersions := allServedVersionsByResource[resource]
+				if len(servedVersions) <= 1 {
+					continue // only one version, nothing to check
+				}
+				if rfs, ok := storage.(rest.ResetFieldsStrategy); ok {
+					resetFields := rfs.GetResetFields()
+					if resetFields == nil {
+						continue // no reset fields, nothing to check
+					}
+					for _, sv := range servedVersions {
+						if _, exists := resetFields[fieldpath.APIVersion(sv)]; !exists {
+							t.Errorf("%s: GetResetFields() is missing version %q, has %v; all served versions: %v",
+								gvr(groupName, v, resource), sv, resetFields, servedVersions)
+						}
+					}
+				}
+
+				if rfs, ok := storage.(rest.ResetFieldsFilterStrategy); ok {
+					resetFieldsFilter := rfs.GetResetFieldsFilter()
+					if resetFieldsFilter == nil {
+						continue
+					}
+					for _, sv := range servedVersions {
+						if _, exists := resetFieldsFilter[fieldpath.APIVersion(sv)]; !exists {
+							t.Errorf("%s: GetResetFieldsFilter() is missing version %q, has %v; all served versions: %v",
+								gvr(groupName, v, resource), sv, resetFieldsFilter, servedVersions)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestDeclarativeValidationEnablementInStrategies verifies that every CreateStrategy and
+// UpdateStrategy installed supports declarative validation.
+func TestDeclarativeValidationEnablementInStrategies(t *testing.T) {
+	_, config, _ := setUp(t)
+
+	client, err := kubernetes.NewForConfig(config.ControlPlane.Generic.LoopbackClientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	providers, err := config.Complete().StorageProviders(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enable all versions (including alpha and beta) so the check covers
+	// every resource that kube-apiserver can serve.
+	allVersionsConfig := DefaultAPIResourceConfigSource()
+	allVersionsConfig.EnableVersions(betaAPIGroupVersionsDisabledByDefault...)
+	allVersionsConfig.EnableVersions(alphaAPIGroupVersionsDisabledByDefault...)
+
+	for _, provider := range providers {
+		groupName := provider.GroupName()
+		apiGroupInfo, err := provider.NewRESTStorage(allVersionsConfig, config.ControlPlane.Generic.RESTOptionsGetter)
+		if err != nil {
+			t.Errorf("error creating REST storage for %s: %v", groupName, err)
+			continue
+		}
+
+		for v, resourcesInVersion := range apiGroupInfo.VersionedResourcesStorageMap {
+			for resource, storage := range resourcesInVersion {
+				gs, ok := storage.(registry.GenericStore)
+				if !ok {
+					// Non-generic storage (e.g. proxy/exec subresources)
+					// has no strategy to check.
+					continue
+				}
+				name := gvr(groupName, v, resource)
+				if cs := gs.GetCreateStrategy(); cs != nil {
+					if _, ok := cs.(rest.DeclarativeValidationStrategy); !ok {
+						t.Errorf("%s: CreateStrategy %T does not implement rest.DeclarativeValidationStrategy; embed rest.DeclarativeValidation to enable automatic declarative validation", name, cs)
+					}
+				}
+				if us := gs.GetUpdateStrategy(); us != nil {
+					if _, ok := us.(rest.DeclarativeValidationStrategy); !ok {
+						t.Errorf("%s: UpdateStrategy %T does not implement rest.DeclarativeValidationStrategy; embed rest.DeclarativeValidation to enable automatic declarative validation", name, us)
+					}
+				}
+			}
+		}
+	}
+}
+
+func gvr(g string, v string, r string) string {
+	var gvr string
+	if len(g) == 0 {
+		gvr = fmt.Sprintf("%s/%s", v, r)
+	} else {
+		gvr = fmt.Sprintf("%s/%s/%s", g, v, r)
+	}
+	return gvr
 }
 
 // noStorageVersionHash lists resources that legitimately with empty storage
@@ -606,6 +753,8 @@ var gvrToStorageVersionHash = map[string]string{
 	"batch/v1/jobs":     "mudhfqk/qZY=",
 	"batch/v1/cronjobs": "sd5LIXh4Fjs=",
 	"certificates.k8s.io/v1/certificatesigningrequests":                 "95fRKMXA+00=",
+	"certificates.k8s.io/v1/clustertrustbundles":                        "v5yhuVertL4=",
+	"certificates.k8s.io/v1/podcertificaterequests":                     "wYA9yXQH8fg=",
 	"coordination.k8s.io/v1/leases":                                     "gqkMMb/YqFM=",
 	"discovery.k8s.io/v1/endpointslices":                                "qgS0xkrxYAI=",
 	"networking.k8s.io/v1/networkpolicies":                              "YpfwF18m1G8=",
@@ -620,6 +769,7 @@ var gvrToStorageVersionHash = map[string]string{
 	"rbac.authorization.k8s.io/v1/rolebindings":                         "eGsCzGH6b1g=",
 	"rbac.authorization.k8s.io/v1/roles":                                "7FuwZcIIItM=",
 	"resource.k8s.io/v1/deviceclasses":                                  "Yk2PTc1Ybxk=",
+	"resource.k8s.io/v1/devicetaintrules":                               "i+85+TcIKpA=",
 	"resource.k8s.io/v1/resourceclaims":                                 "wgAZaHcZxUg=",
 	"resource.k8s.io/v1/resourceclaimtemplates":                         "TuzjC49aUfM=",
 	"resource.k8s.io/v1/resourceslices":                                 "KsC072WgaEY=",
@@ -630,6 +780,7 @@ var gvrToStorageVersionHash = map[string]string{
 	"storage.k8s.io/v1/csistoragecapacities":                            "xeVl+2Ly1kE=",
 	"storage.k8s.io/v1/volumeattachments":                               "tJx/ezt6UDU=",
 	"storage.k8s.io/v1/volumeattributesclasses":                         "tIjydgKBC5w=",
+	"storagemigration.k8s.io/v1/storageversionmigrations":               "pCjmmKOkLy4=",
 	"apps/v1/controllerrevisions":                                       "85nkx63pcBU=",
 	"apps/v1/daemonsets":                                                "dd7pWHUlMKQ=",
 	"apps/v1/deployments":                                               "8aSe+NMegvE=",
@@ -637,8 +788,8 @@ var gvrToStorageVersionHash = map[string]string{
 	"apps/v1/statefulsets":                                              "H+vl74LkKdo=",
 	"admissionregistration.k8s.io/v1/mutatingwebhookconfigurations":     "Sqi0GUgDaX0=",
 	"admissionregistration.k8s.io/v1/validatingwebhookconfigurations":   "B0wHjQmsGNk=",
-	"admissionregistration.k8s.io/v1/mutatingadmissionpolicies":         "LYmCf+UMVdg=",
-	"admissionregistration.k8s.io/v1/mutatingadmissionpolicybindings":   "90V5FRZZ3Zg=",
+	"admissionregistration.k8s.io/v1/mutatingadmissionpolicies":         "mHCkTKpUTrE=",
+	"admissionregistration.k8s.io/v1/mutatingadmissionpolicybindings":   "ZKgZT1uTmZ0=",
 	"admissionregistration.k8s.io/v1/validatingadmissionpolicies":       "6OxvlMmQ6is=",
 	"admissionregistration.k8s.io/v1/validatingadmissionpolicybindings": "v9715VZqakg=",
 	"events.k8s.io/v1/events":                                           "r2yiGXH7wu8=",

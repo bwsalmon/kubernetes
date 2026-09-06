@@ -76,7 +76,7 @@ func ValidateStorageClassUpdate(storageClass, oldStorageClass *storage.StorageCl
 func validateProvisioner(provisioner string, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	if len(provisioner) == 0 {
-		allErrs = append(allErrs, field.Required(fldPath, provisioner)).MarkCoveredByDeclarative()
+		allErrs = append(allErrs, field.Required(fldPath, provisioner).MarkCoveredByDeclarative())
 	}
 	if len(provisioner) > 0 {
 		allErrs = append(allErrs, apivalidation.ValidateQualifiedName(strings.ToLower(provisioner), fldPath)...)
@@ -210,7 +210,7 @@ func validateVolumeError(e *storage.VolumeError, fldPath *field.Path) field.Erro
 		return allErrs
 	}
 	if len(e.Message) > maxVolumeErrorMessageSize {
-		allErrs = append(allErrs, field.TooLong(fldPath.Child("message"), "" /*unused*/, maxAttachedVolumeMetadataSize))
+		allErrs = append(allErrs, field.TooLong(fldPath.Child("message"), "" /*unused*/, maxVolumeErrorMessageSize))
 	}
 
 	if e.ErrorCode != nil {
@@ -302,6 +302,80 @@ func ValidateCSINodeUpdate(new, old *storage.CSINode) field.ErrorList {
 				}
 			}
 		}
+	}
+	return allErrs
+}
+
+var validStorageHealthStatusTypes = sets.New(
+	storage.StorageUnreachable,
+	storage.StorageDegraded,
+)
+
+var validStorageHealthAccessModes = sets.New(
+	api.ReadWriteOnce,
+	api.ReadOnlyMany,
+	api.ReadWriteMany,
+	api.ReadWriteOncePod,
+)
+
+const maxStorageHealthConditions = 16
+
+func validateStorageHealthCondition(condition storage.StorageHealthCondition, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if !validStorageHealthStatusTypes.Has(condition.Status) {
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("status"), condition.Status, sets.List(validStorageHealthStatusTypes)))
+	}
+	if len(condition.Reason) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("reason"), ""))
+	} else {
+		for _, msg := range metav1validation.IsValidConditionReason(condition.Reason) {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("reason"), condition.Reason, msg))
+		}
+		if len(condition.Reason) > 256 {
+			allErrs = append(allErrs, field.TooLong(fldPath.Child("reason"), condition.Reason, 256))
+		}
+	}
+	if len(condition.Message) > 1024 {
+		allErrs = append(allErrs, field.TooLong(fldPath.Child("message"), condition.Message, 1024))
+	}
+	if condition.AccessMode != nil && !validStorageHealthAccessModes.Has(*condition.AccessMode) {
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("accessMode"), *condition.AccessMode, sets.List(validStorageHealthAccessModes)))
+	}
+	if condition.VolumeMode != nil && *condition.VolumeMode != api.PersistentVolumeFilesystem && *condition.VolumeMode != api.PersistentVolumeBlock {
+		allErrs = append(allErrs, field.NotSupported(fldPath.Child("volumeMode"), *condition.VolumeMode, []api.PersistentVolumeMode{api.PersistentVolumeFilesystem, api.PersistentVolumeBlock}))
+	}
+	return allErrs
+}
+
+func validateStorageHealth(health storage.StorageHealth, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if len(health.Name) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("name"), ""))
+	} else {
+		allErrs = append(allErrs, apivalidation.ValidateCSIDriverName(health.Name, fldPath.Child("name"))...)
+	}
+	if len(health.HealthConditions) > maxStorageHealthConditions {
+		allErrs = append(allErrs, field.TooMany(fldPath.Child("healthConditions"), len(health.HealthConditions), maxStorageHealthConditions))
+		return allErrs
+	}
+	for i, condition := range health.HealthConditions {
+		allErrs = append(allErrs, validateStorageHealthCondition(condition, fldPath.Child("healthConditions").Index(i))...)
+	}
+	return allErrs
+}
+
+// ValidateCSINodeStatusUpdate validates an update to the status of a CSINode.
+func ValidateCSINodeStatusUpdate(new, old *storage.CSINode) field.ErrorList {
+	allErrs := apivalidation.ValidateObjectMetaUpdate(&new.ObjectMeta, &old.ObjectMeta, field.NewPath("metadata"))
+	fldPath := field.NewPath("status", "storageHealth")
+	seen := sets.New[string]()
+	for i, health := range new.Status.StorageHealth {
+		idxPath := fldPath.Index(i)
+		if seen.Has(health.Name) {
+			allErrs = append(allErrs, field.Duplicate(idxPath, health.Name))
+		}
+		seen.Insert(health.Name)
+		allErrs = append(allErrs, validateStorageHealth(health, idxPath)...)
 	}
 	return allErrs
 }
@@ -401,7 +475,7 @@ func ValidateCSIDriverUpdate(new, old *storage.CSIDriver) field.ErrorList {
 
 	// immutable fields should not be mutated.
 	allErrs = append(allErrs, apimachineryvalidation.ValidateImmutableField(new.Spec.AttachRequired, old.Spec.AttachRequired, field.NewPath("spec", "attachedRequired"))...)
-	allErrs = append(allErrs, apimachineryvalidation.ValidateImmutableField(new.Spec.VolumeLifecycleModes, old.Spec.VolumeLifecycleModes, field.NewPath("spec", "volumeLifecycleModes"))...)
+	allErrs = append(allErrs, apimachineryvalidation.ValidateImmutableField(new.Spec.VolumeLifecycleModes, old.Spec.VolumeLifecycleModes, field.NewPath("spec", "volumeLifecycleModes")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
 
 	return allErrs
 }
@@ -420,6 +494,7 @@ func validateCSIDriverSpec(
 	allErrs = append(allErrs, validateSELinuxMount(spec.SELinuxMount, fldPath.Child("seLinuxMount"))...)
 	allErrs = append(allErrs, validateNodeAllocatableUpdatePeriodSeconds(spec.NodeAllocatableUpdatePeriodSeconds, fldPath.Child("nodeAllocatableUpdatePeriodSeconds"))...)
 	allErrs = append(allErrs, validateServiceAccountTokenInSecrets(spec.ServiceAccountTokenInSecrets, spec.TokenRequests, fldPath.Child("serviceAccountTokenInSecrets"))...)
+	allErrs = append(allErrs, validatePreventPodSchedulingIfMissing(spec.PreventPodSchedulingIfMissing, fldPath.Child("preventPodSchedulingIfMissing"))...)
 	return allErrs
 }
 
@@ -541,6 +616,16 @@ func validateServiceAccountTokenInSecrets(serviceAccountTokenInSecrets *bool, to
 	allErrs := field.ErrorList{}
 	if serviceAccountTokenInSecrets != nil && len(tokenRequests) == 0 {
 		allErrs = append(allErrs, field.Invalid(fldPath, serviceAccountTokenInSecrets, "serviceAccountTokenInSecrets is set but no tokenRequests are specified"))
+	}
+
+	return allErrs
+}
+
+// validatePreventPodSchedulingIfMissing validates that preventPodSchedulingIfMissing is not set when the VolumeLimitScaling feature gate is disabled.
+func validatePreventPodSchedulingIfMissing(preventPodSchedulingIfMissing *bool, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if preventPodSchedulingIfMissing == nil && utilfeature.DefaultFeatureGate.Enabled(features.VolumeLimitScaling) {
+		allErrs = append(allErrs, field.Required(fldPath, ""))
 	}
 
 	return allErrs

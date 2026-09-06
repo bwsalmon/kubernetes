@@ -19,6 +19,7 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -50,6 +51,10 @@ const (
 	maxWaitForUnmountDuration     = 50 * time.Millisecond
 	maxLongWaitForUnmountDuration = 4200 * time.Second
 	volumeAttachedCheckTimeout    = 5 * time.Second
+	// Generous on purpose: the conditions are met within a few reconciler loop
+	// periods on an idle machine, but a loaded CI machine can starve the
+	// reconciler goroutine for far longer.
+	waitForConditionTimeout = 30 * time.Second
 )
 
 var registerMetrics sync.Once
@@ -1291,7 +1296,7 @@ func Test_Run_OneVolumeDetachOnUnhealthyNodeWithForceDetachOnUnmountDisabled(t *
 	testForceDetachMetric(t, int(initialForceDetachCountTimeout), metrics.ForceDetachReasonTimeout)
 }
 
-func Test_ReportMultiAttachError(t *testing.T) {
+func Test_ReportWaitingOnDetach(t *testing.T) {
 	type nodeWithPods struct {
 		name     k8stypes.NodeName
 		podNames []string
@@ -1306,7 +1311,7 @@ func Test_ReportMultiAttachError(t *testing.T) {
 			[]nodeWithPods{
 				{"node1", []string{"ns1/pod1"}},
 			},
-			[]string{"Warning FailedAttachVolume Multi-Attach error for volume \"volume-name\" Volume is already exclusively attached to one node and can't be attached to another"},
+			[]string{"Warning FailedAttachVolume Waiting for detach for volume \"volume-name\" Volume is already exclusively attached to one node, waiting on detach before it can be attached to another node"},
 		},
 		{
 			"pods in the same namespace use the volume",
@@ -1314,7 +1319,7 @@ func Test_ReportMultiAttachError(t *testing.T) {
 				{"node1", []string{"ns1/pod1"}},
 				{"node2", []string{"ns1/pod2"}},
 			},
-			[]string{"Warning FailedAttachVolume Multi-Attach error for volume \"volume-name\" Volume is already used by pod(s) pod2"},
+			[]string{"Warning FailedAttachVolume Waiting for detach for volume \"volume-name\" Volume is already used by pod(s) pod2"},
 		},
 		{
 			"pods in another namespace use the volume",
@@ -1322,7 +1327,7 @@ func Test_ReportMultiAttachError(t *testing.T) {
 				{"node1", []string{"ns1/pod1"}},
 				{"node2", []string{"ns2/pod2"}},
 			},
-			[]string{"Warning FailedAttachVolume Multi-Attach error for volume \"volume-name\" Volume is already used by 1 pod(s) in different namespaces"},
+			[]string{"Warning FailedAttachVolume Waiting for detach for volume \"volume-name\" Volume is already used by 1 pod(s) in different namespaces"},
 		},
 		{
 			"pods both in the same and another namespace use the volume",
@@ -1331,7 +1336,7 @@ func Test_ReportMultiAttachError(t *testing.T) {
 				{"node2", []string{"ns2/pod2"}},
 				{"node3", []string{"ns1/pod3"}},
 			},
-			[]string{"Warning FailedAttachVolume Multi-Attach error for volume \"volume-name\" Volume is already used by pod(s) pod3 and 1 pod(s) in different namespaces"},
+			[]string{"Warning FailedAttachVolume Waiting for detach for volume \"volume-name\" Volume is already used by pod(s) pod3 and 1 pod(s) in different namespaces"},
 		},
 	}
 
@@ -1418,7 +1423,7 @@ func waitForMultiAttachErrorOnNode(
 		return false, nil
 	}
 
-	err := retryWithExponentialBackOff(100*time.Millisecond, multAttachCheckFunc)
+	err := waitForCondition(100*time.Millisecond, multAttachCheckFunc)
 	if err != nil {
 		t.Fatalf("Timed out waiting for MultiAttach Error to be set on non-attached node")
 	}
@@ -1428,7 +1433,7 @@ func waitForNewAttacherCallCount(
 	t *testing.T,
 	expectedCallCount int,
 	fakePlugin *volumetesting.FakeVolumePlugin) {
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(5*time.Millisecond),
 		func() (bool, error) {
 			actualCallCount := fakePlugin.GetNewAttacherCallCount()
@@ -1455,7 +1460,7 @@ func waitForNewDetacherCallCount(
 	t *testing.T,
 	expectedCallCount int,
 	fakePlugin *volumetesting.FakeVolumePlugin) {
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(5*time.Millisecond),
 		func() (bool, error) {
 			actualCallCount := fakePlugin.GetNewDetacherCallCount()
@@ -1486,7 +1491,7 @@ func waitForAttachCallCount(
 		return
 	}
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(5*time.Millisecond),
 		func() (bool, error) {
 			for i, attacher := range fakePlugin.GetAttachers() {
@@ -1523,7 +1528,7 @@ func waitForTotalAttachCallCount(
 		return
 	}
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(5*time.Millisecond),
 		func() (bool, error) {
 			totalCount := 0
@@ -1557,7 +1562,7 @@ func waitForDetachCallCount(
 		return
 	}
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(5*time.Millisecond),
 		func() (bool, error) {
 			for i, detacher := range fakePlugin.GetDetachers() {
@@ -1594,7 +1599,7 @@ func waitForTotalDetachCallCount(
 		return
 	}
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(5*time.Millisecond),
 		func() (bool, error) {
 			totalCount := 0
@@ -1626,7 +1631,7 @@ func waitForAttachedToNodesCount(
 	volumeName v1.UniqueVolumeName,
 	asw cache.ActualStateOfWorld) {
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(5*time.Millisecond),
 		func() (bool, error) {
 			count := len(asw.GetNodesForAttachedVolume(volumeName))
@@ -1673,7 +1678,7 @@ func waitForVolumeAttachStateToNode(
 	expectedAttachState cache.AttachState,
 	asw cache.ActualStateOfWorld) {
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(500*time.Millisecond),
 		func() (bool, error) {
 			attachState := asw.GetAttachState(volumeName, nodeName)
@@ -1701,7 +1706,7 @@ func waitForVolumeAddedToNode(
 	nodeName k8stypes.NodeName,
 	asw cache.ActualStateOfWorld) {
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(500*time.Millisecond),
 		func() (bool, error) {
 			volumes := asw.GetAttachedVolumes()
@@ -1733,7 +1738,7 @@ func waitForVolumeRemovedFromNode(
 	nodeName k8stypes.NodeName,
 	asw cache.ActualStateOfWorld) {
 
-	err := retryWithExponentialBackOff(
+	err := waitForCondition(
 		time.Duration(500*time.Millisecond),
 		func() (bool, error) {
 			volumes := asw.GetAttachedVolumes()
@@ -1848,14 +1853,18 @@ func verifyNewDetacherCallCount(
 	}
 }
 
-func retryWithExponentialBackOff(initialDuration time.Duration, fn wait.ConditionFunc) error {
-	backoff := wait.Backoff{
-		Duration: initialDuration,
-		Factor:   3,
-		Jitter:   0,
-		Steps:    6,
-	}
-	return wait.ExponentialBackoff(backoff, fn)
+func waitForCondition(interval time.Duration, fn wait.ConditionFunc) error {
+	ctx, cancel := context.WithTimeout(context.Background(), waitForConditionTimeout)
+	defer cancel()
+
+	delay := wait.Backoff{
+		Duration: interval,
+		Factor:   2,
+		Cap:      time.Second,
+		Steps:    math.MaxInt32,
+	}.DelayFunc()
+
+	return delay.Until(ctx, true /* immediate */, false /* sliding */, fn.WithContext())
 }
 
 // verifies the force detach metric with reason

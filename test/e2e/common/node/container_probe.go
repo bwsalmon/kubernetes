@@ -33,6 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/ptr"
+
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/events"
@@ -261,7 +263,7 @@ var _ = SIGDescribe("Probing container", func() {
 		Testname: Pod liveness probe, container exec timeout, restart
 		Description: A Pod is created with liveness probe with a Exec action on the Pod. If the liveness probe call does not return within the timeout specified, liveness probe MUST restart the Pod.
 	*/
-	ginkgo.It("should be restarted with a failing exec liveness probe that took longer than the timeout", func(ctx context.Context) {
+	f.It("should be restarted with a failing exec liveness probe that took longer than the timeout", f.WithNodeConformance(), func(ctx context.Context) {
 		cmd := []string{"/bin/sh", "-c", "sleep 600"}
 		livenessProbe := &v1.Probe{
 			ProbeHandler:        execHandler([]string{"/bin/sh", "-c", "sleep 10 & exit 1"}),
@@ -278,7 +280,7 @@ var _ = SIGDescribe("Probing container", func() {
 		Testname: Pod http liveness probe, redirected to a local address
 		Description: A Pod is created with liveness probe on http endpoint /redirect?loc=healthz. The http handler on the /redirect will redirect to the /healthz endpoint, which will return a http error after 10 seconds since the Pod is started. This MUST result in liveness check failure. The Pod MUST now be killed and restarted incrementing restart count to 1.
 	*/
-	ginkgo.It("should be restarted with a local redirect http liveness probe", func(ctx context.Context) {
+	f.It("should be restarted with a local redirect http liveness probe", f.WithNodeConformance(), func(ctx context.Context) {
 		livenessProbe := &v1.Probe{
 			ProbeHandler:        httpGetHandler("/redirect?loc="+url.QueryEscape("/healthz"), 8080),
 			InitialDelaySeconds: 15,
@@ -293,7 +295,7 @@ var _ = SIGDescribe("Probing container", func() {
 		Testname: Pod http liveness probe, redirected to a non-local address
 		Description: A Pod is created with liveness probe on http endpoint /redirect with a redirect to http://0.0.0.0/. The http handler on the /redirect should not follow the redirect, but instead treat it as a success and generate an event.
 	*/
-	ginkgo.It("should *not* be restarted with a non-local redirect http liveness probe", func(ctx context.Context) {
+	f.It("should *not* be restarted with a non-local redirect http liveness probe", f.WithNodeConformance(), func(ctx context.Context) {
 		livenessProbe := &v1.Probe{
 			ProbeHandler:        httpGetHandler("/redirect?loc="+url.QueryEscape("http://0.0.0.0/"), 8080),
 			InitialDelaySeconds: 15,
@@ -317,7 +319,7 @@ var _ = SIGDescribe("Probing container", func() {
 		Testname: Pod startup probe restart
 		Description: A Pod is created with a failing startup probe. The Pod MUST be killed and restarted incrementing restart count to 1, even if liveness would succeed.
 	*/
-	ginkgo.It("should be restarted startup probe fails", func(ctx context.Context) {
+	f.It("should be restarted startup probe fails", f.WithNodeConformance(), func(ctx context.Context) {
 		cmd := []string{"/bin/sh", "-c", "sleep 600"}
 		livenessProbe := &v1.Probe{
 			ProbeHandler: v1.ProbeHandler{
@@ -346,7 +348,7 @@ var _ = SIGDescribe("Probing container", func() {
 		Testname: Pod liveness probe delayed (long) by startup probe
 		Description: A Pod is created with failing liveness and startup probes. Liveness probe MUST NOT fail until startup probe expires.
 	*/
-	ginkgo.It("should *not* be restarted by liveness probe because startup probe delays it", func(ctx context.Context) {
+	f.It("should *not* be restarted by liveness probe because startup probe delays it", f.WithNodeConformance(), func(ctx context.Context) {
 		cmd := []string{"/bin/sh", "-c", "sleep 600"}
 		livenessProbe := &v1.Probe{
 			ProbeHandler: v1.ProbeHandler{
@@ -375,7 +377,7 @@ var _ = SIGDescribe("Probing container", func() {
 		Testname: Pod liveness probe fails after startup success
 		Description: A Pod is created with failing liveness probe and delayed startup probe that uses 'exec' command to cat /temp/health file. The Container is started by creating /tmp/startup after 10 seconds, triggering liveness probe to fail. The Pod MUST now be killed and restarted incrementing restart count to 1.
 	*/
-	ginkgo.It("should be restarted by liveness probe after startup probe enables it", func(ctx context.Context) {
+	f.It("should be restarted by liveness probe after startup probe enables it", f.WithNodeConformance(), func(ctx context.Context) {
 		cmd := []string{"/bin/sh", "-c", "sleep 10; echo ok >/tmp/startup; sleep 600"}
 		livenessProbe := &v1.Probe{
 			ProbeHandler: v1.ProbeHandler{
@@ -404,7 +406,7 @@ var _ = SIGDescribe("Probing container", func() {
 		Testname: Pod readiness probe, delayed by startup probe
 		Description: A Pod is created with startup and readiness probes. The Container is started by creating /tmp/startup after 45 seconds, delaying the ready state by this amount of time. This is similar to the "Pod readiness probe, with initial delay" test.
 	*/
-	ginkgo.It("should be ready immediately after startupProbe succeeds", func(ctx context.Context) {
+	f.It("should be ready immediately after startupProbe succeeds", f.WithNodeConformance(), func(ctx context.Context) {
 		// Probe workers sleep at Kubelet start for a random time which is at most PeriodSeconds
 		// this test requires both readiness and startup workers running before updating statuses
 		// to avoid flakes, ensure sleep before startup (32s) > readinessProbe.PeriodSeconds
@@ -542,6 +544,118 @@ var _ = SIGDescribe("Probing container", func() {
 	})
 
 	/*
+		Testname: Pod liveness probe, using grpc call with TLS mode, success
+		Description: A Pod is created with liveness probe on a TLS-enabled gRPC service
+		using Mode=TLS. The probe should succeed because TLS is used to connect to the
+		TLS server. When liveness probe does not fail then the restart count MUST remain zero.
+	*/
+	f.It("should *not* be restarted with a GRPC liveness probe with TLS mode",
+		framework.WithFeatureGate(features.GRPCContainerProbeTLS),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					GRPC: &v1.GRPCAction{
+						Port: 5000,
+						Mode: ptr.To(v1.GRPCProbeModeTLS),
+					},
+				},
+				InitialDelaySeconds: probeTestInitialDelaySeconds,
+				TimeoutSeconds:      5,
+				FailureThreshold:    1,
+			}
+
+			pod := gRPCServerPodSpec(nil, livenessProbe, "agnhost",
+				"--tls-cert-file", "/localhost.crt",
+				"--tls-private-key-file", "/localhost.key")
+
+			RunLivenessTest(ctx, f, pod, 0, defaultObservationTimeout)
+		})
+
+	/*
+		Testname: Pod liveness probe using plaintext grpc call against tls server, failure due to no tls mode.
+		Description: A Pod is created with a plaintext gRPC liveness probe (no Mode set)
+		against a TLS-enabled gRPC server. The probe should fail because the server
+		requires TLS but the probe connects with plaintext.
+	*/
+	f.It("should be restarted with a GRPC liveness probe when not using TLS against a TLS server",
+		framework.WithFeatureGate(features.GRPCContainerProbeTLS),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					GRPC: &v1.GRPCAction{
+						Port: 5000,
+					},
+				},
+				InitialDelaySeconds: probeTestInitialDelaySeconds,
+				TimeoutSeconds:      5,
+				FailureThreshold:    1,
+			}
+
+			pod := gRPCServerPodSpec(nil, livenessProbe, "agnhost",
+				"--tls-cert-file", "/localhost.crt",
+				"--tls-private-key-file", "/localhost.key")
+
+			RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
+		})
+
+	/*
+		Testname: Pod liveness probe, using grpc call with TLS mode, unhealthy response
+		Description: A Pod is created with a TLS-enabled gRPC service that starts
+		returning NOT_SERVING after a delay. The liveness probe uses Mode=TLS.
+		The probe should detect the unhealthy response and restart the container.
+	*/
+	f.It("should be restarted with a GRPC liveness probe with TLS mode when endpoint returns not healthy",
+		framework.WithFeatureGate(features.GRPCContainerProbeTLS),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					GRPC: &v1.GRPCAction{
+						Port: 5000,
+						Mode: ptr.To(v1.GRPCProbeModeTLS),
+					},
+				},
+				InitialDelaySeconds: probeTestInitialDelaySeconds,
+				TimeoutSeconds:      5,
+				FailureThreshold:    1,
+			}
+
+			pod := gRPCServerPodSpec(nil, livenessProbe, "agnhost",
+				"--tls-cert-file", "/localhost.crt",
+				"--tls-private-key-file", "/localhost.key",
+				"--delay-unhealthy-sec", "20")
+
+			RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
+		})
+
+	/*
+		Testname: Pod liveness probe, using grpc call with TLS mode, wrong port
+		Description: A Pod is created with a TLS-enabled gRPC service on port 5000.
+		The liveness probe uses Mode=TLS but targets a wrong port (2333) where nothing
+		is listening. The probe should fail due to connection error and restart the container.
+	*/
+	f.It("should be restarted with a GRPC liveness probe with TLS mode on wrong port",
+		framework.WithFeatureGate(features.GRPCContainerProbeTLS),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					GRPC: &v1.GRPCAction{
+						Port: 2333,
+						Mode: ptr.To(v1.GRPCProbeModeTLS),
+					},
+				},
+				InitialDelaySeconds: probeTestInitialDelaySeconds * 4,
+				TimeoutSeconds:      5,
+				FailureThreshold:    1,
+			}
+
+			pod := gRPCServerPodSpec(nil, livenessProbe, "agnhost",
+				"--tls-cert-file", "/localhost.crt",
+				"--tls-private-key-file", "/localhost.key")
+
+			RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
+		})
+
+	/*
 			Release: v1.23
 			Testname: Pod liveness probe, using grpc call, failure
 			Description: A Pod is created with liveness probe on grpc service. Liveness probe on this endpoint should fail because of wrong probe port.
@@ -562,7 +676,107 @@ var _ = SIGDescribe("Probing container", func() {
 		RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
 	})
 
-	ginkgo.It("should mark readiness on pods to false while pod is in progress of terminating when a pod has a readiness probe", func(ctx context.Context) {
+	/*
+		Testname: Pod liveness probe, using httpGet with protocol HTTP1, success
+		Description: A Pod is created with a liveness probe on a healthy HTTP endpoint
+		using Protocol=HTTP1. The probe should succeed because the server serves HTTP/1.1
+		and the probe explicitly requests HTTP/1.1. The restart count MUST remain zero.
+	*/
+	f.It("should *not* be restarted with an httpGet liveness probe with protocol HTTP1",
+		framework.WithFeatureGate(features.H2CContainerProbe),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					HTTPGet: &v1.HTTPGetAction{
+						Path:     "/",
+						Port:     intstr.FromInt32(80),
+						Protocol: ptr.To(v1.HTTPProtocolHTTP1),
+					},
+				},
+				InitialDelaySeconds: 15,
+				TimeoutSeconds:      5,
+				FailureThreshold:    5,
+			}
+			pod := testWebServerPodSpec(nil, livenessProbe, "test-webserver", 80)
+			RunLivenessTest(ctx, f, pod, 0, defaultObservationTimeout)
+		})
+
+	/*
+		Testname: Pod liveness probe, using httpGet with protocol HTTP2 against HTTP/1.1 server, restart
+		Description: A Pod is created with a liveness probe using Protocol=HTTP2 against
+		a server that only speaks HTTP/1.1. The probe should fail because the server
+		cannot handle HTTP/2 cleartext with prior knowledge. The container MUST be restarted.
+	*/
+	f.It("should be restarted with an httpGet liveness probe with protocol HTTP2 against HTTP/1.1 server",
+		framework.WithFeatureGate(features.H2CContainerProbe),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					HTTPGet: &v1.HTTPGetAction{
+						Path:     "/healthz",
+						Port:     intstr.FromInt32(8080),
+						Protocol: ptr.To(v1.HTTPProtocolHTTP2),
+					},
+				},
+				InitialDelaySeconds: probeTestInitialDelaySeconds,
+				TimeoutSeconds:      5,
+				FailureThreshold:    1,
+			}
+			pod := livenessPodSpec(f.Namespace.Name, nil, livenessProbe)
+			RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
+		})
+
+	/*
+		Testname: Pod liveness probe, using httpGet with protocol HTTP2 on wrong port, restart
+		Description: A Pod is created with a liveness probe using Protocol=HTTP2 that
+		targets a wrong port where nothing is listening. The probe should fail due to
+		connection error and the container MUST be restarted.
+	*/
+	f.It("should be restarted with an httpGet liveness probe with protocol HTTP2 on wrong port",
+		framework.WithFeatureGate(features.H2CContainerProbe),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					HTTPGet: &v1.HTTPGetAction{
+						Path:     "/",
+						Port:     intstr.FromInt32(2333),
+						Protocol: ptr.To(v1.HTTPProtocolHTTP2),
+					},
+				},
+				InitialDelaySeconds: probeTestInitialDelaySeconds * 4,
+				TimeoutSeconds:      5,
+				FailureThreshold:    1,
+			}
+			pod := livenessPodSpec(f.Namespace.Name, nil, livenessProbe)
+			RunLivenessTest(ctx, f, pod, 1, defaultObservationTimeout)
+		})
+
+	/*
+		Testname: Pod liveness probe, using httpGet with protocol HTTP2 against h2c server, success
+		Description: A Pod is created running an h2c server with a liveness probe
+		using Protocol=HTTP2. The probe should succeed because both the probe and the
+		server speak HTTP/2 cleartext. The restart count MUST remain zero.
+	*/
+	f.It("should *not* be restarted with an httpGet liveness probe with protocol HTTP2 against h2c server",
+		framework.WithFeatureGate(features.H2CContainerProbe),
+		func(ctx context.Context) {
+			livenessProbe := &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					HTTPGet: &v1.HTTPGetAction{
+						Path:     "/",
+						Port:     intstr.FromInt32(80),
+						Protocol: ptr.To(v1.HTTPProtocolHTTP2),
+					},
+				},
+				InitialDelaySeconds: 15,
+				TimeoutSeconds:      5,
+				FailureThreshold:    5,
+			}
+			pod := h2cServerPodSpec(nil, livenessProbe, "test-h2c-server", 80)
+			RunLivenessTest(ctx, f, pod, 0, defaultObservationTimeout)
+		})
+
+	f.It("should mark readiness on pods to false while pod is in progress of terminating when a pod has a readiness probe", f.WithNodeConformance(), func(ctx context.Context) {
 		podName := "probe-test-" + string(uuid.NewUUID())
 		podClient := e2epod.NewPodClient(f)
 		terminationGracePeriod := int64(30)
@@ -628,7 +842,7 @@ done
 		framework.ExpectNoError(err)
 	})
 
-	ginkgo.It("should mark readiness on pods to false and disable liveness probes while pod is in progress of terminating", func(ctx context.Context) {
+	f.It("should mark readiness on pods to false and disable liveness probes while pod is in progress of terminating", f.WithNodeConformance(), func(ctx context.Context) {
 		podName := "probe-test-" + string(uuid.NewUUID())
 		podClient := e2epod.NewPodClient(f)
 		terminationGracePeriod := int64(30)
@@ -729,7 +943,7 @@ done
 	})
 })
 
-var _ = SIGDescribe(framework.WithNodeConformance(), framework.WithFeatureGate(features.SidecarContainers), "Probing restartable init container", func() {
+var _ = SIGDescribe(framework.WithNodeConformance(), "Probing restartable init container", func() {
 	f := framework.NewDefaultFramework("container-probe")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 	var podClient *e2epod.PodClient
@@ -1815,9 +2029,33 @@ func runReadinessFailTest(ctx context.Context, f *framework.Framework, pod *v1.P
 	}
 }
 
-func gRPCServerPodSpec(readinessProbe, livenessProbe *v1.Probe, containerName string) *v1.Pod {
+func gRPCServerPodSpec(readinessProbe, livenessProbe *v1.Probe, containerName string, extraArgs ...string) *v1.Pod {
+	command := []string{
+		"/agnhost",
+		"grpc-health-checking",
+	}
+	command = append(command, extraArgs...)
+
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-grpc-" + string(uuid.NewUUID())},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:           containerName,
+					Image:          imageutils.GetE2EImage(imageutils.Agnhost),
+					Command:        command,
+					Ports:          []v1.ContainerPort{{ContainerPort: int32(5000)}, {ContainerPort: int32(8080)}},
+					LivenessProbe:  livenessProbe,
+					ReadinessProbe: readinessProbe,
+				},
+			},
+		},
+	}
+}
+
+func h2cServerPodSpec(readinessProbe, livenessProbe *v1.Probe, containerName string, port int) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-h2c-" + string(uuid.NewUUID())},
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{
 				{
@@ -1825,9 +2063,10 @@ func gRPCServerPodSpec(readinessProbe, livenessProbe *v1.Probe, containerName st
 					Image: imageutils.GetE2EImage(imageutils.Agnhost),
 					Command: []string{
 						"/agnhost",
-						"grpc-health-checking",
+						"h2c-server",
+						fmt.Sprintf("--port=%d", port),
 					},
-					Ports:          []v1.ContainerPort{{ContainerPort: int32(5000)}, {ContainerPort: int32(8080)}},
+					Ports:          []v1.ContainerPort{{ContainerPort: int32(port)}},
 					LivenessProbe:  livenessProbe,
 					ReadinessProbe: readinessProbe,
 				},
