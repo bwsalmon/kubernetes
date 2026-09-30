@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2/ktesting"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -887,4 +889,148 @@ func TestAsyncPreemption_InMemoryVictimPreemption(t *testing.T) {
 			asyncframework.RunAsyncPreemptionSteps(testCtx, t, tt.steps, config)
 		})
 	}
+}
+
+// TestAsyncPreemption_MixedPermitAndRunningVictims tests FM-305 / mixed victims scenario:
+// 1 running victim and 2 co-scheduled waiting gang victims. Submit a high-priority preemptor.
+// Verifies that waiting pods receive immediate Reject("Preempted") without API delete traffic,
+// the running pod receives an API delete, and the preemptor schedules successfully.
+func TestAsyncPreemption_MixedPermitAndRunningVictims(t *testing.T) {
+	victim1ToBlock := &asyncframework.BlockedPod{Blocked: make(chan struct{}, 1)}
+	victim2ToBlock := &asyncframework.BlockedPod{Blocked: make(chan struct{}, 1)}
+	podsToBlock := map[string]*asyncframework.BlockedPod{
+		"victim-gang-1": victim1ToBlock,
+		"victim-gang-2": victim2ToBlock,
+	}
+
+	preemptionDoneChannels := &sync.Map{}
+	blockBindingChannel := make(chan struct{})
+	defer close(blockBindingChannel)
+	preemptionConfig := asyncframework.AsyncPreemptionTestConfig{
+		EnableGenericWorkload:  true,
+		PreemptionDoneChannels: preemptionDoneChannels,
+		BlockBindingChannel:    blockBindingChannel,
+		PodsToBlock:            podsToBlock,
+	}
+	testCtx, preemptionPlugin, cs := asyncframework.InitTestForAsyncPreemption(t, preemptionConfig)
+
+	logger, _ := ktesting.NewTestContext(t)
+	if testCtx.Scheduler.APIDispatcher != nil {
+		testCtx.Scheduler.APIDispatcher.Run(logger)
+		defer testCtx.Scheduler.APIDispatcher.Close()
+	}
+	testCtx.Scheduler.SchedulingQueue.Run(logger)
+	defer testCtx.Scheduler.SchedulingQueue.Close()
+
+	createdPods := []*v1.Pod{}
+	defer func() {
+		testutils.CleanupPods(testCtx.Ctx, cs, t, createdPods)
+	}()
+
+	config := asyncframework.AsyncPreemptionStepRunnerConfig{
+		CreatedPods:            createdPods,
+		ClientSet:              cs,
+		PreemptionDoneChannels: preemptionDoneChannels,
+		Logger:                 logger,
+		PreemptionPlugin:       preemptionPlugin,
+		BlockBindingChannel:    blockBindingChannel,
+	}
+
+	steps := []asyncframework.Step{
+		{
+			Name:       "create Node (4 CPU)",
+			CreateNode: "node",
+		},
+		{
+			Name: "create running victim pod (2 CPU)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("victim-running").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Node("node").Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+			},
+		},
+		{
+			Name: "create gang victims PodGroup (minMember=2)",
+			CreatePodGroup: &asyncframework.CreatePodGroup{
+				PodGroup: st.MakePodGroup().Name("gang-victims").MinCount(2).Priority(10).Obj(),
+			},
+		},
+		{
+			Name: "create gang victim 1 (1 CPU)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("victim-gang-1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").Priority(10).PodGroupName("gang-victims").Obj(),
+			},
+		},
+		{
+			Name: "create gang victim 2 (1 CPU)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("victim-gang-2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").Priority(10).PodGroupName("gang-victims").Obj(),
+			},
+		},
+		{
+			Name: "schedule gang victims (both enter permit phase and wait)",
+			SchedulePodGroup: &asyncframework.SchedulePodGroup{
+				PodGroupName: "gang-victims",
+			},
+		},
+		{
+			Name: "verify gang victims reached permit wait",
+			CustomStep: func(testCtx *testutils.TestContext, t *testing.T, config *asyncframework.AsyncPreemptionStepRunnerConfig) {
+				select {
+				case <-victim1ToBlock.Blocked:
+					t.Log("victim-gang-1 reached permit wait")
+				case <-time.After(wait.ForeverTestTimeout):
+					t.Fatal("Timed out waiting for victim-gang-1 to reach permit wait")
+				}
+				select {
+				case <-victim2ToBlock.Blocked:
+					t.Log("victim-gang-2 reached permit wait")
+				case <-time.After(wait.ForeverTestTimeout):
+					t.Fatal("Timed out waiting for victim-gang-2 to reach permit wait")
+				}
+				if err := wait.PollUntilContextTimeout(testCtx.Ctx, 50*time.Millisecond, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+					return testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(config.CreatedPods[1].UID) != nil &&
+						testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(config.CreatedPods[2].UID) != nil, nil
+				}); err != nil {
+					t.Fatalf("Timed out waiting for gang victims in WaitingPods: %v", err)
+				}
+			},
+		},
+		{
+			Name: "create high-priority preemptor Pod (4 CPU, priority 500)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("preemptor-p").Req(map[v1.ResourceName]string{v1.ResourceCPU: "4"}).Container("image").Priority(500).Obj(),
+			},
+		},
+		{
+			Name: "schedule preemptor Pod (initiates async preemption against running and waiting gang victims)",
+			SchedulePod: &asyncframework.SchedulePod{
+				PodName:             "preemptor-p",
+				ExpectUnschedulable: true,
+			},
+		},
+		{
+			Name:               "complete preemption for preemptor",
+			CompletePreemption: "preemptor-p",
+		},
+		{
+			Name: "verify waiting gang victims were NOT deleted via API (preempted in-memory)",
+			VerifyPodsNotDeleted: []int{1, 2},
+		},
+		{
+			Name: "wait for running victim to be deleted via API",
+			WaitForPodsDeleted: []int{0},
+		},
+		{
+			Name:               "flush scheduling queue",
+			FlushUnschedulable: true,
+		},
+		{
+			Name: "schedule preemptor Pod (succeeds on node)",
+			SchedulePod: &asyncframework.SchedulePod{
+				PodName:       "preemptor-p",
+				ExpectSuccess: true,
+			},
+		},
+	}
+
+	asyncframework.RunAsyncPreemptionSteps(testCtx, t, steps, config)
 }
