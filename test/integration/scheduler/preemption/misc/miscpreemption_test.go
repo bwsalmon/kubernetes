@@ -3924,3 +3924,730 @@ func TestDRAClaimPreemption(t *testing.T) {
 		}
 	})
 }
+
+// TestPodTopologySpreadMultiZonePreemption tests preemption behavior under PodTopologySpread constraints (FM-601).
+func TestPodTopologySpreadMultiZonePreemption(t *testing.T) {
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "1000m",
+		v1.ResourceMemory: "1000Mi",
+	}
+	victimRes := v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("800m"),
+		v1.ResourceMemory: resource.MustParse("800Mi"),
+	}
+
+	t.Run("strict maxSkew selects victim in under-represented zone to maintain skew balance", func(t *testing.T) {
+		testCtx := initTest(t, "pts-preempt-skew")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeA, err := createNode(cs, st.MakeNode().Name("node-zone-a").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-a").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeA: %v", err)
+		}
+		nodeB, err := createNode(cs, st.MakeNode().Name("node-zone-b").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-b").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeB: %v", err)
+		}
+		nodeC, err := createNode(cs, st.MakeNode().Name("node-zone-c").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-c").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeC: %v", err)
+		}
+
+		// Zone A: 2 matching pods
+		for i := 1; i <= 2; i++ {
+			p := st.MakePod().Name(fmt.Sprintf("spread-pod-a-%d", i)).Namespace(ns).Node(nodeA.Name).
+				Label("app", "spread-app").Priority(lowPriority).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+				Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+			if _, err := runPausePod(cs, p); err != nil {
+				t.Fatalf("Failed to run spread pod A: %v", err)
+			}
+		}
+
+		// Zone B: 2 matching pods
+		for i := 1; i <= 2; i++ {
+			p := st.MakePod().Name(fmt.Sprintf("spread-pod-b-%d", i)).Namespace(ns).Node(nodeB.Name).
+				Label("app", "spread-app").Priority(lowPriority).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+				Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+			if _, err := runPausePod(cs, p); err != nil {
+				t.Fatalf("Failed to run spread pod B: %v", err)
+			}
+		}
+
+		// Zone C: 1 matching pod
+		spreadPodC := st.MakePod().Name("spread-pod-c-1").Namespace(ns).Node(nodeC.Name).
+			Label("app", "spread-app").Priority(lowPriority).
+			Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+			Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+		if _, err := runPausePod(cs, spreadPodC); err != nil {
+			t.Fatalf("Failed to run spread pod C: %v", err)
+		}
+
+		// Low-priority victims on all nodes
+		victimA, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-a",
+			Namespace: ns,
+			NodeName:  nodeA.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimA: %v", err)
+		}
+		victimB, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-b",
+			Namespace: ns,
+			NodeName:  nodeB.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimB: %v", err)
+		}
+		victimC, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-c",
+			Namespace: ns,
+			NodeName:  nodeC.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimC: %v", err)
+		}
+
+		// Preemptor with maxSkew: 1 across zone
+		preemptorPod := st.MakePod().Name("preemptor-spread").Namespace(ns).
+			Label("app", "spread-app").Priority(highPriority).
+			SpreadConstraint(1, v1.LabelTopologyZone, v1.DoNotSchedule, &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "spread-app"},
+			}, nil, nil, nil, nil).
+			Req(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "800m",
+				v1.ResourceMemory: "800Mi",
+			}).
+			Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+
+		preemptor, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, preemptorPod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{preemptor, victimA, victimB, victimC})
+
+		// Preemption MUST select victimC on node-zone-c because placing preemptor on A or B would result in skew = 3 - 1 = 2 > maxSkew(1)
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimC.Name); err != nil {
+			t.Fatalf("Expected victimC in zone-c to be preempted: %v", err)
+		}
+
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptor, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule on zone-c: %v", err)
+		}
+
+		scheduledPreemptor, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptor.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor: %v", err)
+		}
+		if scheduledPreemptor.Spec.NodeName != nodeC.Name {
+			t.Errorf("Preemptor scheduled on %q, expected %q (zone-c)", scheduledPreemptor.Spec.NodeName, nodeC.Name)
+		}
+
+		// Verify victims A and B were NOT evicted
+		pA, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, victimA.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get victimA: %v", err)
+		}
+		if pA.DeletionTimestamp != nil {
+			t.Errorf("Victim A was unexpectedly marked for deletion")
+		}
+		pB, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, victimB.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get victimB: %v", err)
+		}
+		if pB.DeletionTimestamp != nil {
+			t.Errorf("Victim B was unexpectedly marked for deletion")
+		}
+	})
+
+	t.Run("preemption across multi-zone nodes selects victim satisfying combined zone and hostname constraints", func(t *testing.T) {
+		testCtx := initTest(t, "pts-dual")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		// 4 nodes across 2 zones (2 nodes per zone)
+		nodeA1, err := createNode(cs, st.MakeNode().Name("node-a1").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-a").Label(v1.LabelHostname, "node-a1").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeA1: %v", err)
+		}
+		nodeA2, err := createNode(cs, st.MakeNode().Name("node-a2").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-a").Label(v1.LabelHostname, "node-a2").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeA2: %v", err)
+		}
+		nodeB1, err := createNode(cs, st.MakeNode().Name("node-b1").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-b").Label(v1.LabelHostname, "node-b1").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeB1: %v", err)
+		}
+		nodeB2, err := createNode(cs, st.MakeNode().Name("node-b2").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-b").Label(v1.LabelHostname, "node-b2").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeB2: %v", err)
+		}
+
+		// Zone A: node-a1 has 2 pods, node-a2 has 1 pod (total zone-a = 3 pods)
+		// Zone B: node-b1 has 2 pods, node-b2 has 0 pods (total zone-b = 2 pods)
+		for i := 1; i <= 2; i++ {
+			p := st.MakePod().Name(fmt.Sprintf("sp-a1-%d", i)).Namespace(ns).Node(nodeA1.Name).
+				Label("app", "dual-spread").Priority(lowPriority).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+				Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+			if _, err := runPausePod(cs, p); err != nil {
+				t.Fatalf("Failed to run sp-a1-%d: %v", i, err)
+			}
+		}
+		pA2 := st.MakePod().Name("sp-a2-1").Namespace(ns).Node(nodeA2.Name).
+			Label("app", "dual-spread").Priority(lowPriority).
+			Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+			Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+		if _, err := runPausePod(cs, pA2); err != nil {
+			t.Fatalf("Failed to run sp-a2-1: %v", err)
+		}
+		for i := 1; i <= 2; i++ {
+			p := st.MakePod().Name(fmt.Sprintf("sp-b1-%d", i)).Namespace(ns).Node(nodeB1.Name).
+				Label("app", "dual-spread").Priority(lowPriority).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+				Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+			if _, err := runPausePod(cs, p); err != nil {
+				t.Fatalf("Failed to run sp-b1-%d: %v", i, err)
+			}
+		}
+
+		// Victims occupying capacity on each node
+		victimA1, _ := runPausePod(cs, initPausePod(&testutils.PausePodConfig{Name: "victim-a1", Namespace: ns, NodeName: nodeA1.Name, Priority: &lowPriority, Resources: &v1.ResourceRequirements{Requests: victimRes}}))
+		victimA2, _ := runPausePod(cs, initPausePod(&testutils.PausePodConfig{Name: "victim-a2", Namespace: ns, NodeName: nodeA2.Name, Priority: &lowPriority, Resources: &v1.ResourceRequirements{Requests: victimRes}}))
+		victimB1, _ := runPausePod(cs, initPausePod(&testutils.PausePodConfig{Name: "victim-b1", Namespace: ns, NodeName: nodeB1.Name, Priority: &lowPriority, Resources: &v1.ResourceRequirements{Requests: victimRes}}))
+		victimB2, _ := runPausePod(cs, initPausePod(&testutils.PausePodConfig{Name: "victim-b2", Namespace: ns, NodeName: nodeB2.Name, Priority: &lowPriority, Resources: &v1.ResourceRequirements{Requests: victimRes}}))
+
+		// Preemptor with maxSkew: 1 on Zone AND maxSkew: 1 on Hostname
+		preemptorPod := st.MakePod().Name("preemptor-dual").Namespace(ns).
+			Label("app", "dual-spread").Priority(highPriority).
+			SpreadConstraint(1, v1.LabelTopologyZone, v1.DoNotSchedule, &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "dual-spread"},
+			}, nil, nil, nil, nil).
+			SpreadConstraint(1, v1.LabelHostname, v1.DoNotSchedule, &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "dual-spread"},
+			}, nil, nil, nil, nil).
+			Req(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "800m",
+				v1.ResourceMemory: "800Mi",
+			}).
+			Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+
+		preemptor, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, preemptorPod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create dual preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{preemptor, victimA1, victimA2, victimB1, victimB2})
+
+		// Node B2 (zone-b, node-b2) has 0 pods. Zone A has 3 pods, Zone B has 2 pods.
+		// Placing on Node B2 makes Zone B count = 3 (skew vs Zone A = 0), and Hostname count = 1 (skew vs other nodes <= 1).
+		// Any other node would violate either zone skew or hostname skew.
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimB2.Name); err != nil {
+			t.Fatalf("Expected victimB2 to be preempted: %v", err)
+		}
+
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptor, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule on node-b2: %v", err)
+		}
+
+		scheduledPreemptor, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptor.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor: %v", err)
+		}
+		if scheduledPreemptor.Spec.NodeName != nodeB2.Name {
+			t.Errorf("Preemptor scheduled on %q, expected %q (node-b2)", scheduledPreemptor.Spec.NodeName, nodeB2.Name)
+		}
+	})
+
+	t.Run("MatchLabelKeys in PodTopologySpread multi-zone preemption", func(t *testing.T) {
+		testCtx := initTest(t, "pts-mlk")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeA, err := createNode(cs, st.MakeNode().Name("node-mlk-a").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-a").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeA: %v", err)
+		}
+		nodeB, err := createNode(cs, st.MakeNode().Name("node-mlk-b").Capacity(nodeRes).Label(v1.LabelTopologyZone, "zone-b").Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeB: %v", err)
+		}
+
+		// Zone A has 2 pods with app=web, version=v1
+		for i := 1; i <= 2; i++ {
+			p := st.MakePod().Name(fmt.Sprintf("web-a-%d", i)).Namespace(ns).Node(nodeA.Name).
+				Label("app", "web").Label("version", "v1").Priority(lowPriority).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+				Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+			if _, err := runPausePod(cs, p); err != nil {
+				t.Fatalf("Failed to run web-a-%d: %v", i, err)
+			}
+		}
+
+		// Zone B has 0 pods with app=web, version=v1 (and 2 pods with app=web, version=v2)
+		for i := 1; i <= 2; i++ {
+			p := st.MakePod().Name(fmt.Sprintf("web-b-%d", i)).Namespace(ns).Node(nodeB.Name).
+				Label("app", "web").Label("version", "v2").Priority(lowPriority).
+				Req(map[v1.ResourceName]string{v1.ResourceCPU: "50m", v1.ResourceMemory: "50Mi"}).
+				Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+			if _, err := runPausePod(cs, p); err != nil {
+				t.Fatalf("Failed to run web-b-%d: %v", i, err)
+			}
+		}
+
+		// Victims consuming 800m CPU on each node
+		victimA, _ := runPausePod(cs, initPausePod(&testutils.PausePodConfig{Name: "victim-mlk-a", Namespace: ns, NodeName: nodeA.Name, Priority: &lowPriority, Resources: &v1.ResourceRequirements{Requests: victimRes}}))
+		victimB, _ := runPausePod(cs, initPausePod(&testutils.PausePodConfig{Name: "victim-mlk-b", Namespace: ns, NodeName: nodeB.Name, Priority: &lowPriority, Resources: &v1.ResourceRequirements{Requests: victimRes}}))
+
+		// Preemptor with app=web, version=v1 and MatchLabelKeys: ["version"], maxSkew: 1 across zone
+		preemptorPod := st.MakePod().Name("preemptor-mlk").Namespace(ns).
+			Label("app", "web").Label("version", "v1").Priority(highPriority).
+			SpreadConstraint(1, v1.LabelTopologyZone, v1.DoNotSchedule, &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "web"},
+			}, nil, nil, nil, []string{"version"}).
+			Req(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "800m",
+				v1.ResourceMemory: "800Mi",
+			}).
+			Container(imageutils.GetPauseImageName()).ZeroTerminationGracePeriod().Obj()
+
+		preemptor, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, preemptorPod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{preemptor, victimA, victimB})
+
+		// For version=v1: Zone A has 2 pods, Zone B has 0 pods.
+		// Preemptor on Zone A would make count(A)=3 vs count(B)=0 (skew=3 > 1).
+		// Preemptor on Zone B makes count(B)=1 vs count(A)=2 (skew=1 <= 1).
+		// So preemption MUST choose victim-mlk-b on nodeB (Zone B).
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimB.Name); err != nil {
+			t.Fatalf("Expected victimB to be preempted: %v", err)
+		}
+
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptor, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule on nodeB: %v", err)
+		}
+
+		scheduledPreemptor, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptor.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor: %v", err)
+		}
+		if scheduledPreemptor.Spec.NodeName != nodeB.Name {
+			t.Errorf("Preemptor scheduled on %q, expected %q (nodeB)", scheduledPreemptor.Spec.NodeName, nodeB.Name)
+		}
+	})
+}
+
+// TestReadWriteOncePodMultiNodePreemptionInterlocks tests single-node RWOP volume preemption coordination,
+// multi-node candidate filtering, and collision prevention (FM-603 / FM-304).
+func TestReadWriteOncePodMultiNodePreemptionInterlocks(t *testing.T) {
+	nodeRes := map[v1.ResourceName]string{
+		v1.ResourcePods:   "32",
+		v1.ResourceCPU:    "1000m",
+		v1.ResourceMemory: "1000Mi",
+	}
+	victimRes := v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("800m"),
+		v1.ResourceMemory: resource.MustParse("800Mi"),
+	}
+
+	storage := v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceStorage: resource.MustParse("1Mi")}}
+	volType := v1.HostPathDirectoryOrCreate
+
+	t.Run("multi-node RWOP preemption targets node with volume assignment and preserves non-holding node", func(t *testing.T) {
+		testCtx := initTest(t, "rwop-multinode-preempt")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeA, err := createNode(cs, st.MakeNode().Name("node-rwop-a").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeA: %v", err)
+		}
+		nodeB, err := createNode(cs, st.MakeNode().Name("node-rwop-b").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeB: %v", err)
+		}
+
+		pv1 := st.MakePersistentVolume().
+			Name("pv-rwop-interlock-1").
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Capacity(storage.Requests).
+			HostPathVolumeSource(&v1.HostPathVolumeSource{Path: "/mnt-rwop-1", Type: &volType}).
+			Obj()
+		if _, err := testutils.CreatePV(cs, pv1); err != nil {
+			t.Fatalf("Failed to create pv1: %v", err)
+		}
+		pvc1 := st.MakePersistentVolumeClaim().
+			Name("pvc-rwop-interlock-1").
+			Namespace(ns).
+			Annotation(volume.AnnBindCompleted, "true").
+			VolumeName(pv1.Name).
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Resources(storage).
+			Obj()
+		if _, err := testutils.CreatePVC(cs, pvc1); err != nil {
+			t.Fatalf("Failed to create pvc1: %v", err)
+		}
+
+		// Victim A is scheduled on nodeA using PVC1 and 800m CPU
+		victimA, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-rwop-a",
+			Namespace: ns,
+			NodeName:  nodeA.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimA: %v", err)
+		}
+
+		// Victim B is scheduled on nodeB (generic pod, 800m CPU, no PVC)
+		victimB, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-generic-b",
+			Namespace: ns,
+			NodeName:  nodeB.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimB: %v", err)
+		}
+
+		// Preemptor pod requires PVC1 (ReadWriteOncePod) and 800m CPU
+		preemptorPod := initPausePod(&testutils.PausePodConfig{
+			Name:      "preemptor-rwop",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		})
+
+		preemptor, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, preemptorPod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{preemptor, victimA, victimB})
+
+		// VolumeRestrictions ensures nodeB cannot host the preemptor because pvc1 is assigned to nodeA.
+		// Preemption MUST select victimA on nodeA.
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimA.Name); err != nil {
+			t.Fatalf("Expected victimA to be preempted: %v", err)
+		}
+
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptor, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule on nodeA: %v", err)
+		}
+
+		scheduledPreemptor, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptor.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor: %v", err)
+		}
+		if scheduledPreemptor.Spec.NodeName != nodeA.Name {
+			t.Errorf("Preemptor scheduled on %q, expected %q (nodeA)", scheduledPreemptor.Spec.NodeName, nodeA.Name)
+		}
+
+		// Verify victimB on nodeB was NEVER marked for deletion
+		pB, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, victimB.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get victimB: %v", err)
+		}
+		if pB.DeletionTimestamp != nil {
+			t.Errorf("Victim B on nodeB was unexpectedly marked for deletion")
+		}
+	})
+
+	t.Run("unresolvable conflicting multi-RWOP preemption across distinct nodes preserves all victims", func(t *testing.T) {
+		testCtx := initTest(t, "rwop-multinode-conflict")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeA, err := createNode(cs, st.MakeNode().Name("node-conflict-a").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeA: %v", err)
+		}
+		nodeB, err := createNode(cs, st.MakeNode().Name("node-conflict-b").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeB: %v", err)
+		}
+
+		pv1 := st.MakePersistentVolume().
+			Name("pv-conflict-1").
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Capacity(storage.Requests).
+			HostPathVolumeSource(&v1.HostPathVolumeSource{Path: "/mnt-conflict-1", Type: &volType}).
+			Obj()
+		if _, err := testutils.CreatePV(cs, pv1); err != nil {
+			t.Fatalf("Failed to create pv1: %v", err)
+		}
+		pvc1 := st.MakePersistentVolumeClaim().
+			Name("pvc-conflict-1").
+			Namespace(ns).
+			Annotation(volume.AnnBindCompleted, "true").
+			VolumeName(pv1.Name).
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Resources(storage).
+			Obj()
+		if _, err := testutils.CreatePVC(cs, pvc1); err != nil {
+			t.Fatalf("Failed to create pvc1: %v", err)
+		}
+
+		pv2 := st.MakePersistentVolume().
+			Name("pv-conflict-2").
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Capacity(storage.Requests).
+			HostPathVolumeSource(&v1.HostPathVolumeSource{Path: "/mnt-conflict-2", Type: &volType}).
+			Obj()
+		if _, err := testutils.CreatePV(cs, pv2); err != nil {
+			t.Fatalf("Failed to create pv2: %v", err)
+		}
+		pvc2 := st.MakePersistentVolumeClaim().
+			Name("pvc-conflict-2").
+			Namespace(ns).
+			Annotation(volume.AnnBindCompleted, "true").
+			VolumeName(pv2.Name).
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Resources(storage).
+			Obj()
+		if _, err := testutils.CreatePVC(cs, pvc2); err != nil {
+			t.Fatalf("Failed to create pvc2: %v", err)
+		}
+
+		// Victim 1 holds PVC1 on Node A
+		victimA, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-conflict-a",
+			Namespace: ns,
+			NodeName:  nodeA.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimA: %v", err)
+		}
+
+		// Victim 2 holds PVC2 on Node B
+		victimB, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-conflict-b",
+			Namespace: ns,
+			NodeName:  nodeB.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{{
+				Name: "vol-2",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc2.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimB: %v", err)
+		}
+
+		// Preemptor requires BOTH PVC1 and PVC2
+		preemptorPod := initPausePod(&testutils.PausePodConfig{
+			Name:      "preemptor-dual-rwop",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{
+				{
+					Name: "vol-1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvc1.Name,
+						},
+					},
+				},
+				{
+					Name: "vol-2",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvc2.Name,
+						},
+					},
+				},
+			},
+		})
+
+		preemptor, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, preemptorPod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{preemptor, victimA, victimB})
+
+		// Preemptor must remain unschedulable because PVC1 and PVC2 cannot be co-located without violating volume locks
+		if err := waitForPodUnschedulable(testCtx.Ctx, cs, preemptor); err != nil {
+			t.Fatalf("Preemptor unexpectedly scheduled: %v", err)
+		}
+
+		// Neither victim should be marked for deletion
+		pA, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, victimA.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get victimA: %v", err)
+		}
+		if pA.DeletionTimestamp != nil {
+			t.Errorf("Victim A was unexpectedly marked for deletion in unresolvable preemption")
+		}
+		pB, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, victimB.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get victimB: %v", err)
+		}
+		if pB.DeletionTimestamp != nil {
+			t.Errorf("Victim B was unexpectedly marked for deletion in unresolvable preemption")
+		}
+	})
+
+	t.Run("preemption interlock prevents volume collision during victim termination grace period", func(t *testing.T) {
+		testCtx := initTest(t, "rwop-collision-prevent")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeA, err := createNode(cs, st.MakeNode().Name("node-interlock").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create nodeA: %v", err)
+		}
+
+		pv1 := st.MakePersistentVolume().
+			Name("pv-interlock-lock").
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Capacity(storage.Requests).
+			HostPathVolumeSource(&v1.HostPathVolumeSource{Path: "/mnt-interlock-lock", Type: &volType}).
+			Obj()
+		if _, err := testutils.CreatePV(cs, pv1); err != nil {
+			t.Fatalf("Failed to create pv1: %v", err)
+		}
+		pvc1 := st.MakePersistentVolumeClaim().
+			Name("pvc-interlock-lock").
+			Namespace(ns).
+			Annotation(volume.AnnBindCompleted, "true").
+			VolumeName(pv1.Name).
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+			Resources(storage).
+			Obj()
+		if _, err := testutils.CreatePVC(cs, pvc1); err != nil {
+			t.Fatalf("Failed to create pvc1: %v", err)
+		}
+
+		// Victim pod on nodeA with RWOP PVC1
+		victimA, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-locking-pod",
+			Namespace: ns,
+			NodeName:  nodeA.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victimA: %v", err)
+		}
+
+		// High-priority preemptor
+		preemptorPod := initPausePod(&testutils.PausePodConfig{
+			Name:      "high-preemptor-rwop",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		})
+		preemptor, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, preemptorPod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+
+		// Wait for victimA to be nominated for deletion by preemptor
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false, func(ctx context.Context) (bool, error) {
+			pod, err := cs.CoreV1().Pods(ns).Get(ctx, victimA.Name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			return pod.DeletionTimestamp != nil, nil
+		}); err != nil {
+			t.Fatalf("Expected victimA to receive deletion timestamp: %v", err)
+		}
+
+		// Create medium priority contender pod requesting the same RWOP PVC1
+		contenderPod := initPausePod(&testutils.PausePodConfig{
+			Name:      "medium-contender-rwop",
+			Namespace: ns,
+			Priority:  &mediumPriority,
+			Resources: &v1.ResourceRequirements{Requests: victimRes},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		})
+		contender, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, contenderPod, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create contender pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{preemptor, contender, victimA})
+
+		// Now simulate completion of victim deletion
+		if err := cs.CoreV1().Pods(ns).Delete(testCtx.Ctx, victimA.Name, metav1.DeleteOptions{GracePeriodSeconds: ptr.To(int64(0))}); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatalf("Failed to delete victim: %v", err)
+		}
+
+		// High priority preemptor must schedule and bind to nodeA
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptor, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule: %v", err)
+		}
+
+		// Medium priority contender must be unschedulable (cannot steal or collide with volume)
+		if err := waitForPodUnschedulable(testCtx.Ctx, cs, contender); err != nil {
+			t.Fatalf("Contender pod should be unschedulable while preemptor occupies volume: %v", err)
+		}
+	})
+}
+
