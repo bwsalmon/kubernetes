@@ -5007,3 +5007,221 @@ func TestCompositePodGroupPreemption_DivergentHierarchyValidation(t *testing.T) 
 		})
 	}
 }
+
+type timeoutPermitPlugin struct {
+	targetPGName string
+	timeout      time.Duration
+	enteredChan  chan string
+}
+
+func (p *timeoutPermitPlugin) Name() string {
+	return "timeoutPermitPlugin"
+}
+
+func (p *timeoutPermitPlugin) Permit(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) (*fwk.Status, time.Duration) {
+	if pod.Spec.SchedulingGroup != nil && pod.Spec.SchedulingGroup.PodGroupName != nil && *pod.Spec.SchedulingGroup.PodGroupName == p.targetPGName {
+		if p.enteredChan != nil {
+			select {
+			case p.enteredChan <- pod.Name:
+			default:
+			}
+		}
+		return fwk.NewStatus(fwk.Wait, "waiting for gang quorum permit"), p.timeout
+	}
+	return nil, 0
+}
+
+// TestPodGroupPreemptionPermitTimeoutRollback tests KEP-5710 gang preemption permit timeout and atomic rollback.
+// When a 4-pod PodGroup (minMember: 4) preempts victims across 4 nodes but one victim's deletion is stalled past
+// the permit timeout, waiting pods must time out, all nominatedNodeName values must be cleared, no in-memory cache
+// reservations or nominations are leaked, and subsequent workloads can use the freed capacity.
+func TestPodGroupPreemptionPermitTimeoutRollback(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload: true,
+	})
+
+	const (
+		pluginName   = "timeoutPermitPlugin"
+		targetPGName = "preemptor-pg"
+		permitWait   = 3 * time.Second
+	)
+
+	enteredChan := make(chan string, 10)
+	registry := make(frameworkruntime.Registry)
+	err := registry.Register(pluginName, func(ctx context.Context, obj runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
+		return &timeoutPermitPlugin{
+			targetPGName: targetPGName,
+			timeout:      permitWait,
+			enteredChan:  enteredChan,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to register %s: %v", pluginName, err)
+	}
+
+	cfg := configtesting.V1ToInternalWithDefaults(t, configv1.KubeSchedulerConfiguration{
+		Profiles: []configv1.KubeSchedulerProfile{{
+			SchedulerName: new(v1.DefaultSchedulerName),
+			Plugins: &configv1.Plugins{
+				Permit: configv1.PluginSet{
+					Enabled: []configv1.Plugin{
+						{Name: pluginName},
+					},
+				},
+			},
+		}},
+	})
+
+	testCtx := testutils.InitTestSchedulerWithNS(t, "pg-permit-timeout-rollback",
+		scheduler.WithProfiles(cfg.Profiles...),
+		scheduler.WithFrameworkOutOfTreeRegistry(registry),
+		scheduler.WithPodMaxBackoffSeconds(1),
+		scheduler.WithPodInitialBackoffSeconds(0),
+	)
+	cs, ns := testCtx.ClientSet, testCtx.NS.Name
+
+	// 1. Create 4 nodes
+	nodeNames := []string{"node1", "node2", "node3", "node4"}
+	for _, nodeName := range nodeNames {
+		node := st.MakeNode().Name(nodeName).Label("kubernetes.io/hostname", nodeName).Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "1",
+			v1.ResourceMemory: "4Gi",
+			v1.ResourcePods:   "32",
+		}).Obj()
+		if _, err := cs.CoreV1().Nodes().Create(testCtx.Ctx, node, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create node %s: %v", nodeName, err)
+		}
+	}
+
+	// 2. Create 4 victim pods (1 per node).
+	// victim-1..3 terminate quickly; victim-4 has a finalizer to stall deletion.
+	victimPods := []*v1.Pod{
+		st.MakePod().Name("victim-1").Node("node1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+		st.MakePod().Name("victim-2").Node("node2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+		st.MakePod().Name("victim-3").Node("node3").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+		st.MakePod().Name("victim-4").Node("node4").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").Priority(10).Obj(),
+	}
+	victimPods[3].Finalizers = []string{"example.com/hold-victim"}
+
+	for _, v := range victimPods {
+		v.Namespace = ns
+		if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, v, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create victim pod %s: %v", v.Name, err)
+		}
+	}
+
+	for _, v := range victimPods {
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			testutils.PodScheduled(cs, ns, v.Name)); err != nil {
+			t.Fatalf("Failed to wait for victim pod %s to be scheduled: %v", v.Name, err)
+		}
+	}
+
+	// 3. Create PodGroup with minMember: 4
+	pg := st.MakePodGroup().Name(targetPGName).Namespace(ns).Priority(100).MinCount(4).Obj()
+	if _, err := cs.SchedulingV1beta1().PodGroups(ns).Create(testCtx.Ctx, pg, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create PodGroup %s: %v", pg.Name, err)
+	}
+
+	// 4. Create 4 high-priority preemptor pods targeting the 4 nodes
+	preemptorNames := []string{"preemptor-1", "preemptor-2", "preemptor-3", "preemptor-4"}
+	for i, name := range preemptorNames {
+		p := st.MakePod().Name(name).Namespace(ns).Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+			Container("image").PodGroupName(targetPGName).ZeroTerminationGracePeriod().Priority(100).
+			NodeSelector(map[string]string{"kubernetes.io/hostname": nodeNames[i]}).Obj()
+		if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create preemptor pod %s: %v", name, err)
+		}
+	}
+
+	// 5. Wait for the 3 preemptors (on node1..node3) to enter Permit and become WaitingPods
+	// while victim-4 remains deleting on node4.
+	t.Log("Waiting for preemptor pods on freed nodes to reach permit phase...")
+	err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 15*time.Second, false, func(ctx context.Context) (bool, error) {
+		waitingCount := 0
+		for _, name := range preemptorNames[:3] {
+			pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+			if wp := testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(pod.UID); wp != nil {
+				waitingCount++
+			}
+		}
+		return waitingCount == 3, nil
+	})
+	if err != nil {
+		t.Fatalf("Preemptor pods failed to enter waiting pods permit phase: %v", err)
+	}
+
+	// 6. Wait for permit timeout (3s) to fire and rollback to occur
+	t.Log("Waiting for permit timeout to fire and rollback all member pods...")
+	err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 20*time.Second, false, func(ctx context.Context) (bool, error) {
+		// All waiting pods must be rejected (no longer in waiting pods map)
+		for _, name := range preemptorNames {
+			pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+			if wp := testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(pod.UID); wp != nil {
+				return false, nil
+			}
+			// Nominated node name must be cleanly removed
+			if pod.Status.NominatedNodeName != "" {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("Timed out waiting for permit rollback and nominatedNodeName clearance: %v", err)
+	}
+
+	// 7. Verify no in-memory cache reservations or victim nominations are leaked in NodeInfoMap or PodGroupState
+	dump := testCtx.Scheduler.Cache.Dump()
+	if len(dump.AssumedPods) != 0 {
+		t.Errorf("Expected 0 assumed pods in cache after rollback, got %d: %v", len(dump.AssumedPods), dump.AssumedPods)
+	}
+
+	for _, nodeName := range nodeNames[:3] {
+		nodeInfo, err := testCtx.Scheduler.Cache.GetNode(nodeName)
+		if err != nil {
+			t.Fatalf("Failed to get nodeInfo for %s: %v", nodeName, err)
+		}
+		if reqCPU := nodeInfo.Requested.MilliCPU; reqCPU != 0 {
+			t.Errorf("Expected 0 milliCPU requested on %s after rollback, got %d", nodeName, reqCPU)
+		}
+		if len(nodeInfo.Pods) != 0 {
+			t.Errorf("Expected 0 pods on %s in cache after rollback, got %d", nodeName, len(nodeInfo.Pods))
+		}
+	}
+
+	pgState, err := testCtx.Scheduler.Cache.PodGroupStates().Get(ns, targetPGName)
+	if err == nil && pgState != nil {
+		if assumedCount := pgState.AssumedPods().Len(); assumedCount != 0 {
+			t.Errorf("Expected 0 assumed pods in PodGroupState after rollback, got %d", assumedCount)
+		}
+		if assignedCount := pgState.AssignedPods().Len(); assignedCount != 0 {
+			t.Errorf("Expected 0 assigned pods in PodGroupState after rollback, got %d", assignedCount)
+		}
+	}
+
+	// 8. Verify subsequent workloads can use freed capacity
+	subsequentPod := st.MakePod().Name("subsequent-pod-node1").Namespace(ns).
+		Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+		Container("image").ZeroTerminationGracePeriod().Priority(10).
+		NodeSelector(map[string]string{"kubernetes.io/hostname": "node1"}).Obj()
+	if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, subsequentPod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create subsequent pod: %v", err)
+	}
+	if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+		testutils.PodScheduled(cs, ns, subsequentPod.Name)); err != nil {
+		t.Fatalf("Subsequent pod failed to schedule on freed capacity: %v", err)
+	}
+
+	// Clean up stalled victim-4 by removing its finalizer
+	patch := []byte(`{"metadata":{"finalizers":null}}`)
+	if _, err := cs.CoreV1().Pods(ns).Patch(testCtx.Ctx, "victim-4", types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		t.Logf("Failed to remove finalizer on victim-4: %v", err)
+	}
+}
