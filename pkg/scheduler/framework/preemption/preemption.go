@@ -481,6 +481,20 @@ func (ev *Evaluator) DryRunPreemption(ctx context.Context, state fwk.CycleState,
 		nodeInfo := potentialNodes[(int(offset)+i)%len(potentialNodes)]
 		logger.V(5).Info("Check the potential node for preemption", "node", nodeInfo.Node().Name)
 
+		// Coarse-grained capacity & headroom pruning: skip expensive victim discovery and dry-run
+		// simulation if the node cannot mathematically fit the preemptor or violates static constraints.
+		// If an interested preemption extender is configured, bypass coarse-grained pruning so the extender
+		// can manage its external resources/victims.
+		if !ev.hasInterestedPreemptExtender(pod) {
+			if canFit, pruneStatus := ev.canNodeFitPreemptorHeadroom(logger, pod, nodeInfo); !canFit {
+				logger.V(5).Info("Node pruned by coarse-grained capacity and headroom filter", "node", nodeInfo.Node().Name, "pod", klog.KObj(pod), "reason", pruneStatus.Message())
+				mu.Lock()
+				nodeStatuses.Set(nodeInfo.Node().Name, pruneStatus)
+				mu.Unlock()
+				return
+			}
+		}
+
 		// GetVictimsOnNode is called with a shared nodeInfo. The returned DomainVictims
 		// will contain shared, non-cloned NodeInfos for affected nodes. This is safe because
 		// SelectVictimsOnNode only mutates the main node's NodeInfo (which is passed as a cloned
@@ -532,6 +546,10 @@ func (ev *Evaluator) DryRunPreemption(ctx context.Context, state fwk.CycleState,
 	}
 	fh.Parallelizer().Until(ctx, len(potentialNodes), checkNode, ev.PluginName)
 	return append(nonViolatingCandidates.get(), violatingCandidates.get()...), nodeStatuses, utilerrors.NewAggregate(errs)
+}
+
+func (ev *Evaluator) canNodeFitPreemptorHeadroom(logger klog.Logger, pod *v1.Pod, nodeInfo fwk.NodeInfo) (bool, *fwk.Status) {
+	return CanNodeFitPreemptorHeadroom(logger, pod, nodeInfo, ev.podGroupSnapshot, ev.compositePodGroupSnapshot, ev.fts.EnablePodLevelResources)
 }
 
 // GetVictimsOnNode returns a list of potential preemption victims on the given node.

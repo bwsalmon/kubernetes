@@ -364,7 +364,7 @@ func TestSelectCandidate(t *testing.T) {
 
 			fakePreemptionScorePostFilterPlugin := &FakePreemptionScorePostFilterPlugin{}
 
-			for _, pod := range tt.testPods {
+			for range tt.testPods {
 				state := framework.NewCycleState()
 				pe := Evaluator{
 					PluginName: "FakePreemptionScorePostFilter",
@@ -372,7 +372,7 @@ func TestSelectCandidate(t *testing.T) {
 					Interface:  fakePreemptionScorePostFilterPlugin,
 					executor:   nil,
 				}
-				candidates, _, _ := pe.DryRunPreemption(ctx, state, pod, nodeInfos, nil, 0, int32(len(nodeInfos)))
+				candidates, _, _ := pe.DryRunPreemption(ctx, state, tt.pod, nodeInfos, nil, 0, int32(len(nodeInfos)))
 				s := pe.SelectCandidate(ctx, candidates)
 				if s == nil || len(s.Name()) == 0 {
 					t.Errorf("expect any node in %v, but no candidate selected", tt.expected)
@@ -387,12 +387,12 @@ func TestSelectCandidate(t *testing.T) {
 }
 
 type fakeExtender struct {
-	ignorable            bool
-	errProcessPreemption bool
-	supportsPreemption   bool
-	returnsNoVictims     bool
-	victimsToAdd         []*v1.Pod
-	trimVictims          *int
+	ignorable               bool
+	errProcessPreemption    bool
+	supportsPreemption      bool
+	returnsNoVictims        bool
+	victimsToAdd            []*v1.Pod
+	trimVictims             *int
 	customProcessPreemption func(pod *v1.Pod, victims map[string]*extenderv1.Victims, nodeLister fwk.NodeInfoLister) (map[string]*extenderv1.Victims, error)
 }
 
