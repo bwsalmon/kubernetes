@@ -2008,4 +2008,175 @@ var _ = SIGDescribe("WorkloadAwarePreemption", framework.WithFeatureGate(feature
 		})
 	})
 
+	ginkgo.Describe("CompositePodGroup StrictOrdering Hierarchical Preemption", func() {
+		ginkgo.It("validates CompositePodGroup StrictOrdering multi-tier gang preemption lifecycle on a live cluster", func(ctx context.Context) {
+			cs := f.ClientSet
+			ns := f.Namespace.Name
+			extendedResourceName := v1.ResourceName(extendedResourceDomain + ns)
+
+			lowPriorityName := "low-priority-cpg-strict-" + ns
+			highPriorityName := "high-priority-cpg-strict-" + ns
+			blockerPriorityName := "blocker-priority-cpg-strict-" + ns
+
+			createPriorityClass(ctx, &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{Name: lowPriorityName},
+				Value:      100,
+			})
+			defer deletePriorityClass(ctx, lowPriorityName)
+
+			createPriorityClass(ctx, &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{Name: highPriorityName},
+				Value:      1000,
+			})
+			defer deletePriorityClass(ctx, highPriorityName)
+
+			createPriorityClass(ctx, &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{Name: blockerPriorityName},
+				Value:      2000,
+			})
+			defer deletePriorityClass(ctx, blockerPriorityName)
+
+			node1, node2 := getTwoNodeNames(ctx)
+			addExtendedResource(ctx, node1, extendedResourceName)
+			defer removeExtendedResource(ctx, node1, extendedResourceName)
+			addExtendedResource(ctx, node2, extendedResourceName)
+			defer removeExtendedResource(ctx, node2, extendedResourceName)
+
+			// Phase 1: Parent Tier (P1) cannot find preemption candidates -> verify zero victims evicted for Child Tier (P2)
+			ginkgo.By("Phase 1: Setting up higher-priority blocker on node1 and low-priority victim on node2")
+			blocker1 := makePod(node1, "blocker-n1-1", "", blockerPriorityName, extendedResourceName)
+			createdBlocker1, err := cs.CoreV1().Pods(ns).Create(ctx, blocker1, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			blocker2 := makePod(node1, "blocker-n1-2", "", blockerPriorityName, extendedResourceName)
+			createdBlocker2, err := cs.CoreV1().Pods(ns).Create(ctx, blocker2, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+
+			victim1 := makePod(node2, "victim-p2-1", "", lowPriorityName, extendedResourceName)
+			createdVictim1, err := cs.CoreV1().Pods(ns).Create(ctx, victim1, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			victim2 := makePod(node2, "victim-p2-2", "", lowPriorityName, extendedResourceName)
+			createdVictim2, err := cs.CoreV1().Pods(ns).Create(ctx, victim2, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdBlocker1.Name, ns))
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdBlocker2.Name, ns))
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdVictim1.Name, ns))
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdVictim2.Name, ns))
+
+			ginkgo.By("Phase 1: Creating CompositePodGroup with StrictOrdering multi-tier dependency")
+			cpgGatedName := "cpg-strict-gated-" + ns
+			cpgGated := makeCompositePodGroup(cpgGatedName, highPriorityName, cpgGangPolicy, singleCompositeDisruption)
+			createCompositePodGroup(ctx, cpgGated)
+			defer deleteCompositePodGroup(ctx, cpgGatedName)
+
+			pgParentGatedName := "pg-parent-gated-" + ns
+			pgParentGated := makeChildPodGroup(pgParentGatedName, highPriorityName, cpgGatedName, gangPolicy, singleDisruption)
+			createPodGroup(ctx, pgParentGated)
+			defer deletePodGroup(ctx, pgParentGatedName)
+
+			pgChildGatedName := "pg-child-gated-" + ns
+			pgChildGated := makeChildPodGroup(pgChildGatedName, highPriorityName, cpgGatedName, gangPolicy, singleDisruption)
+			createPodGroup(ctx, pgChildGated)
+			defer deletePodGroup(ctx, pgChildGatedName)
+
+			ginkgo.By("Phase 1: Creating preemptor pods for Parent Tier on node1 and Child Tier on node2")
+			var p1Pods []*v1.Pod
+			for i := 1; i <= 2; i++ {
+				p := makePod(node1, fmt.Sprintf("hp-p1-n1-%d", i), pgParentGatedName, highPriorityName, extendedResourceName)
+				createdP, err := cs.CoreV1().Pods(ns).Create(ctx, p, metav1.CreateOptions{})
+				framework.ExpectNoError(err)
+				p1Pods = append(p1Pods, createdP)
+			}
+			var p2Pods []*v1.Pod
+			for i := 1; i <= 2; i++ {
+				p := makePod(node2, fmt.Sprintf("hp-p2-n2-%d", i), pgChildGatedName, highPriorityName, extendedResourceName)
+				createdP, err := cs.CoreV1().Pods(ns).Create(ctx, p, metav1.CreateOptions{})
+				framework.ExpectNoError(err)
+				p2Pods = append(p2Pods, createdP)
+			}
+
+			ginkgo.By("Phase 1: Verifying zero victims are evicted across the cluster for Child Tier (P2)")
+			time.Sleep(3 * time.Second)
+
+			for _, v := range []*v1.Pod{createdVictim1, createdVictim2} {
+				pod, err := cs.CoreV1().Pods(ns).Get(ctx, v.Name, metav1.GetOptions{})
+				framework.ExpectNoError(err)
+				gomega.Expect(pod.DeletionTimestamp).To(gomega.BeNil(), "victim pod %s should not have DeletionTimestamp", v.Name)
+				gomega.Expect(pod.Status.Phase).To(gomega.Equal(v1.PodRunning), "victim pod %s should remain Running", v.Name)
+			}
+
+			for _, p := range append(p1Pods, p2Pods...) {
+				pod, err := cs.CoreV1().Pods(ns).Get(ctx, p.Name, metav1.GetOptions{})
+				framework.ExpectNoError(err)
+				gomega.Expect(pod.Spec.NodeName).To(gomega.BeEmpty(), "preemptor pod %s should not be assigned a node", p.Name)
+			}
+
+			ginkgo.By("Phase 1: Cleaning up Phase 1 preemptors and blocker pods")
+			for _, p := range append(p1Pods, p2Pods...) {
+				_ = cs.CoreV1().Pods(ns).Delete(ctx, p.Name, metav1.DeleteOptions{})
+			}
+			deletePodGroup(ctx, pgChildGatedName)
+			deletePodGroup(ctx, pgParentGatedName)
+			deleteCompositePodGroup(ctx, cpgGatedName)
+
+			_ = cs.CoreV1().Pods(ns).Delete(ctx, createdBlocker1.Name, metav1.DeleteOptions{})
+			_ = cs.CoreV1().Pods(ns).Delete(ctx, createdBlocker2.Name, metav1.DeleteOptions{})
+
+			framework.ExpectNoError(e2epod.WaitForPodNotFoundInNamespace(ctx, cs, createdBlocker1.Name, ns, 30*time.Second))
+			framework.ExpectNoError(e2epod.WaitForPodNotFoundInNamespace(ctx, cs, createdBlocker2.Name, ns, 30*time.Second))
+
+			// Phase 2: Full multi-tier gang preemption lifecycle on live cluster
+			ginkgo.By("Phase 2: Creating low-priority victim pods on node1")
+			victimN1_1 := makePod(node1, "victim-p1-1", "", lowPriorityName, extendedResourceName)
+			createdVictimN1_1, err := cs.CoreV1().Pods(ns).Create(ctx, victimN1_1, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			victimN1_2 := makePod(node1, "victim-p1-2", "", lowPriorityName, extendedResourceName)
+			createdVictimN1_2, err := cs.CoreV1().Pods(ns).Create(ctx, victimN1_2, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdVictimN1_1.Name, ns))
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdVictimN1_2.Name, ns))
+
+			allVictims := []*v1.Pod{createdVictimN1_1, createdVictimN1_2, createdVictim1, createdVictim2}
+
+			ginkgo.By("Phase 2: Creating high-priority CompositePodGroup and child PodGroups")
+			cpgSuccessName := "cpg-strict-success-" + ns
+			cpgSuccess := makeCompositePodGroup(cpgSuccessName, highPriorityName, cpgGangPolicy, singleCompositeDisruption)
+			createCompositePodGroup(ctx, cpgSuccess)
+			defer deleteCompositePodGroup(ctx, cpgSuccessName)
+
+			pgParentSuccessName := "pg-parent-success-" + ns
+			pgParentSuccess := makeChildPodGroup(pgParentSuccessName, highPriorityName, cpgSuccessName, gangPolicy, singleDisruption)
+			createPodGroup(ctx, pgParentSuccess)
+			defer deletePodGroup(ctx, pgParentSuccessName)
+
+			pgChildSuccessName := "pg-child-success-" + ns
+			pgChildSuccess := makeChildPodGroup(pgChildSuccessName, highPriorityName, cpgSuccessName, gangPolicy, singleDisruption)
+			createPodGroup(ctx, pgChildSuccess)
+			defer deletePodGroup(ctx, pgChildSuccessName)
+
+			ginkgo.By("Phase 2: Creating high-priority gang pods for Parent Tier on node1 and Child Tier on node2")
+			var successHP []*v1.Pod
+			for i := 1; i <= 2; i++ {
+				p := makePod(node1, fmt.Sprintf("hp-succ-p1-%d", i), pgParentSuccessName, highPriorityName, extendedResourceName)
+				createdP, err := cs.CoreV1().Pods(ns).Create(ctx, p, metav1.CreateOptions{})
+				framework.ExpectNoError(err)
+				successHP = append(successHP, createdP)
+			}
+			for i := 1; i <= 2; i++ {
+				p := makePod(node2, fmt.Sprintf("hp-succ-p2-%d", i), pgChildSuccessName, highPriorityName, extendedResourceName)
+				createdP, err := cs.CoreV1().Pods(ns).Create(ctx, p, metav1.CreateOptions{})
+				framework.ExpectNoError(err)
+				successHP = append(successHP, createdP)
+			}
+
+			ginkgo.By("Phase 2: Verifying all victim pods are preempted across nodes")
+			verifyAllPreempted(ctx, allVictims)
+
+			ginkgo.By("Phase 2: Verifying all high-priority multi-tier gang pods schedule and run")
+			for _, p := range successHP {
+				framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, p.Name, ns), "hp pod %s failed to run", p.Name)
+			}
+		})
+	})
 })
