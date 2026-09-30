@@ -31,6 +31,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -5005,5 +5006,415 @@ func TestCompositePodGroupPreemption_DivergentHierarchyValidation(t *testing.T) 
 				t.Fatalf("Scheduler appears deadlocked; failed to schedule valid independent pod: %v", err)
 			}
 		})
+	}
+}
+
+type timeoutPermitPlugin struct {
+	targetPGName string
+	timeout      time.Duration
+	enteredChan  chan string
+}
+
+func (p *timeoutPermitPlugin) Name() string {
+	return "timeoutPermitPlugin"
+}
+
+func (p *timeoutPermitPlugin) Permit(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeName string) (*fwk.Status, time.Duration) {
+	if pod.Spec.SchedulingGroup != nil && pod.Spec.SchedulingGroup.PodGroupName != nil && *pod.Spec.SchedulingGroup.PodGroupName == p.targetPGName {
+		if p.enteredChan != nil {
+			select {
+			case p.enteredChan <- pod.Name:
+			default:
+			}
+		}
+		return fwk.NewStatus(fwk.Wait, "waiting for gang quorum permit"), p.timeout
+	}
+	return nil, 0
+}
+
+// TestPodGroupPreemptionPermitTimeoutRollback tests KEP-5710 gang preemption permit timeout and atomic rollback.
+// When a 4-pod PodGroup (minMember: 4) preempts victims across 4 nodes but one victim's deletion is stalled past
+// the permit timeout, waiting pods must time out, all nominatedNodeName values must be cleared, no in-memory cache
+// reservations or nominations are leaked, and subsequent workloads can use the freed capacity.
+func TestPodGroupPreemptionPermitTimeoutRollback(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload: true,
+	})
+
+	const (
+		pluginName   = "timeoutPermitPlugin"
+		targetPGName = "preemptor-pg"
+		permitWait   = 3 * time.Second
+	)
+
+	enteredChan := make(chan string, 10)
+	registry := make(frameworkruntime.Registry)
+	err := registry.Register(pluginName, func(ctx context.Context, obj runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
+		return &timeoutPermitPlugin{
+			targetPGName: targetPGName,
+			timeout:      permitWait,
+			enteredChan:  enteredChan,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to register %s: %v", pluginName, err)
+	}
+
+	cfg := configtesting.V1ToInternalWithDefaults(t, configv1.KubeSchedulerConfiguration{
+		Profiles: []configv1.KubeSchedulerProfile{{
+			SchedulerName: new(v1.DefaultSchedulerName),
+			Plugins: &configv1.Plugins{
+				Permit: configv1.PluginSet{
+					Enabled: []configv1.Plugin{
+						{Name: pluginName},
+					},
+				},
+			},
+		}},
+	})
+
+	testCtx := testutils.InitTestSchedulerWithNS(t, "pg-permit-timeout-rollback",
+		scheduler.WithProfiles(cfg.Profiles...),
+		scheduler.WithFrameworkOutOfTreeRegistry(registry),
+		scheduler.WithPodMaxBackoffSeconds(1),
+		scheduler.WithPodInitialBackoffSeconds(0),
+	)
+	cs, ns := testCtx.ClientSet, testCtx.NS.Name
+
+	// 1. Create 4 nodes
+	nodeNames := []string{"node1", "node2", "node3", "node4"}
+	for _, nodeName := range nodeNames {
+		node := st.MakeNode().Name(nodeName).Label("kubernetes.io/hostname", nodeName).Capacity(map[v1.ResourceName]string{
+			v1.ResourceCPU:    "1",
+			v1.ResourceMemory: "4Gi",
+			v1.ResourcePods:   "32",
+		}).Obj()
+		if _, err := cs.CoreV1().Nodes().Create(testCtx.Ctx, node, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create node %s: %v", nodeName, err)
+		}
+	}
+
+	// 2. Create 4 victim pods (1 per node).
+	// victim-1..3 terminate quickly; victim-4 has a finalizer to stall deletion.
+	victimPods := []*v1.Pod{
+		st.MakePod().Name("victim-1").Node("node1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+		st.MakePod().Name("victim-2").Node("node2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+		st.MakePod().Name("victim-3").Node("node3").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+		st.MakePod().Name("victim-4").Node("node4").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").Priority(10).Obj(),
+	}
+	victimPods[3].Finalizers = []string{"example.com/hold-victim"}
+
+	for _, v := range victimPods {
+		v.Namespace = ns
+		if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, v, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create victim pod %s: %v", v.Name, err)
+		}
+	}
+
+	for _, v := range victimPods {
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			testutils.PodScheduled(cs, ns, v.Name)); err != nil {
+			t.Fatalf("Failed to wait for victim pod %s to be scheduled: %v", v.Name, err)
+		}
+	}
+
+	// 3. Create PodGroup with minMember: 4
+	pg := st.MakePodGroup().Name(targetPGName).Namespace(ns).Priority(100).MinCount(4).Obj()
+	if _, err := cs.SchedulingV1beta1().PodGroups(ns).Create(testCtx.Ctx, pg, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create PodGroup %s: %v", pg.Name, err)
+	}
+
+	// 4. Create 4 high-priority preemptor pods targeting the 4 nodes
+	preemptorNames := []string{"preemptor-1", "preemptor-2", "preemptor-3", "preemptor-4"}
+	for i, name := range preemptorNames {
+		p := st.MakePod().Name(name).Namespace(ns).Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+			Container("image").PodGroupName(targetPGName).ZeroTerminationGracePeriod().Priority(100).
+			NodeSelector(map[string]string{"kubernetes.io/hostname": nodeNames[i]}).Obj()
+		if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create preemptor pod %s: %v", name, err)
+		}
+	}
+
+	// 5. Wait for the 3 preemptors (on node1..node3) to enter Permit and become WaitingPods
+	// while victim-4 remains deleting on node4.
+	t.Log("Waiting for preemptor pods on freed nodes to reach permit phase...")
+	err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 15*time.Second, false, func(ctx context.Context) (bool, error) {
+		waitingCount := 0
+		for _, name := range preemptorNames[:3] {
+			pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+			if wp := testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(pod.UID); wp != nil {
+				waitingCount++
+			}
+		}
+		return waitingCount == 3, nil
+	})
+	if err != nil {
+		t.Fatalf("Preemptor pods failed to enter waiting pods permit phase: %v", err)
+	}
+
+	// 6. Wait for permit timeout (3s) to fire and rollback to occur
+	t.Log("Waiting for permit timeout to fire and rollback all member pods...")
+	err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 20*time.Second, false, func(ctx context.Context) (bool, error) {
+		// All waiting pods must be rejected (no longer in waiting pods map)
+		for _, name := range preemptorNames {
+			pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+			if wp := testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(pod.UID); wp != nil {
+				return false, nil
+			}
+			// Nominated node name must be cleanly removed
+			if pod.Status.NominatedNodeName != "" {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("Timed out waiting for permit rollback and nominatedNodeName clearance: %v", err)
+	}
+
+	// 7. Verify no in-memory cache reservations or victim nominations are leaked in NodeInfoMap or PodGroupState
+	dump := testCtx.Scheduler.Cache.Dump()
+	if len(dump.AssumedPods) != 0 {
+		t.Errorf("Expected 0 assumed pods in cache after rollback, got %d: %v", len(dump.AssumedPods), dump.AssumedPods)
+	}
+
+	for _, nodeName := range nodeNames[:3] {
+		nodeInfo, err := testCtx.Scheduler.Cache.GetNode(nodeName)
+		if err != nil {
+			t.Fatalf("Failed to get nodeInfo for %s: %v", nodeName, err)
+		}
+		if reqCPU := nodeInfo.Requested.MilliCPU; reqCPU != 0 {
+			t.Errorf("Expected 0 milliCPU requested on %s after rollback, got %d", nodeName, reqCPU)
+		}
+		if len(nodeInfo.Pods) != 0 {
+			t.Errorf("Expected 0 pods on %s in cache after rollback, got %d", nodeName, len(nodeInfo.Pods))
+		}
+	}
+
+	pgState, err := testCtx.Scheduler.Cache.PodGroupStates().Get(ns, targetPGName)
+	if err == nil && pgState != nil {
+		if assumedCount := pgState.AssumedPods().Len(); assumedCount != 0 {
+			t.Errorf("Expected 0 assumed pods in PodGroupState after rollback, got %d", assumedCount)
+		}
+		if assignedCount := pgState.AssignedPods().Len(); assignedCount != 0 {
+			t.Errorf("Expected 0 assigned pods in PodGroupState after rollback, got %d", assignedCount)
+		}
+	}
+
+	// 8. Verify subsequent workloads can use freed capacity
+	subsequentPod := st.MakePod().Name("subsequent-pod-node1").Namespace(ns).
+		Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+		Container("image").ZeroTerminationGracePeriod().Priority(10).
+		NodeSelector(map[string]string{"kubernetes.io/hostname": "node1"}).Obj()
+	if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, subsequentPod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create subsequent pod: %v", err)
+	}
+	if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+		testutils.PodScheduled(cs, ns, subsequentPod.Name)); err != nil {
+		t.Fatalf("Subsequent pod failed to schedule on freed capacity: %v", err)
+	}
+
+	// Clean up stalled victim-4 by removing its finalizer
+	patch := []byte(`{"metadata":{"finalizers":null}}`)
+	if _, err := cs.CoreV1().Pods(ns).Patch(testCtx.Ctx, "victim-4", types.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		t.Logf("Failed to remove finalizer on victim-4: %v", err)
+	}
+}
+
+// TestPodGroupPreemption_VolumeBindingTopologyConstraints tests KEP-5710/KEP-6012 gang preemption
+// with WaitForFirstConsumer PVC volume binding and storage topology constraints.
+// When a 3-pod PodGroup requires WaitForFirstConsumer PVCs constrained to Zone A, but Zone A nodes
+// are occupied by high-priority pods and Zone B nodes are occupied by low-priority victims,
+// the preemption evaluator must verify that candidate nodes in Zone B satisfy storage topology constraints
+// before evicting any victims. Because Zone B cannot satisfy Zone A storage topology, preemption must
+// abort with zero victims evicted in Zone B.
+func TestPodGroupPreemption_VolumeBindingTopologyConstraints(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.GenericWorkload:                 true,
+		features.CompositePodGroup:               true,
+		features.PodGroupPreemptionPolicy:        true,
+		features.TopologyAwareWorkloadScheduling: true,
+	})
+
+	testCtx := testutils.InitTestSchedulerWithNS(t, "pg-volumebinding-topology")
+	cs, ns := testCtx.ClientSet, testCtx.NS.Name
+
+	// 1. Create StorageClass with VolumeBindingWaitForFirstConsumer and AllowedTopologies restricted to zone-a
+	scName := "zone-a-sc"
+	sc := st.MakeStorageClass().
+		Name(scName).
+		VolumeBindingMode(storagev1.VolumeBindingWaitForFirstConsumer).
+		Provisioner("example.com/mock-provisioner").
+		AllowedTopologies([]v1.TopologySelectorTerm{
+			{
+				MatchLabelExpressions: []v1.TopologySelectorLabelRequirement{
+					{
+						Key:      "topology.kubernetes.io/zone",
+						Values:   []string{"zone-a"},
+					},
+				},
+			},
+		}).Obj()
+	if _, err := cs.StorageV1().StorageClasses().Create(testCtx.Ctx, sc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create StorageClass %s: %v", scName, err)
+	}
+
+	// 2. Create Nodes: 3 in Zone A and 3 in Zone B
+	zoneANodes := []string{"node-a-1", "node-a-2", "node-a-3"}
+	zoneBNodes := []string{"node-b-1", "node-b-2", "node-b-3"}
+
+	for _, nodeName := range zoneANodes {
+		node := st.MakeNode().Name(nodeName).
+			Label("topology.kubernetes.io/zone", "zone-a").
+			Label("kubernetes.io/hostname", nodeName).
+			Capacity(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "1",
+				v1.ResourceMemory: "4Gi",
+				v1.ResourcePods:   "32",
+			}).Obj()
+		if _, err := cs.CoreV1().Nodes().Create(testCtx.Ctx, node, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create node %s: %v", nodeName, err)
+		}
+	}
+
+	for _, nodeName := range zoneBNodes {
+		node := st.MakeNode().Name(nodeName).
+			Label("topology.kubernetes.io/zone", "zone-b").
+			Label("kubernetes.io/hostname", nodeName).
+			Capacity(map[v1.ResourceName]string{
+				v1.ResourceCPU:    "1",
+				v1.ResourceMemory: "4Gi",
+				v1.ResourcePods:   "32",
+			}).Obj()
+		if _, err := cs.CoreV1().Nodes().Create(testCtx.Ctx, node, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create node %s: %v", nodeName, err)
+		}
+	}
+
+	// 3. Populate Zone A nodes with high-priority pods (Priority: 1000)
+	var highPriorityPods []*v1.Pod
+	for i, nodeName := range zoneANodes {
+		p := st.MakePod().Name(fmt.Sprintf("high-pod-zone-a-%d", i+1)).Namespace(ns).Node(nodeName).
+			Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+			Container("image").ZeroTerminationGracePeriod().Priority(1000).Obj()
+		if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create high priority pod %s: %v", p.Name, err)
+		}
+		highPriorityPods = append(highPriorityPods, p)
+	}
+
+	// 4. Populate Zone B nodes with low-priority victim pods (Priority: 10)
+	var lowPriorityVictims []*v1.Pod
+	for i, nodeName := range zoneBNodes {
+		p := st.MakePod().Name(fmt.Sprintf("victim-zone-b-%d", i+1)).Namespace(ns).Node(nodeName).
+			Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+			Container("image").ZeroTerminationGracePeriod().Priority(10).Obj()
+		if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create victim pod %s: %v", p.Name, err)
+		}
+		lowPriorityVictims = append(lowPriorityVictims, p)
+	}
+
+	// Wait for all initial pods to be scheduled
+	for _, p := range append(highPriorityPods, lowPriorityVictims...) {
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			testutils.PodScheduled(cs, ns, p.Name)); err != nil {
+			t.Fatalf("Failed to wait for initial pod %s to be scheduled: %v", p.Name, err)
+		}
+	}
+
+	// 5. Create 3 unbound PVCs referencing the Zone A StorageClass
+	pvcNames := []string{"preemptor-pvc-1", "preemptor-pvc-2", "preemptor-pvc-3"}
+	for _, pvcName := range pvcNames {
+		pvc := st.MakePersistentVolumeClaim().
+			Name(pvcName).
+			Namespace(ns).
+			StorageClassName(&scName).
+			AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}).
+			Resources(v1.VolumeResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceStorage: resource.MustParse("5Gi"),
+				},
+			}).Obj()
+		if _, err := cs.CoreV1().PersistentVolumeClaims(ns).Create(testCtx.Ctx, pvc, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create PVC %s: %v", pvcName, err)
+		}
+	}
+
+	// 6. Create 3-pod PodGroup (Priority: 100, MinCount: 3)
+	targetPGName := "preemptor-pg"
+	pg := st.MakePodGroup().Name(targetPGName).Namespace(ns).Priority(100).MinCount(3).Obj()
+	if _, err := cs.SchedulingV1beta1().PodGroups(ns).Create(testCtx.Ctx, pg, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create PodGroup %s: %v", pg.Name, err)
+	}
+
+	// 7. Create 3 preemptor pods (Priority: 100) requesting PVCs
+	preemptorNames := []string{"preemptor-pod-1", "preemptor-pod-2", "preemptor-pod-3"}
+	for i, name := range preemptorNames {
+		p := st.MakePod().Name(name).Namespace(ns).
+			Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).
+			Container("image").PodGroupName(targetPGName).
+			PVC(pvcNames[i]).
+			ZeroTerminationGracePeriod().Priority(100).Obj()
+		if _, err := cs.CoreV1().Pods(ns).Create(testCtx.Ctx, p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create preemptor pod %s: %v", name, err)
+		}
+	}
+
+	// 8. Verify preemption aborts and zero victims in Zone B are evicted.
+	// Low-priority victims in Zone B must remain running and scheduled.
+	// Preemptor pods must remain unscheduled.
+	err := wait.PollUntilContextTimeout(testCtx.Ctx, 200*time.Millisecond, 5*time.Second, false, func(ctx context.Context) (bool, error) {
+		for _, v := range lowPriorityVictims {
+			pod, err := cs.CoreV1().Pods(ns).Get(ctx, v.Name, metav1.GetOptions{})
+			if err != nil {
+				return false, fmt.Errorf("victim pod %s was unexpectedly deleted: %w", v.Name, err)
+			}
+			if pod.DeletionTimestamp != nil {
+				return false, fmt.Errorf("victim pod %s has deletion timestamp set (eviction started)", v.Name)
+			}
+			if pod.Spec.NodeName == "" {
+				return false, fmt.Errorf("victim pod %s lost its node assignment", v.Name)
+			}
+		}
+
+		for _, name := range preemptorNames {
+			pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			if pod.Spec.NodeName != "" {
+				return false, fmt.Errorf("preemptor pod %s was unexpectedly scheduled to %s", name, pod.Spec.NodeName)
+			}
+			if pod.Status.NominatedNodeName != "" {
+				// Node in zone-b must not be nominated
+				for _, bNode := range zoneBNodes {
+					if pod.Status.NominatedNodeName == bNode {
+						return false, fmt.Errorf("preemptor pod %s nominated invalid zone-b node %s", name, pod.Status.NominatedNodeName)
+					}
+				}
+			}
+		}
+		return false, nil // Keep polling until timeout to ensure stability
+	})
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Preemption constraint check failed: %v", err)
+	}
+
+	// Final verification: ensure all victims in Zone B are still intact and scheduled
+	for _, v := range lowPriorityVictims {
+		pod, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, v.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Victim pod %s not found: %v", v.Name, err)
+		}
+		if pod.DeletionTimestamp != nil {
+			t.Fatalf("Victim pod %s was evicted", v.Name)
+		}
 	}
 }

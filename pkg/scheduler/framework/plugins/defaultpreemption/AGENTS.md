@@ -1,18 +1,24 @@
-# DefaultPreemption Plugin (`pkg/scheduler/framework/plugins/defaultpreemption`)
+# AGENTS.md: DefaultPreemption Plugin Architecture & Implementation Guide
 
-This guide provides an architectural overview, interface implementations, victim selection algorithms, reprieve mechanics, PodGroup and composite preemption flows, queueing hints, and testing strategies for the `DefaultPreemption` plugin in `pkg/scheduler/framework/plugins/defaultpreemption`.
+This guide provides an in-depth architectural overview, interface implementations, victim selection algorithms, reprieve mechanics, PDB partitioning, PodGroup and composite preemption flows, queueing hints, and testing strategies for the `DefaultPreemption` plugin in `pkg/scheduler/framework/plugins/defaultpreemption`.
 
 ---
 
-## 1. High-Level Purpose & Scope
+## 1. High-Level Purpose & Scope (KEP-562 & KEP-3838)
 
 The `DefaultPreemption` plugin implements the scheduler's `PostFilter` extension point. When an incoming high-priority pod or workload cannot fit on any node in the cluster during normal filtering, `DefaultPreemption` searches for candidate nodes where evicting a minimal set of lower-priority "victim" pods will allow the preemptor to fit.
 
-### Core Responsibilities:
-1. **Preemption Feasibility Assessment**: Evaluates whether a pod is eligible to preempt others (`PodEligibleToPreemptOthers`), checking `spec.preemptionPolicy` and verifying that the nominated node is not waiting on existing terminating pods.
-2. **Victim Selection on Candidate Nodes**: Computes the optimal, minimal set of victim pods on a candidate node (`SelectVictimsOnNode`) while minimizing PodDisruptionBudget (PDB) violations and preserving higher-importance workloads.
+### Core Objectives:
+1. **Core Pod Priority and Preemption (KEP-562)**:
+   - Provide deterministic, priority-driven preemption while avoiding unnecessary evictions.
+   - Support `PreemptionPolicy` (`PreemptLowerPriority` vs `PreemptNever`).
+   - Coordinate candidate node discovery, minimal victim calculation, and nomination tracking (`status.nominatedNodeName`).
+2. **Respect PodDisruptionBudget in Preemption (KEP-3838)**:
+   - Partition candidate victims into PDB-respecting ($V_{respect}$) and PDB-violating ($V_{violate}$) sets.
+   - Prioritize reprieving $V_{violate}$ victims before $V_{respect}$ victims.
+   - Prefer candidate nodes with zero PDB violations during dry-run preemption and candidate scoring.
 3. **Multi-Node PodGroup Eviction**: Coordinates preemption of multi-node PodGroups, discovering all affected nodes and ensuring pre-filter extensions (e.g. topology spread skew, inter-pod affinity) update their cycle state accurately.
-4. **Asynchronous Preemption Gating**: Implements `PreEnqueue` to gate pods or pod groups that currently have asynchronous preemption operations in progress (`IsPodRunningPreemption` / `IsPodGroupRunningPreemption`).
+4. **Asynchronous Preemption Gating (KEP-4832)**: Implements `PreEnqueue` to gate pods or pod groups that currently have asynchronous preemption operations in progress (`IsPodRunningPreemption` / `IsPodGroupRunningPreemption`).
 5. **Workload & Composite PodGroup Preemption**: Supports hierarchical workload preemption (`PodGroupPostFilter`) utilizing mutable snapshot transactions (`StartMutations` / `EndMutations`).
 
 ---
@@ -126,7 +132,7 @@ type DefaultPreemption struct {
 
 ## 5. Victim Selection Algorithm (`SelectVictimsOnNode`)
 
-`SelectVictimsOnNode` finds the minimal set of victim pods to evict on a target node to accommodate the preemptor:
+`SelectVictimsOnNode` computes the minimal set of victim pods to evict on a target node to accommodate the preemptor:
 
 ```
 [ All Possible Victims ]
@@ -149,37 +155,43 @@ type DefaultPreemption struct {
 [ Step 3: Sort Potential Victims by MoreImportantVictim (Descending) ]
         │
         ▼
-[ Step 4: Partition into PDB-Violating vs Non-Violating Sets ]
+[ Step 4: Partition into PDB-Violating ($V_{violate}$) vs Non-Violating ($V_{respect}$) Sets ]
         │
         ▼
-[ Step 5: Reprieve Pass - PDB-Violating First ]
+[ Step 5: Reprieve Pass A - PDB-Violating First ($V_{violate}$) ]
   - Add victim back (NodeInfo.AddPodInfo + RunPreFilterExtensionAddPod)
-  - Test Fit:
+  - Test Fit (RunFilterPluginsWithNominatedPods):
       - Fits: Kept reprieved (not evicted)
       - Fails: Remove again, add to final victims list, count PDB violations
         │
         ▼
-[ Step 6: Reprieve Pass - Non-Violating Next ]
+[ Step 6: Reprieve Pass B - Non-Violating Next ($V_{respect}$) ]
   - Add victim back
-  - Test Fit:
+  - Test Fit (RunFilterPluginsWithNominatedPods):
       - Fits: Kept reprieved
       - Fails: Remove again, add to final victims list
         │
         ▼
-[ Return Final Victim Pods & PDB Violation Count ]
+[ Step 7: Sort Final Victims by Descending Importance & Return ]
 ```
 
 ### 5.1. Main Node vs. Remote Node Mutation Contract
 - **Main Node**: Mutates both `NodeInfo` (via `RemovePod` / `AddPodInfo`) and framework `CycleState` (via `RunPreFilterExtensionRemovePod` / `RunPreFilterExtensionAddPod`). This ensures subsequent `RunFilterPluginsWithNominatedPods` passes see the updated node capacity and port bindings.
 - **Remote Nodes**: Mutates *only* `CycleState` via `PreFilterExtension` hooks (e.g. topology spread skew counters, pod affinity state). Remote `NodeInfo` instances are not mutated directly during single-node victim selection.
 
-### 5.2. Victim Importance Hierarchy (`MoreImportantVictim`)
+### 5.2. PDB Partitioning ($V_{respect}$ vs $V_{violate}$) & Reprieve Invariants
+- Potential victims are partitioned via `preemption.FilterVictimsWithPDBViolation(potentialVictims, pdbs)`.
+- **Reprieve Order Invariant**: By reprieving $V_{violate}$ pods **first**, the scheduler attempts to fit the preemptor without breaking PDBs. If higher-importance non-violating pods must be evicted to save lower-importance PDB-violating pods, the PDB-violating pods are reprieved first to minimize disruption.
+- **Post-Reprieve Sorting**: If both violating and non-violating victims were selected, the final victim list is re-sorted by `MoreImportantVictim` descending so downstream eviction order remains deterministic.
+
+### 5.3. Victim Importance Hierarchy (`MoreImportantVictim`)
 
 When sorting victims for reprieve, higher importance workloads are reprieved first:
 1. **Higher Priority**: Victims with higher `Priority()` are more important.
-2. **Workload Hierarchy**: `CompositePodGroup` > `PodGroup` > Standalone `Pod`.
-3. **Group Size**: Larger groups are more important than smaller groups.
-4. **Runtime / StartTime**: Pods/groups with older `StartTime` (running longer) are more important (final tie-breaker).
+2. **Workload Hierarchy**: `CompositePodGroup` (rank 3) > `PodGroup` (rank 2) > Standalone `Pod` (rank 1).
+3. **Runtime / StartTime**: Pods/groups with older `StartTime` (running longer) are more important ("first-come, first-served").
+4. **Group Size**: Larger groups are more important than smaller groups (minimizes rescheduling churn).
+5. **UID Determinism**: `podIdentityLess` (string comparison of representative pod UID) guarantees deterministic sorting across runs.
 
 ---
 
@@ -198,4 +210,5 @@ For gang-scheduled workloads and pod groups (`EnableGenericWorkload`):
 - **`TestSelectVictimsOnNode`**: Verifies victim selection under varying resource pressures, multiple priorities, PDB constraints, and pod affinity rules.
 - **`TestPodEligibleToPreemptOthers`**: Validates preemption policies (`PreemptNever`, `PreemptLowerPriority`) and nominated node terminating pod checks.
 - **`TestOffsetAndNumCandidates`**: Verifies randomized node offset selection and minimum candidate bounds.
+- **`TestDryRunPreemption`**: Validates candidate search limits, zero-disruption short-circuiting, and PDB violation tracking.
 - **PodGroup Preemption Fixtures**: Tests multi-node victim removal and reprieve across composite and standard pod groups.

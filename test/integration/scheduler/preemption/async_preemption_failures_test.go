@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2/ktesting"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -616,4 +618,419 @@ func TestAsyncPreemption_PreemptorDeletionDuringExecution(t *testing.T) {
 			asyncframework.RunAsyncPreemptionSteps(testCtx, t, tt.steps, config)
 		})
 	}
+}
+
+// TestAsyncPreemption_Tolerate404NotFound tests FM-304: When victim pods are deleted
+// concurrently or return 404 Not Found during async preemption (e.g. terminating out-of-band),
+// the async preemption executor treats this idempotently as success rather than an error,
+// allows remaining preemption to finish, and unblocks the preemptor.
+func TestAsyncPreemption_Tolerate404NotFound(t *testing.T) {
+	tests := []struct {
+		name  string
+		steps []asyncframework.Step
+	}{
+		{
+			name: "Victim deleted out-of-band returning 404 Not Found during 2-victim async preemption is tolerated and preemptor binds",
+			steps: []asyncframework.Step{
+				{
+					Name:       "create Node",
+					CreateNode: "node",
+				},
+				{
+					Name: "create victim-0",
+					CreatePod: &asyncframework.CreatePod{
+						Pod: st.MakePod().Name("victim-0").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Node("node").Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+					},
+				},
+				{
+					Name: "create victim-1",
+					CreatePod: &asyncframework.CreatePod{
+						Pod: st.MakePod().Name("victim-1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Node("node").Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+					},
+				},
+				{
+					Name: "create preemptor Pod requiring 4 CPU (must preempt both victims)",
+					CreatePod: &asyncframework.CreatePod{
+						Pod: st.MakePod().Name("preemptor-p").Req(map[v1.ResourceName]string{v1.ResourceCPU: "4"}).Container("image").Priority(500).Obj(),
+					},
+				},
+				{
+					Name: "schedule preemptor Pod (triggers async preemption against victim-0 and victim-1)",
+					SchedulePod: &asyncframework.SchedulePod{
+						PodName:             "preemptor-p",
+						ExpectUnschedulable: true,
+					},
+				},
+				{
+					Name:            "check preemptor is gated in queue",
+					PodGatedInQueue: "preemptor-p",
+				},
+				{
+					Name:                 "check preemptor is running preemption",
+					PodRunningPreemption: new(2),
+				},
+				{
+					Name:      "delete victim-0 out-of-band from API server while preemption is blocked",
+					DeletePod: "victim-0",
+				},
+				{
+					Name:               "complete preemption API calls for preemptor-p",
+					CompletePreemption: "preemptor-p",
+				},
+				{
+					Name: "verify preemptor is no longer running preemption",
+					VerifyPodRunningPreemption: &asyncframework.VerifyPodRunningPreemption{
+						PodIndex: 2,
+						Expected: false,
+					},
+				},
+				{
+					Name: "schedule preemptor Pod (should succeed on freed node)",
+					SchedulePod: &asyncframework.SchedulePod{
+						PodName:       "preemptor-p",
+						ExpectSuccess: true,
+					},
+				},
+			},
+		},
+		{
+			name: "Single victim deleted out-of-band completes preemption and un-gates preemptor",
+			steps: []asyncframework.Step{
+				{
+					Name:       "create Node",
+					CreateNode: "node",
+				},
+				{
+					Name: "create victim-single",
+					CreatePod: &asyncframework.CreatePod{
+						Pod: st.MakePod().Name("victim-single").Req(map[v1.ResourceName]string{v1.ResourceCPU: "4"}).Node("node").Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+					},
+				},
+				{
+					Name: "create preemptor Pod",
+					CreatePod: &asyncframework.CreatePod{
+						Pod: st.MakePod().Name("preemptor-p").Req(map[v1.ResourceName]string{v1.ResourceCPU: "4"}).Container("image").Priority(500).Obj(),
+					},
+				},
+				{
+					Name: "schedule preemptor Pod",
+					SchedulePod: &asyncframework.SchedulePod{
+						PodName:             "preemptor-p",
+						ExpectUnschedulable: true,
+					},
+				},
+				{
+					Name:            "check preemptor is gated in queue",
+					PodGatedInQueue: "preemptor-p",
+				},
+				{
+					Name:                 "check preemptor is running preemption",
+					PodRunningPreemption: new(1),
+				},
+				{
+					Name:      "delete victim-single out-of-band from apiserver",
+					DeletePod: "victim-single",
+				},
+				{
+					Name:               "complete preemption API calls",
+					CompletePreemption: "preemptor-p",
+				},
+				{
+					Name: "verify preemptor is no longer running preemption",
+					VerifyPodRunningPreemption: &asyncframework.VerifyPodRunningPreemption{
+						PodIndex: 1,
+						Expected: false,
+					},
+				},
+				{
+					Name: "schedule preemptor Pod (succeeds on node)",
+					SchedulePod: &asyncframework.SchedulePod{
+						PodName:       "preemptor-p",
+						ExpectSuccess: true,
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			preemptionDoneChannels := &sync.Map{}
+			blockBindingChannel := make(chan struct{})
+			defer close(blockBindingChannel)
+			preemptionConfig := asyncframework.AsyncPreemptionTestConfig{
+				PreemptionDoneChannels: preemptionDoneChannels,
+				BlockBindingChannel:    blockBindingChannel,
+			}
+			testCtx, preemptionPlugin, cs := asyncframework.InitTestForAsyncPreemption(t, preemptionConfig)
+
+			logger, _ := ktesting.NewTestContext(t)
+			if testCtx.Scheduler.APIDispatcher != nil {
+				testCtx.Scheduler.APIDispatcher.Run(logger)
+				defer testCtx.Scheduler.APIDispatcher.Close()
+			}
+			testCtx.Scheduler.SchedulingQueue.Run(logger)
+			defer testCtx.Scheduler.SchedulingQueue.Close()
+
+			createdPods := []*v1.Pod{}
+			defer func() {
+				testutils.CleanupPods(testCtx.Ctx, cs, t, createdPods)
+			}()
+
+			config := asyncframework.AsyncPreemptionStepRunnerConfig{
+				CreatedPods:            createdPods,
+				ClientSet:              cs,
+				PreemptionDoneChannels: preemptionDoneChannels,
+				Logger:                 logger,
+				PreemptionPlugin:       preemptionPlugin,
+				BlockBindingChannel:    blockBindingChannel,
+			}
+
+			asyncframework.RunAsyncPreemptionSteps(testCtx, t, tt.steps, config)
+		})
+	}
+}
+
+// TestAsyncPreemption_InMemoryVictimPreemption tests FM-305: When victims are preempted
+// in memory (such as WaitingPods in permit stage or pods in pre-bind), no API deletion calls
+// are issued, preemptedInMemory is flagged, and the preemptor is immediately activated upon completion.
+func TestAsyncPreemption_InMemoryVictimPreemption(t *testing.T) {
+	tests := []struct {
+		name           string
+		preemptPodHook asyncframework.PreemptPodHookFn
+		steps          []asyncframework.Step
+	}{
+		{
+			name: "In-memory victim preemption skips API deletion and activates preemptor immediately",
+			preemptPodHook: func(ctx context.Context, c fwk.PreemptionCandidate, preemptor preemption.ExecutorPreemptor, victim *v1.Pod, pluginName string) (bool, error, bool) {
+				if victim.Name == "victim-inmem" {
+					// Simulate in-memory preemption (returns preemptedInMemory=true, err=nil, handled=true)
+					return true, nil, true
+				}
+				return false, nil, false
+			},
+			steps: []asyncframework.Step{
+				{
+					Name:       "create Node",
+					CreateNode: "node",
+				},
+				{
+					Name: "create scheduled victim Pod (victim-inmem)",
+					CreatePod: &asyncframework.CreatePod{
+						Pod: st.MakePod().Name("victim-inmem").Req(map[v1.ResourceName]string{v1.ResourceCPU: "4"}).Node("node").Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+					},
+				},
+				{
+					Name: "create preemptor Pod",
+					CreatePod: &asyncframework.CreatePod{
+						Pod: st.MakePod().Name("preemptor-p").Req(map[v1.ResourceName]string{v1.ResourceCPU: "4"}).Container("image").Priority(500).Obj(),
+					},
+				},
+				{
+					Name: "schedule preemptor Pod (starts async preemption and executes in-memory eviction)",
+					SchedulePod: &asyncframework.SchedulePod{
+						PodName:             "preemptor-p",
+						ExpectUnschedulable: true,
+					},
+				},
+				{
+					Name: "verify victim-inmem was NOT deleted via API call (preempted in-memory)",
+					VerifyPodsNotDeleted: []int{0},
+				},
+				{
+					Name: "delete victim-inmem from API server to free node resources",
+					DeletePod: "victim-inmem",
+				},
+				{
+					Name: "schedule preemptor Pod (succeeds on node)",
+					SchedulePod: &asyncframework.SchedulePod{
+						PodName:       "preemptor-p",
+						ExpectSuccess: true,
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			preemptionDoneChannels := &sync.Map{}
+			blockBindingChannel := make(chan struct{})
+			defer close(blockBindingChannel)
+			preemptionConfig := asyncframework.AsyncPreemptionTestConfig{
+				PreemptionDoneChannels: preemptionDoneChannels,
+				BlockBindingChannel:    blockBindingChannel,
+				PreemptPodHook:         tt.preemptPodHook,
+			}
+			testCtx, preemptionPlugin, cs := asyncframework.InitTestForAsyncPreemption(t, preemptionConfig)
+
+			logger, _ := ktesting.NewTestContext(t)
+			if testCtx.Scheduler.APIDispatcher != nil {
+				testCtx.Scheduler.APIDispatcher.Run(logger)
+				defer testCtx.Scheduler.APIDispatcher.Close()
+			}
+			testCtx.Scheduler.SchedulingQueue.Run(logger)
+			defer testCtx.Scheduler.SchedulingQueue.Close()
+
+			createdPods := []*v1.Pod{}
+			defer func() {
+				testutils.CleanupPods(testCtx.Ctx, cs, t, createdPods)
+			}()
+
+			config := asyncframework.AsyncPreemptionStepRunnerConfig{
+				CreatedPods:            createdPods,
+				ClientSet:              cs,
+				PreemptionDoneChannels: preemptionDoneChannels,
+				Logger:                 logger,
+				PreemptionPlugin:       preemptionPlugin,
+				BlockBindingChannel:    blockBindingChannel,
+			}
+
+			asyncframework.RunAsyncPreemptionSteps(testCtx, t, tt.steps, config)
+		})
+	}
+}
+
+// TestAsyncPreemption_MixedPermitAndRunningVictims tests FM-305 / mixed victims scenario:
+// 1 running victim and 2 co-scheduled waiting gang victims. Submit a high-priority preemptor.
+// Verifies that waiting pods receive immediate Reject("Preempted") without API delete traffic,
+// the running pod receives an API delete, and the preemptor schedules successfully.
+func TestAsyncPreemption_MixedPermitAndRunningVictims(t *testing.T) {
+	victim1ToBlock := &asyncframework.BlockedPod{Blocked: make(chan struct{}, 1)}
+	victim2ToBlock := &asyncframework.BlockedPod{Blocked: make(chan struct{}, 1)}
+	podsToBlock := map[string]*asyncframework.BlockedPod{
+		"victim-gang-1": victim1ToBlock,
+		"victim-gang-2": victim2ToBlock,
+	}
+
+	preemptionDoneChannels := &sync.Map{}
+	blockBindingChannel := make(chan struct{})
+	defer close(blockBindingChannel)
+	preemptionConfig := asyncframework.AsyncPreemptionTestConfig{
+		EnableGenericWorkload:  true,
+		PreemptionDoneChannels: preemptionDoneChannels,
+		BlockBindingChannel:    blockBindingChannel,
+		PodsToBlock:            podsToBlock,
+	}
+	testCtx, preemptionPlugin, cs := asyncframework.InitTestForAsyncPreemption(t, preemptionConfig)
+
+	logger, _ := ktesting.NewTestContext(t)
+	if testCtx.Scheduler.APIDispatcher != nil {
+		testCtx.Scheduler.APIDispatcher.Run(logger)
+		defer testCtx.Scheduler.APIDispatcher.Close()
+	}
+	testCtx.Scheduler.SchedulingQueue.Run(logger)
+	defer testCtx.Scheduler.SchedulingQueue.Close()
+
+	createdPods := []*v1.Pod{}
+	defer func() {
+		testutils.CleanupPods(testCtx.Ctx, cs, t, createdPods)
+	}()
+
+	config := asyncframework.AsyncPreemptionStepRunnerConfig{
+		CreatedPods:            createdPods,
+		ClientSet:              cs,
+		PreemptionDoneChannels: preemptionDoneChannels,
+		Logger:                 logger,
+		PreemptionPlugin:       preemptionPlugin,
+		BlockBindingChannel:    blockBindingChannel,
+	}
+
+	steps := []asyncframework.Step{
+		{
+			Name:       "create Node (4 CPU)",
+			CreateNode: "node",
+		},
+		{
+			Name: "create running victim pod (2 CPU)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("victim-running").Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Node("node").Container("image").ZeroTerminationGracePeriod().Priority(10).Obj(),
+			},
+		},
+		{
+			Name: "create gang victims PodGroup (minMember=2)",
+			CreatePodGroup: &asyncframework.CreatePodGroup{
+				PodGroup: st.MakePodGroup().Name("gang-victims").MinCount(2).Priority(10).Obj(),
+			},
+		},
+		{
+			Name: "create gang victim 1 (1 CPU)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("victim-gang-1").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").Priority(10).PodGroupName("gang-victims").Obj(),
+			},
+		},
+		{
+			Name: "create gang victim 2 (1 CPU)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("victim-gang-2").Req(map[v1.ResourceName]string{v1.ResourceCPU: "1"}).Container("image").Priority(10).PodGroupName("gang-victims").Obj(),
+			},
+		},
+		{
+			Name: "schedule gang victims (both enter permit phase and wait)",
+			SchedulePodGroup: &asyncframework.SchedulePodGroup{
+				PodGroupName: "gang-victims",
+			},
+		},
+		{
+			Name: "verify gang victims reached permit wait",
+			CustomStep: func(testCtx *testutils.TestContext, t *testing.T, config *asyncframework.AsyncPreemptionStepRunnerConfig) {
+				select {
+				case <-victim1ToBlock.Blocked:
+					t.Log("victim-gang-1 reached permit wait")
+				case <-time.After(wait.ForeverTestTimeout):
+					t.Fatal("Timed out waiting for victim-gang-1 to reach permit wait")
+				}
+				select {
+				case <-victim2ToBlock.Blocked:
+					t.Log("victim-gang-2 reached permit wait")
+				case <-time.After(wait.ForeverTestTimeout):
+					t.Fatal("Timed out waiting for victim-gang-2 to reach permit wait")
+				}
+				if err := wait.PollUntilContextTimeout(testCtx.Ctx, 50*time.Millisecond, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+					return testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(config.CreatedPods[1].UID) != nil &&
+						testCtx.Scheduler.Profiles[v1.DefaultSchedulerName].GetWaitingPod(config.CreatedPods[2].UID) != nil, nil
+				}); err != nil {
+					t.Fatalf("Timed out waiting for gang victims in WaitingPods: %v", err)
+				}
+			},
+		},
+		{
+			Name: "create high-priority preemptor Pod (4 CPU, priority 500)",
+			CreatePod: &asyncframework.CreatePod{
+				Pod: st.MakePod().Name("preemptor-p").Req(map[v1.ResourceName]string{v1.ResourceCPU: "4"}).Container("image").Priority(500).Obj(),
+			},
+		},
+		{
+			Name: "schedule preemptor Pod (initiates async preemption against running and waiting gang victims)",
+			SchedulePod: &asyncframework.SchedulePod{
+				PodName:             "preemptor-p",
+				ExpectUnschedulable: true,
+			},
+		},
+		{
+			Name:               "complete preemption for preemptor",
+			CompletePreemption: "preemptor-p",
+		},
+		{
+			Name: "verify waiting gang victims were NOT deleted via API (preempted in-memory)",
+			VerifyPodsNotDeleted: []int{1, 2},
+		},
+		{
+			Name: "wait for running victim to be deleted via API",
+			WaitForPodsDeleted: []int{0},
+		},
+		{
+			Name:               "flush scheduling queue",
+			FlushUnschedulable: true,
+		},
+		{
+			Name: "schedule preemptor Pod (succeeds on node)",
+			SchedulePod: &asyncframework.SchedulePod{
+				PodName:       "preemptor-p",
+				ExpectSuccess: true,
+			},
+		},
+	}
+
+	asyncframework.RunAsyncPreemptionSteps(testCtx, t, steps, config)
 }

@@ -386,7 +386,9 @@ func (pl *DefaultPreemption) SelectVictimsOnNode(
 	// from the highest importance victims.
 	violatingVictims, nonViolatingVictims := preemption.FilterVictimsWithPDBViolation(potentialVictims, pdbs)
 	var victims []*preemption.DomainVictim
-	reprieveVictim := func(v *preemption.DomainVictim) (bool, error) {
+
+	// reprieveVictimLinear reprieves a single victim linearly.
+	reprieveVictimLinear := func(v *preemption.DomainVictim) (bool, error) {
 		if err := addVictim(v); err != nil {
 			return false, err
 		}
@@ -410,18 +412,143 @@ func (pl *DefaultPreemption) SelectVictimsOnNode(
 		return fits, nil
 	}
 
+	// reprieveVictimsLogarithmic reprieves candidate victims using exponential doubling
+	// and binary search over the sorted slice of candidates.
+	// For high-density nodes (dozens or hundreds of pods), this reduces Filter evaluations
+	// from O(K) linear evaluations to O(log K) without changing victim selection fidelity.
+	reprieveVictimsLogarithmic := func(candidates []*preemption.DomainVictim, onReject func(v *preemption.DomainVictim, index int)) error {
+		n := len(candidates)
+		if n < 4 {
+			for i, v := range candidates {
+				fits, err := reprieveVictimLinear(v)
+				if err != nil {
+					return err
+				}
+				if !fits {
+					onReject(v, i)
+				}
+			}
+			return nil
+		}
+
+		i := 0
+		step := 1
+
+		for i < n {
+			batchSize := step
+			if i+batchSize > n {
+				batchSize = n - i
+			}
+
+			if batchSize == 1 {
+				v := candidates[i]
+				fits, err := reprieveVictimLinear(v)
+				if err != nil {
+					return err
+				}
+				if !fits {
+					onReject(v, i)
+					step = 1
+				} else {
+					step = 2
+				}
+				i++
+				continue
+			}
+
+			// Try adding the entire batch [i .. i+batchSize-1]
+			chunk := candidates[i : i+batchSize]
+			for j, v := range chunk {
+				if err := addVictim(v); err != nil {
+					for k := j - 1; k >= 0; k-- {
+						_ = removeVictim(chunk[k])
+					}
+					return err
+				}
+			}
+
+			status := pl.fh.RunFilterPluginsWithNominatedPods(ctx, cycleState, preemptor, nodeInfo)
+			if status.IsSuccess() {
+				// The entire batch fits! Keep all of them and double step size.
+				i += batchSize
+				step *= 2
+				continue
+			}
+
+			// The batch does not fit: remove the batch and binary search for the maximal fitting prefix within [i .. i+batchSize-1].
+			for j := len(chunk) - 1; j >= 0; j-- {
+				if err := removeVictim(chunk[j]); err != nil {
+					return err
+				}
+			}
+
+			low := i
+			high := i + batchSize - 1
+			bestFitIndex := i - 1
+			currAdded := i - 1
+
+			for low <= high {
+				mid := low + (high-low)/2
+				for j := currAdded + 1; j <= mid; j++ {
+					if err := addVictim(candidates[j]); err != nil {
+						return err
+					}
+				}
+				currAdded = mid
+
+				status := pl.fh.RunFilterPluginsWithNominatedPods(ctx, cycleState, preemptor, nodeInfo)
+				if status.IsSuccess() {
+					bestFitIndex = mid
+					low = mid + 1
+				} else {
+					for j := currAdded; j > bestFitIndex; j-- {
+						if err := removeVictim(candidates[j]); err != nil {
+							return err
+						}
+					}
+					currAdded = bestFitIndex
+					high = mid - 1
+				}
+			}
+
+			// All pods up to bestFitIndex are reprieved.
+			// The pod at bestFitIndex+1 could not fit in the prefix, so evaluate it or mark it evicted.
+			i = bestFitIndex + 1
+			if i < n {
+				v := candidates[i]
+				victims = append(victims, v)
+				onReject(v, i)
+				if loggerV := logger.V(5); loggerV.Enabled() {
+					var pods []klog.ObjectRef
+					for _, p := range v.Pods() {
+						pods = append(pods, klog.KObj(p.GetPod()))
+					}
+					loggerV.Info("Pods are potential preemption victims on node", "pods", pods, "node", mainNodeName)
+				}
+				i++
+			}
+			step = 1
+		}
+
+		return nil
+	}
+
 	numViolatingVictim := 0
-	for _, violatingVictim := range violatingVictims {
-		if fits, err := reprieveVictim(violatingVictim.Victim); err != nil {
+	if len(violatingVictims) > 0 {
+		violatingDomainVictims := make([]*preemption.DomainVictim, len(violatingVictims))
+		for i, vv := range violatingVictims {
+			violatingDomainVictims[i] = vv.Victim
+		}
+		if err := reprieveVictimsLogarithmic(violatingDomainVictims, func(v *preemption.DomainVictim, index int) {
+			numViolatingVictim += violatingVictims[index].ViolateCount
+		}); err != nil {
 			return nil, 0, fwk.AsStatus(err)
-		} else if !fits {
-			numViolatingVictim += violatingVictim.ViolateCount
 		}
 	}
 
 	// Now we try to reprieve non-violating victims.
-	for _, v := range nonViolatingVictims {
-		if _, err := reprieveVictim(v); err != nil {
+	if len(nonViolatingVictims) > 0 {
+		if err := reprieveVictimsLogarithmic(nonViolatingVictims, func(v *preemption.DomainVictim, index int) {}); err != nil {
 			return nil, 0, fwk.AsStatus(err)
 		}
 	}
