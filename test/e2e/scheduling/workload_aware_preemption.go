@@ -1788,6 +1788,120 @@ var _ = SIGDescribe("WorkloadAwarePreemption", framework.WithFeatureGate(feature
 			framework.ExpectNoError(err)
 			gomega.Expect(pod.Status.Phase).To(gomega.Equal(v1.PodPending))
 		})
+
+		ginkgo.It("validates DisruptionTarget condition on all evicted victims across multiple nodes during gang preemption with DisruptionMode: All", func(ctx context.Context) {
+			cs := f.ClientSet
+			ns := f.Namespace.Name
+			extendedResourceName := v1.ResourceName(extendedResourceDomain + ns)
+
+			lowPriorityName := "low-priority-dt-all-" + ns
+			highPriorityName := "high-priority-dt-all-" + ns
+
+			createPriorityClass(ctx, &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{Name: lowPriorityName},
+				Value:      100,
+			})
+			defer deletePriorityClass(ctx, lowPriorityName)
+
+			createPriorityClass(ctx, &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{Name: highPriorityName},
+				Value:      1000,
+			})
+			defer deletePriorityClass(ctx, highPriorityName)
+
+			node1, node2 := getTwoNodeNames(ctx)
+			addExtendedResource(ctx, node1, extendedResourceName)
+			defer removeExtendedResource(ctx, node1, extendedResourceName)
+			addExtendedResource(ctx, node2, extendedResourceName)
+			defer removeExtendedResource(ctx, node2, extendedResourceName)
+
+			ginkgo.By("Creating low-priority victim PodGroup with DisruptionMode: All across node1 and node2")
+			victimPGName := "victim-all-dt-" + ns
+			victimPG := makePodGroup(victimPGName, lowPriorityName, schedulingv1beta1.PodGroupSchedulingPolicy{
+				Gang: &schedulingv1beta1.GangSchedulingPolicy{MinCount: 4},
+			}, allDisruption)
+			createPodGroup(ctx, victimPG)
+			defer deletePodGroup(ctx, victimPGName)
+
+			const victimFinalizer = "example.com/victim-dt-finalizer"
+			var victimPods []*v1.Pod
+			for i := 1; i <= 2; i++ {
+				p1 := makePod(node1, fmt.Sprintf("v-dt-n1-%d", i), victimPGName, lowPriorityName, extendedResourceName)
+				p1.Finalizers = []string{victimFinalizer}
+				createdP1, err := cs.CoreV1().Pods(ns).Create(ctx, p1, metav1.CreateOptions{})
+				framework.ExpectNoError(err)
+				victimPods = append(victimPods, createdP1)
+
+				p2 := makePod(node2, fmt.Sprintf("v-dt-n2-%d", i), victimPGName, lowPriorityName, extendedResourceName)
+				p2.Finalizers = []string{victimFinalizer}
+				createdP2, err := cs.CoreV1().Pods(ns).Create(ctx, p2, metav1.CreateOptions{})
+				framework.ExpectNoError(err)
+				victimPods = append(victimPods, createdP2)
+			}
+
+			defer func() {
+				// Remove finalizers from all victim pods to ensure clean teardown
+				patch := []byte(`{"metadata":{"finalizers":null}}`)
+				for _, p := range victimPods {
+					_, _ = cs.CoreV1().Pods(ns).Patch(ctx, p.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+				}
+			}()
+
+			ginkgo.By("Verifying all victim pods across node1 and node2 are running and scheduled")
+			for _, p := range victimPods {
+				framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, p.Name, ns))
+				verifyEventRecorded(ctx, p.Name, "Scheduled")
+			}
+			verifyPodGroupCondition(ctx, victimPGName, schedulingv1beta1.PodGroupInitiallyScheduled, string(metav1.ConditionTrue), schedulingv1beta1.PodGroupReasonScheduled)
+
+			ginkgo.By("Creating high-priority preemptor PodGroup triggering preemption on node1")
+			preemptorPGName := "preemptor-dt-pg-" + ns
+			preemptorPG := makePodGroup(preemptorPGName, highPriorityName, schedulingv1beta1.PodGroupSchedulingPolicy{
+				Gang: &schedulingv1beta1.GangSchedulingPolicy{MinCount: 1},
+			}, singleDisruption)
+			createPodGroup(ctx, preemptorPG)
+			defer deletePodGroup(ctx, preemptorPGName)
+
+			hpPod := makePod(node1, "hp-dt-pod", preemptorPGName, highPriorityName, extendedResourceName)
+			createdHP, err := cs.CoreV1().Pods(ns).Create(ctx, hpPod, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+
+			ginkgo.By("Verifying all victim pods across multiple nodes receive DisruptionTarget condition and Preempted event")
+			verifyAllPreempted(ctx, victimPods)
+
+			for _, p := range victimPods {
+				verifyPodCondition(ctx, p.Name, v1.DisruptionTarget, v1.ConditionTrue, v1.PodReasonPreemptionByScheduler)
+				verifyEventRecorded(ctx, p.Name, "Preempted")
+
+				// Verify condition message contains preemption info
+				gomega.Eventually(ctx, func(ctx context.Context) error {
+					pod, err := cs.CoreV1().Pods(ns).Get(ctx, p.Name, metav1.GetOptions{})
+					if err != nil {
+						return err
+					}
+					cond := e2epod.FindPodConditionByType(&pod.Status, v1.DisruptionTarget)
+					if cond == nil {
+						return fmt.Errorf("condition %s not found on pod %s", v1.DisruptionTarget, p.Name)
+					}
+					if !strings.Contains(cond.Message, "preempting to accommodate a higher priority") {
+						return fmt.Errorf("expected message to contain preemption reason, got %q on pod %s", cond.Message, p.Name)
+					}
+					return nil
+				}).WithTimeout(30 * time.Second).WithPolling(1 * time.Second).Should(gomega.Succeed())
+			}
+
+			ginkgo.By("Removing finalizers from all victim pods to complete their termination")
+			patch := []byte(`{"metadata":{"finalizers":null}}`)
+			for _, p := range victimPods {
+				_, err := cs.CoreV1().Pods(ns).Patch(ctx, p.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+				framework.ExpectNoError(err)
+			}
+
+			ginkgo.By("Verifying high-priority preemptor pod becomes Running and emits Scheduled event")
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdHP.Name, ns))
+			verifyEventRecorded(ctx, createdHP.Name, "Scheduled")
+			verifyPodGroupCondition(ctx, preemptorPGName, schedulingv1beta1.PodGroupInitiallyScheduled, string(metav1.ConditionTrue), schedulingv1beta1.PodGroupReasonScheduled)
+		})
 	})
 
 	ginkgo.Describe("Gang Preemption Permit Timeout and Atomic Rollback", func() {
