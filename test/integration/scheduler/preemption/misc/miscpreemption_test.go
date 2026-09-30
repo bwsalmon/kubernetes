@@ -32,6 +32,7 @@ import (
 	nodev1 "k8s.io/api/node/v1"
 	policy "k8s.io/api/policy/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -4647,6 +4648,809 @@ func TestReadWriteOncePodMultiNodePreemptionInterlocks(t *testing.T) {
 		// Medium priority contender must be unschedulable (cannot steal or collide with volume)
 		if err := waitForPodUnschedulable(testCtx.Ctx, cs, contender); err != nil {
 			t.Fatalf("Contender pod should be unschedulable while preemptor occupies volume: %v", err)
+		}
+	})
+}
+
+// createTestCSIDriver creates a CSIDriver object in the API server.
+func createTestCSIDriver(ctx context.Context, cs clientset.Interface, name string) (*storagev1.CSIDriver, error) {
+	driver := st.MakeCSIDriver().Name(name).StorageCapacity(ptr.To(true)).Obj()
+	return cs.StorageV1().CSIDrivers().Create(ctx, driver, metav1.CreateOptions{})
+}
+
+// createTestCSINode creates a CSINode object with volume limits for the specified driver.
+func createTestCSINode(ctx context.Context, cs clientset.Interface, nodeName, driverName string, limit int32) (*storagev1.CSINode, error) {
+	csiNode := &storagev1.CSINode{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+		Spec: storagev1.CSINodeSpec{
+			Drivers: []storagev1.CSINodeDriver{
+				{
+					Name:   driverName,
+					NodeID: nodeName,
+					Allocatable: &storagev1.VolumeNodeResources{
+						Count: ptr.To(limit),
+					},
+				},
+			},
+		},
+	}
+	return cs.StorageV1().CSINodes().Create(ctx, csiNode, metav1.CreateOptions{})
+}
+
+// createTestCSIPVAndPVC creates a bound CSI PV and PVC pair.
+func createTestCSIPVAndPVC(ctx context.Context, cs clientset.Interface, ns, name, driverName, volumeHandle string) (*v1.PersistentVolume, *v1.PersistentVolumeClaim, error) {
+	storage := v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceStorage: resource.MustParse("1Mi")}}
+	pv := st.MakePersistentVolume().
+		Name(name).
+		AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}).
+		Capacity(storage.Requests).
+		PersistentVolumeSource(v1.PersistentVolumeSource{
+			CSI: &v1.CSIPersistentVolumeSource{
+				Driver:       driverName,
+				VolumeHandle: volumeHandle,
+			},
+		}).
+		Obj()
+	createdPV, err := testutils.CreatePV(cs, pv)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create PV %s: %w", name, err)
+	}
+
+	pvc := st.MakePersistentVolumeClaim().
+		Name(name).
+		Namespace(ns).
+		Annotation(volume.AnnBindCompleted, "true").
+		VolumeName(createdPV.Name).
+		AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOnce}).
+		Resources(storage).
+		Obj()
+	createdPVC, err := testutils.CreatePVC(cs, pvc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create PVC %s: %w", name, err)
+	}
+	return createdPV, createdPVC, nil
+}
+
+// TestCSINodeVolumeLimitsPreemption tests storage preemption driven by CSI Node Volume limits.
+func TestCSINodeVolumeLimitsPreemption(t *testing.T) {
+	driverName := "csi.example.com"
+
+	t.Run("node at maximum CSI volume attach limit with free CPU/memory triggers preemption of lower-priority CSI pod", func(t *testing.T) {
+		testCtx := initTest(t, "csi-vol-limit-preemption")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeRes := map[v1.ResourceName]string{
+			v1.ResourcePods:   "32",
+			v1.ResourceCPU:    "1000m",
+			v1.ResourceMemory: "1000Mi",
+		}
+		node, err := createNode(cs, st.MakeNode().Name("node-1").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		if _, err := createTestCSIDriver(testCtx.Ctx, cs, driverName); err != nil {
+			t.Fatalf("Failed to create CSIDriver: %v", err)
+		}
+		if _, err := createTestCSINode(testCtx.Ctx, cs, node.Name, driverName, 1); err != nil {
+			t.Fatalf("Failed to create CSINode: %v", err)
+		}
+
+		_, pvc1, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-1", driverName, "vol-handle-1")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 1: %v", err)
+		}
+		_, pvc2, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-2", driverName, "vol-handle-2")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 2: %v", err)
+		}
+
+		podRes := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
+			},
+		}
+
+		// Low priority victim pod with CSI volume attached
+		victimPodConfig := &testutils.PausePodConfig{
+			Name:      "victim-csi-pod",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		}
+		victimPod, err := runPausePod(cs, initPausePod(victimPodConfig))
+		if err != nil {
+			t.Fatalf("Failed to run victim pod: %v", err)
+		}
+
+		if err := waitCachedPodsStable(testCtx, []*v1.Pod{victimPod}); err != nil {
+			t.Fatalf("Failed to wait for cached pods: %v", err)
+		}
+
+		// High priority preemptor pod requesting a new CSI volume
+		preemptorPodConfig := &testutils.PausePodConfig{
+			Name:      "preemptor-csi-pod",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-2",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc2.Name,
+					},
+				},
+			}},
+		}
+		preemptorPod, err := createPausePod(cs, initPausePod(preemptorPodConfig))
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{victimPod, preemptorPod})
+
+		// Wait for victim pod to be marked for eviction (receiving deletion timestamp)
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			podIsGettingEvicted(cs, victimPod.Namespace, victimPod.Name)); err != nil {
+			t.Fatalf("Expected victim pod to be evicted: %v", err)
+		}
+
+		// Preemptor should have nominated node-1
+		if err := testutils.WaitForNominatedNodeName(testCtx.Ctx, cs, preemptorPod); err != nil {
+			t.Fatalf("Expected nominatedNodeName to be set: %v", err)
+		}
+
+		// Complete deletion of victim pod
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, victimPod.Namespace, victimPod.Name); err != nil {
+			t.Fatalf("Failed to simulate victim deletion: %v", err)
+		}
+
+		// Preemptor should now be scheduled on node-1
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptorPod, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor pod failed to schedule: %v", err)
+		}
+	})
+
+	t.Run("storage preemption selectively evicts CSI pod and preserves non-CSI pod when only volume limit is exceeded", func(t *testing.T) {
+		testCtx := initTest(t, "csi-selective-preemption")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeRes := map[v1.ResourceName]string{
+			v1.ResourcePods:   "32",
+			v1.ResourceCPU:    "1000m",
+			v1.ResourceMemory: "1000Mi",
+		}
+		node, err := createNode(cs, st.MakeNode().Name("node-1").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		if _, err := createTestCSIDriver(testCtx.Ctx, cs, driverName); err != nil {
+			t.Fatalf("Failed to create CSIDriver: %v", err)
+		}
+		if _, err := createTestCSINode(testCtx.Ctx, cs, node.Name, driverName, 1); err != nil {
+			t.Fatalf("Failed to create CSINode: %v", err)
+		}
+
+		_, pvc1, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-1", driverName, "vol-handle-1")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 1: %v", err)
+		}
+		_, pvc2, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-2", driverName, "vol-handle-2")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 2: %v", err)
+		}
+
+		podRes := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
+			},
+		}
+
+		// Low priority victim with CSI volume
+		victimCSIPod, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-csi-pod",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run victim CSI pod: %v", err)
+		}
+
+		// Low priority innocent pod without CSI volume (only compute)
+		innocentPod, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "innocent-compute-pod",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: podRes,
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run innocent compute pod: %v", err)
+		}
+
+		if err := waitCachedPodsStable(testCtx, []*v1.Pod{victimCSIPod, innocentPod}); err != nil {
+			t.Fatalf("Failed to wait for cached pods: %v", err)
+		}
+
+		// High priority preemptor requesting CSI volume slot
+		preemptorPod, err := createPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "preemptor-csi-pod",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-2",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc2.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{victimCSIPod, innocentPod, preemptorPod})
+
+		// Verify victim CSI pod gets evicted
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			podIsGettingEvicted(cs, victimCSIPod.Namespace, victimCSIPod.Name)); err != nil {
+			t.Fatalf("Expected victim CSI pod to be evicted: %v", err)
+		}
+
+		// Verify innocent non-CSI pod is NOT evicted
+		innocentLive, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, innocentPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get innocent pod: %v", err)
+		}
+		if innocentLive.DeletionTimestamp != nil {
+			t.Fatalf("Innocent compute-only pod should not be evicted")
+		}
+
+		// Simulate deletion of victim CSI pod
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, victimCSIPod.Namespace, victimCSIPod.Name); err != nil {
+			t.Fatalf("Failed to simulate victim deletion: %v", err)
+		}
+
+		// Preemptor should now be scheduled on node-1
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptorPod, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor pod failed to schedule: %v", err)
+		}
+	})
+
+	t.Run("multi-node volume limit preemption prefers node with lower-priority CSI pod", func(t *testing.T) {
+		testCtx := initTest(t, "csi-multinode-preemption")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeRes := map[v1.ResourceName]string{
+			v1.ResourcePods:   "32",
+			v1.ResourceCPU:    "1000m",
+			v1.ResourceMemory: "1000Mi",
+		}
+		node1, err := createNode(cs, st.MakeNode().Name("node-1").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create node-1: %v", err)
+		}
+		node2, err := createNode(cs, st.MakeNode().Name("node-2").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create node-2: %v", err)
+		}
+
+		if _, err := createTestCSIDriver(testCtx.Ctx, cs, driverName); err != nil {
+			t.Fatalf("Failed to create CSIDriver: %v", err)
+		}
+		if _, err := createTestCSINode(testCtx.Ctx, cs, node1.Name, driverName, 1); err != nil {
+			t.Fatalf("Failed to create CSINode 1: %v", err)
+		}
+		if _, err := createTestCSINode(testCtx.Ctx, cs, node2.Name, driverName, 1); err != nil {
+			t.Fatalf("Failed to create CSINode 2: %v", err)
+		}
+
+		_, pvc1, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-1", driverName, "vol-handle-1")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 1: %v", err)
+		}
+		_, pvc2, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-2", driverName, "vol-handle-2")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 2: %v", err)
+		}
+		_, pvc3, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-3", driverName, "vol-handle-3")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 3: %v", err)
+		}
+
+		podRes := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
+			},
+		}
+
+		// Node 1 has a low priority pod with CSI volume
+		lowPod, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "low-pri-csi-pod",
+			Namespace: ns,
+			NodeName:  node1.Name,
+			Priority:  &lowPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run low-pri pod: %v", err)
+		}
+
+		// Node 2 has a medium priority pod with CSI volume
+		midPod, err := runPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "mid-pri-csi-pod",
+			Namespace: ns,
+			NodeName:  node2.Name,
+			Priority:  &mediumPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-2",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc2.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to run mid-pri pod: %v", err)
+		}
+
+		if err := waitCachedPodsStable(testCtx, []*v1.Pod{lowPod, midPod}); err != nil {
+			t.Fatalf("Failed to wait for cached pods: %v", err)
+		}
+
+		// High priority preemptor requesting CSI volume slot
+		preemptorPod, err := createPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "preemptor-csi-pod",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-3",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc3.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{lowPod, midPod, preemptorPod})
+
+		// Scheduler should choose node-1 with lower priority victim
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			podIsGettingEvicted(cs, lowPod.Namespace, lowPod.Name)); err != nil {
+			t.Fatalf("Expected low priority pod on node-1 to be evicted: %v", err)
+		}
+
+		// Medium priority pod on node-2 should remain untouched
+		midLive, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, midPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get mid-pri pod: %v", err)
+		}
+		if midLive.DeletionTimestamp != nil {
+			t.Fatalf("Mid priority pod on node-2 should not be evicted")
+		}
+
+		// Preemptor should nominate node-1
+		if err := testutils.WaitForNominatedNodeName(testCtx.Ctx, cs, preemptorPod); err != nil {
+			t.Fatalf("Expected nominatedNodeName to be set: %v", err)
+		}
+
+		// Simulate deletion of low-pri pod on node-1
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, lowPod.Namespace, lowPod.Name); err != nil {
+			t.Fatalf("Failed to simulate low-pri pod deletion: %v", err)
+		}
+
+		// Preemptor should bind to node-1
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptorPod, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule on node-1: %v", err)
+		}
+		scheduledPreemptor, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptorPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor: %v", err)
+		}
+		if scheduledPreemptor.Spec.NodeName != node1.Name {
+			t.Fatalf("Preemptor scheduled on %s, want %s", scheduledPreemptor.Spec.NodeName, node1.Name)
+		}
+	})
+}
+
+// TestCombinedResourceAndStoragePreemption evaluates preemption when nodes are saturated
+// simultaneously on compute resources (CPU/memory) and CSI volume attach limits, verifying
+// that DefaultPreemption selects victims that resolve both constraints with minimal PDB disruptions.
+func TestCombinedResourceAndStoragePreemption(t *testing.T) {
+	driverName := "csi.combined.example.com"
+
+	t.Run("simultaneous compute and CSI volume saturation selects victim with minimal PDB disruption", func(t *testing.T) {
+		testCtx := initTest(t, "csi-pdb-combined")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		initDisruptionController(t, testCtx)
+
+		nodeRes := map[v1.ResourceName]string{
+			v1.ResourcePods:   "32",
+			v1.ResourceCPU:    "1200m",
+			v1.ResourceMemory: "1000Mi",
+		}
+		node, err := createNode(cs, st.MakeNode().Name("node-1").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		if _, err := createTestCSIDriver(testCtx.Ctx, cs, driverName); err != nil {
+			t.Fatalf("Failed to create CSIDriver: %v", err)
+		}
+		// Limit of 2 CSI volumes on the node
+		if _, err := createTestCSINode(testCtx.Ctx, cs, node.Name, driverName, 2); err != nil {
+			t.Fatalf("Failed to create CSINode: %v", err)
+		}
+
+		_, pvc1, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-1", driverName, "vol-handle-1")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 1: %v", err)
+		}
+		_, pvc2, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-2", driverName, "vol-handle-2")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 2: %v", err)
+		}
+		_, pvc3, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-3", driverName, "vol-handle-3")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 3: %v", err)
+		}
+
+		podRes := &v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("400m"),
+				v1.ResourceMemory: resource.MustParse("100Mi"),
+			},
+		}
+
+		// Pod 1: 400m CPU, mounts PVC1, protected by PDB
+		podProtectedCSI := initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-protected-csi",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: podRes,
+			Labels:    map[string]string{"app": "protected-storage"},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		})
+
+		// Pod 2: 400m CPU, no volume, no PDB (compute-only)
+		podComputeOnly := initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-compute-only",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: podRes,
+		})
+
+		// Pod 3: 400m CPU, mounts PVC2, no PDB (unprotected CSI)
+		podUnprotectedCSI := initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-unprotected-csi",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-2",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc2.Name,
+					},
+				},
+			}},
+		})
+
+		existingPods := []*v1.Pod{podProtectedCSI, podComputeOnly, podUnprotectedCSI}
+		createdExistingPods := make([]*v1.Pod, len(existingPods))
+		for i, p := range existingPods {
+			created, err := runPausePod(cs, p)
+			if err != nil {
+				t.Fatalf("Failed to run pod %s: %v", p.Name, err)
+			}
+			addPodConditionReady(created)
+			if _, err := cs.CoreV1().Pods(ns).UpdateStatus(testCtx.Ctx, created, metav1.UpdateOptions{}); err != nil {
+				t.Fatalf("Failed to update status for pod %s: %v", p.Name, err)
+			}
+			createdExistingPods[i] = created
+		}
+
+		if err := waitCachedPodsStable(testCtx, createdExistingPods); err != nil {
+			t.Fatalf("Failed to wait for cached pods: %v", err)
+		}
+
+		// Create PDB protecting podProtectedCSI (minAvailable: 1 -> 0 disruptions allowed)
+		pdb := mkMinAvailablePDB("storage-pdb", ns, types.UID("storage-pdb-uid"), 1, map[string]string{"app": "protected-storage"})
+		if _, err := cs.PolicyV1().PodDisruptionBudgets(ns).Create(testCtx.Ctx, pdb, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create PDB: %v", err)
+		}
+		if err := waitForPDBsStable(testCtx, []*policy.PodDisruptionBudget{pdb}, []int32{1}); err != nil {
+			t.Fatalf("Failed to wait for PDB stability: %v", err)
+		}
+
+		// Preemptor requires 400m CPU AND a new CSI volume slot (PVC3)
+		preemptorPod, err := createPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "preemptor-pod",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: podRes,
+			Volumes: []v1.Volume{{
+				Name: "vol-3",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc3.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to create preemptor: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, append(createdExistingPods, preemptorPod))
+
+		// DefaultPreemption must select victim-unprotected-csi because:
+		// - victim-compute-only frees 400m CPU but 0 CSI slots (still at 2/2 limit -> unschedulable)
+		// - victim-protected-csi frees 400m CPU + 1 CSI slot, but violates PDB (1 violation)
+		// - victim-unprotected-csi frees 400m CPU + 1 CSI slot, with 0 PDB violations
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			podIsGettingEvicted(cs, ns, podUnprotectedCSI.Name)); err != nil {
+			t.Fatalf("Expected victim-unprotected-csi to be evicted: %v", err)
+		}
+
+		// Check that protected CSI pod and compute-only pod are NOT evicted
+		protLive, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, podProtectedCSI.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get protected CSI pod: %v", err)
+		}
+		if protLive.DeletionTimestamp != nil {
+			t.Fatalf("PDB-protected CSI pod should not be evicted")
+		}
+
+		compLive, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, podComputeOnly.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get compute-only pod: %v", err)
+		}
+		if compLive.DeletionTimestamp != nil {
+			t.Fatalf("Compute-only pod should not be evicted when it cannot resolve storage limit")
+		}
+
+		// Simulate deletion of chosen victim
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, podUnprotectedCSI.Name); err != nil {
+			t.Fatalf("Failed to simulate victim deletion: %v", err)
+		}
+
+		// Preemptor successfully schedules on node-1
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptorPod, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule: %v", err)
+		}
+	})
+
+	t.Run("multi-victim preemption resolving compute and storage deficit prefers multiple non-violating pods over single PDB-violating pod", func(t *testing.T) {
+		testCtx := initTest(t, "csi-pdb-multivictim")
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		initDisruptionController(t, testCtx)
+
+		nodeRes := map[v1.ResourceName]string{
+			v1.ResourcePods:   "32",
+			v1.ResourceCPU:    "1200m",
+			v1.ResourceMemory: "1000Mi",
+		}
+		node, err := createNode(cs, st.MakeNode().Name("node-1").Capacity(nodeRes).Obj())
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		if _, err := createTestCSIDriver(testCtx.Ctx, cs, driverName); err != nil {
+			t.Fatalf("Failed to create CSIDriver: %v", err)
+		}
+		if _, err := createTestCSINode(testCtx.Ctx, cs, node.Name, driverName, 2); err != nil {
+			t.Fatalf("Failed to create CSINode: %v", err)
+		}
+
+		_, pvc1, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-1", driverName, "vol-handle-1")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 1: %v", err)
+		}
+		_, pvc2, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-2", driverName, "vol-handle-2")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 2: %v", err)
+		}
+		_, pvc3, err := createTestCSIPVAndPVC(testCtx.Ctx, cs, ns, "pv-pvc-3", driverName, "vol-handle-3")
+		if err != nil {
+			t.Fatalf("Failed to create PV/PVC 3: %v", err)
+		}
+
+		// Pod 1: 300m CPU, mounts PVC1, no PDB
+		podCSISmall := initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-csi-small",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("300m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			},
+			Volumes: []v1.Volume{{
+				Name: "vol-1",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc1.Name,
+					},
+				},
+			}},
+		})
+
+		// Pod 2: 300m CPU, no volume, no PDB
+		podCPUSmall := initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-cpu-small",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("300m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			},
+		})
+
+		// Pod 3: 600m CPU, mounts PVC2, protected by PDB
+		podHeavyPDB := initPausePod(&testutils.PausePodConfig{
+			Name:      "victim-heavy-pdb",
+			Namespace: ns,
+			NodeName:  node.Name,
+			Priority:  &lowPriority,
+			Resources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("600m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			},
+			Labels: map[string]string{"app": "heavy-pdb"},
+			Volumes: []v1.Volume{{
+				Name: "vol-2",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc2.Name,
+					},
+				},
+			}},
+		})
+
+		existingPods := []*v1.Pod{podCSISmall, podCPUSmall, podHeavyPDB}
+		createdExistingPods := make([]*v1.Pod, len(existingPods))
+		for i, p := range existingPods {
+			created, err := runPausePod(cs, p)
+			if err != nil {
+				t.Fatalf("Failed to run pod %s: %v", p.Name, err)
+			}
+			addPodConditionReady(created)
+			if _, err := cs.CoreV1().Pods(ns).UpdateStatus(testCtx.Ctx, created, metav1.UpdateOptions{}); err != nil {
+				t.Fatalf("Failed to update status for pod %s: %v", p.Name, err)
+			}
+			createdExistingPods[i] = created
+		}
+
+		if err := waitCachedPodsStable(testCtx, createdExistingPods); err != nil {
+			t.Fatalf("Failed to wait for cached pods: %v", err)
+		}
+
+		// Create PDB protecting podHeavyPDB
+		pdb := mkMinAvailablePDB("heavy-pdb", ns, types.UID("heavy-pdb-uid"), 1, map[string]string{"app": "heavy-pdb"})
+		if _, err := cs.PolicyV1().PodDisruptionBudgets(ns).Create(testCtx.Ctx, pdb, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create PDB: %v", err)
+		}
+		if err := waitForPDBsStable(testCtx, []*policy.PodDisruptionBudget{pdb}, []int32{1}); err != nil {
+			t.Fatalf("Failed to wait for PDB stability: %v", err)
+		}
+
+		// Preemptor requires 600m CPU AND a new CSI volume slot (PVC3)
+		preemptorPod, err := createPausePod(cs, initPausePod(&testutils.PausePodConfig{
+			Name:      "preemptor-heavy",
+			Namespace: ns,
+			Priority:  &highPriority,
+			Resources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("600m"),
+					v1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			},
+			Volumes: []v1.Volume{{
+				Name: "vol-3",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvc3.Name,
+					},
+				},
+			}},
+		}))
+		if err != nil {
+			t.Fatalf("Failed to create preemptor: %v", err)
+		}
+		defer testutils.CleanupPods(testCtx.Ctx, cs, t, append(createdExistingPods, preemptorPod))
+
+		// DefaultPreemption prefers 0 PDB violations, selecting {victim-csi-small, victim-cpu-small} (300m+300m=600m CPU + 1 CSI slot)
+		// over single victim-heavy-pdb (600m CPU + 1 CSI slot, 1 PDB violation).
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			podIsGettingEvicted(cs, ns, podCSISmall.Name)); err != nil {
+			t.Fatalf("Expected victim-csi-small to be evicted: %v", err)
+		}
+		if err := wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			podIsGettingEvicted(cs, ns, podCPUSmall.Name)); err != nil {
+			t.Fatalf("Expected victim-cpu-small to be evicted: %v", err)
+		}
+
+		// PDB protected heavy pod should NOT be evicted
+		heavyLive, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, podHeavyPDB.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get heavy PDB pod: %v", err)
+		}
+		if heavyLive.DeletionTimestamp != nil {
+			t.Fatalf("PDB-protected heavy pod should not be evicted when non-violating victim set exists")
+		}
+
+		// Simulate deletion of the two victims
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, podCSISmall.Name); err != nil {
+			t.Fatalf("Failed to simulate victim-csi-small deletion: %v", err)
+		}
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, podCPUSmall.Name); err != nil {
+			t.Fatalf("Failed to simulate victim-cpu-small deletion: %v", err)
+		}
+
+		// Preemptor successfully schedules on node-1
+		if err := waitForPodToScheduleWithTimeout(testCtx.Ctx, cs, preemptorPod, 15*time.Second); err != nil {
+			t.Fatalf("Preemptor failed to schedule: %v", err)
 		}
 	})
 }
