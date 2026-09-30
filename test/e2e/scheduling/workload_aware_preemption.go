@@ -35,6 +35,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/features"
@@ -1786,6 +1787,110 @@ var _ = SIGDescribe("WorkloadAwarePreemption", framework.WithFeatureGate(feature
 			pod, err := cs.CoreV1().Pods(ns).Get(ctx, createdP.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 			gomega.Expect(pod.Status.Phase).To(gomega.Equal(v1.PodPending))
+		})
+	})
+
+	ginkgo.Describe("Gang Preemption Permit Timeout and Atomic Rollback", func() {
+		ginkgo.It("should cleanly roll back nominated nodes and cache when gang member victims are stalled past permit timeout", func(ctx context.Context) {
+			cs := f.ClientSet
+			ns := f.Namespace.Name
+			extendedResourceName := v1.ResourceName(extendedResourceDomain + ns)
+
+			lowPriorityName := "low-priority-timeout-" + ns
+			highPriorityName := "high-priority-timeout-" + ns
+
+			createPriorityClass(ctx, &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{Name: lowPriorityName},
+				Value:      100,
+			})
+			defer deletePriorityClass(ctx, lowPriorityName)
+
+			createPriorityClass(ctx, &schedulingv1.PriorityClass{
+				ObjectMeta: metav1.ObjectMeta{Name: highPriorityName},
+				Value:      1000,
+			})
+			defer deletePriorityClass(ctx, highPriorityName)
+
+			node1, node2 := getTwoNodeNames(ctx)
+			addExtendedResource(ctx, node1, extendedResourceName)
+			defer removeExtendedResource(ctx, node1, extendedResourceName)
+			addExtendedResource(ctx, node2, extendedResourceName)
+			defer removeExtendedResource(ctx, node2, extendedResourceName)
+
+			ginkgo.By("Creating low-priority victim pods across node1 and node2; stalling victim on node2 with finalizer")
+			v1 := makePod(node1, "victim-permit-n1", "", lowPriorityName, extendedResourceName)
+			createdV1, err := cs.CoreV1().Pods(ns).Create(ctx, v1, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+
+			v2 := makePod(node2, "victim-permit-n2", "", lowPriorityName, extendedResourceName)
+			v2.Finalizers = []string{"e2e.example.com/hold-victim"}
+			createdV2, err := cs.CoreV1().Pods(ns).Create(ctx, v2, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			defer func() {
+				// Ensure finalizer is cleaned up if test exits
+				patch := []byte(`{"metadata":{"finalizers":null}}`)
+				_, _ = cs.CoreV1().Pods(ns).Patch(ctx, createdV2.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+			}()
+
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdV1.Name, ns))
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdV2.Name, ns))
+
+			ginkgo.By("Creating high-priority gang PodGroup (minMember: 2) requiring placement across both nodes")
+			pgName := "hp-timeout-gang-" + ns
+			pg := makePodGroup(pgName, highPriorityName, schedulingv1beta1.PodGroupSchedulingPolicy{
+				Gang: &schedulingv1beta1.GangSchedulingPolicy{MinCount: 2},
+			}, singleDisruption)
+			createPodGroup(ctx, pg)
+			defer deletePodGroup(ctx, pgName)
+
+			ginkgo.By("Creating high-priority gang pods targeting node1 and node2")
+			hp1 := makePod(node1, "hp-timeout-n1", pgName, highPriorityName, extendedResourceName)
+			createdHP1, err := cs.CoreV1().Pods(ns).Create(ctx, hp1, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+
+			hp2 := makePod(node2, "hp-timeout-n2", pgName, highPriorityName, extendedResourceName)
+			createdHP2, err := cs.CoreV1().Pods(ns).Create(ctx, hp2, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+
+			ginkgo.By("Verifying victim-1 on node1 is preempted and deleted while victim-2 is marked for deletion but stalled")
+			err = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 30*time.Second, false, func(ctx context.Context) (bool, error) {
+				_, err := cs.CoreV1().Pods(ns).Get(ctx, createdV1.Name, metav1.GetOptions{})
+				if !apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				p2, err := cs.CoreV1().Pods(ns).Get(ctx, createdV2.Name, metav1.GetOptions{})
+				if err != nil {
+					return false, err
+				}
+				return p2.DeletionTimestamp != nil, nil
+			})
+			framework.ExpectNoError(err, "expected victim-1 deleted and victim-2 marked with DeletionTimestamp")
+
+			ginkgo.By("Verifying gang pods do not hold leaked nominations or finish scheduling while victim-2 is stalled")
+			err = wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 20*time.Second, false, func(ctx context.Context) (bool, error) {
+				curHP1, err := cs.CoreV1().Pods(ns).Get(ctx, createdHP1.Name, metav1.GetOptions{})
+				if err != nil {
+					return false, err
+				}
+				curHP2, err := cs.CoreV1().Pods(ns).Get(ctx, createdHP2.Name, metav1.GetOptions{})
+				if err != nil {
+					return false, err
+				}
+				// Both pods should remain unassigned / Pending
+				return curHP1.Spec.NodeName == "" && curHP2.Spec.NodeName == "", nil
+			})
+			framework.ExpectNoError(err, "gang pods unexpectedly scheduled while quorum was blocked")
+
+			ginkgo.By("Verifying a subsequent pod can schedule on node1 using freed capacity")
+			subPod := makePod(node1, "subsequent-pod-n1", "", lowPriorityName, extendedResourceName)
+			createdSubPod, err := cs.CoreV1().Pods(ns).Create(ctx, subPod, metav1.CreateOptions{})
+			framework.ExpectNoError(err)
+			framework.ExpectNoError(e2epod.WaitForPodNameRunningInNamespace(ctx, cs, createdSubPod.Name, ns), "subsequent pod failed to schedule on node1")
+
+			ginkgo.By("Removing finalizer from stalled victim-2 to clean up")
+			patch := []byte(`{"metadata":{"finalizers":null}}`)
+			_, err = cs.CoreV1().Pods(ns).Patch(ctx, createdV2.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+			framework.ExpectNoError(err)
 		})
 	})
 
