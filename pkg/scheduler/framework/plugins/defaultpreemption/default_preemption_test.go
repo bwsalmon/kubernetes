@@ -2533,17 +2533,17 @@ func TestCustomOrdering(t *testing.T) {
 
 func TestPodEligibleToPreemptOthers(t *testing.T) {
 	tests := []struct {
-		name                string
-		pod                 *v1.Pod
-		pods                []*v1.Pod
+		name                    string
+		pod                     *v1.Pod
+		pods                    []*v1.Pod
 		podGroups               []*v1beta1.PodGroup
 		cachePodGroups          []*v1beta1.PodGroup
 		compositePodGroups      []*v1alpha3.CompositePodGroup
 		cacheCompositePodGroups []*v1alpha3.CompositePodGroup
-		nodes               []string
-		features            feature.Features
-		nominatedNodeStatus *fwk.Status
-		expected            bool
+		nodes                   []string
+		features                feature.Features
+		nominatedNodeStatus     *fwk.Status
+		expected                bool
 	}{
 		{
 			name:                "Pod with nominated node",
