@@ -296,7 +296,51 @@ When evicting a victim pod:
 
 ---
 
-## 9. Prometheus Metrics & Observability
+## 9. Advanced Resource, Topology & Batched Preemption Interactions (KEPs)
+
+### 9.1 KEP-2837: Pod-Level Resource Specification & Overhead Accounting in Preemption
+- **Resource Computation Model**:
+  - The `NodeResourcesFit` plugin invokes `computePodResourceRequest(pod, opts)` (backed by `resourcehelper.PodRequests(pod, opts)`).
+  - Effective requests are computed as:
+    $$\text{EffectiveRequest}[R] = \text{Spec.Overhead}[R] + \max\left(\text{Spec.Resources.Requests}[R], \max_{c \in \text{Containers}}(\text{Container.Requests}[R])\right)$$
+  - Under in-place resource scaling (KEP-1287), container `AllocatedResources` and resize status adjustments are layered on top of pod-level definitions.
+- **Preemption Evaluation Lifecycle**:
+  - During candidate dry-run evaluation (`DryRunPreemption` -> `SelectVictimsOnNode`), when candidate victim pods are speculatively removed via `nodeInfo.RemovePod(victim)`, the node's `Requested` resource footprint is reduced by the victim's exact effective request (accounting for pod-level requests, overheads, and resize states).
+  - In `fitsRequest(podRequest)`, the preemptor's aggregate demand (inclusive of `Spec.Resources.Requests` and `Spec.Overhead`) is compared against the node's allocatable capacity minus remaining pods' effective allocations.
+  - In the reprieve phase (`reprievePod`), candidate victims are added back sequentially to ensure the minimal subset of victims is evicted without over-evicting capacity.
+
+### 9.2 KEP-4818: Node Declared Features Matching & `UnschedulableAndUnresolvable` Safety
+- **Feature Inference & Filtering**:
+  - `NodeDeclaredFeatures` plugin matches features required by the pod (inferred via `InferForPodScheduling(pod.Spec)`) against `nodeInfo.GetNodeDeclaredFeatures()`.
+  - Inferred features include kernel/container runtime capabilities such as `UserNamespacesHostNetworkSupport` (inferred when `HostNetwork: true` and `HostUsers: false`).
+- **Preemption Resolvability Invariant**:
+  - If a node lacks a required declared feature, `NodeDeclaredFeatures.Filter` returns `fwk.NewStatus(fwk.UnschedulableAndUnresolvable, ...)`.
+  - In `DryRunPreemption`, candidate node discovery runs parallel `checkNode` workers across candidate nodes. Any node returning `UnschedulableAndUnresolvable` is immediately disqualified and skipped before any victim eviction simulation or PDB analysis.
+  - **Safety Guarantee**: Unrelated lower-priority workloads on feature-incompatible nodes are never disrupted or evicted, preventing useless thrashing and ensuring preemption exclusively targets feature-compatible nodes.
+
+### 9.3 KEP-5598: Opportunistic Batching, Pod Signature Hashing & Preemption Decision Caching
+- **Pod Signature Hashing (`SignPod`)**:
+  - The framework computes a canonical JSON hash `PodSignature` for queue items by invoking `SignPlugin.SignPod` across registered plugins (`NodeResourcesFit`, `NodeDeclaredFeatures`, `TaintToleration`, `DynamicResources`, etc.).
+  - Signature fragments serialize scheduling criteria (tolerations, affinity, feature requirements, effective resource requests, priority level).
+- **Batch Cache & Preemption Boundary**:
+  - `OpportunisticBatch.GetNodeHint` accelerates scheduling of consecutive, homogeneous pods by reusing filter and score decisions.
+  - When a pod in a batch fails filter and enters `PostFilter` / preemption, `SignPod` invariants guarantee that:
+    1. Preemption decisions and nominations are computed specifically for the nominated preemptor.
+    2. Dynamic resource claim pods (`len(pod.Spec.ResourceClaims) > 0`) return `Unschedulable` status during `SignPod`, completely bypassing batch caching due to node-specific claim and device states.
+    3. Once preemption nominates a node, subsequent pods in the scheduling queue re-evaluate the nominated node taking the pending eviction into account.
+
+### 9.4 KEP-6072: Structured Dynamic Resource Allocation (DRA) & NUMA Topology Preemption
+- **Structured Resource Allocation**:
+  - The `DynamicResources` plugin interfaces with the DRA API (`resource.k8s.io/v1`), evaluating `DeviceClass`, `ResourceClaim`, and `ResourceSlice` objects.
+  - CEL device selectors filter devices by driver attributes, model identifiers, and topology locations (e.g. NUMA nodes, PCIe switches).
+- **Candidate Evaluation across Topology Boundaries**:
+  - In `PostFilter` / `Preemption`, if a preemptor pod requires structured dynamic devices, candidate evaluation checks both compute capacity (`NodeResourcesFit`) and device availability (`DynamicResources`).
+  - Nodes lacking available devices matching the claim's CEL selectors or NUMA topology return unresolvable statuses in `DynamicResources.PreFilter` / `Filter`.
+  - Preemption ensures that lower-priority compute victims are only evicted on nodes that can simultaneously satisfy both the compute requests and the structured DRA device/topology allocations.
+
+---
+
+## 10. Prometheus Metrics & Observability
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
@@ -312,7 +356,7 @@ When evicting a victim pod:
 
 ---
 
-## 10. Critical Developer & Agent Invariants
+## 11. Critical Developer & Agent Invariants
 
 1. **CycleState Isolation during Dry Run**:
    - `checkNode` in `DryRunPreemption` evaluates candidate nodes concurrently across worker goroutines. It **MUST** pass `state.Clone()` into `SelectVictimsOnNode`. Never share mutable `CycleState` between parallel evaluation workers.
@@ -326,10 +370,12 @@ When evicting a victim pod:
    - Victim pods MUST have their status patched with condition `DisruptionTarget` before deletion, preserving attribution and pod lifecycle observability.
 6. **Context Detachment in Async Eviction**:
    - `prepareCandidateAsync` MUST create a new context (`context.Background()`) detached from the scheduling cycle, as the scheduling cycle context is canceled immediately upon returning from `scheduleOne`.
+7. **Resolvability Status Enforcement**:
+   - Any plugin returning `fwk.UnschedulableAndUnresolvable` during Filter MUST halt victim discovery on that node immediately. Never attempt preemption on nodes with unresolvable mismatches (such as missing declared hardware/kernel features or invalid volume access modes).
 
 ---
 
-## 11. Testing Patterns & Verification
+## 12. Testing Patterns & Verification
 
 ```bash
 # Run all preemption unit tests with race detection
@@ -338,6 +384,6 @@ GOTOOLCHAIN=auto go test -v -race ./pkg/scheduler/framework/preemption/...
 # Run DefaultPreemption plugin tests
 GOTOOLCHAIN=auto go test -v -race ./pkg/scheduler/framework/plugins/defaultpreemption/...
 
-# Run scheduler integration preemption tests
-GOTOOLCHAIN=auto go test -v ./test/integration/scheduler -run TestPreemption
+# Run scheduler integration preemption tests (including KEP-2837, KEP-4818, KEP-5598, KEP-6072 suites)
+GOTOOLCHAIN=auto go test -v ./test/integration/scheduler/preemption/misc/
 ```
