@@ -25,10 +25,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -36,6 +38,7 @@ import (
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	"k8s.io/kubernetes/pkg/scheduler"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	testutils "k8s.io/kubernetes/test/integration/util"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 )
@@ -49,11 +52,13 @@ const (
 	filter               = "filter"
 	prioritize           = "prioritize"
 	bind                 = "bind"
+	preempt              = "preempt"
 	extendedResourceName = "foo.com/bar"
 )
 
 type fitPredicate func(pod *v1.Pod, node *v1.Node) (bool, error)
 type priorityFunc func(pod *v1.Pod, nodes *v1.NodeList) (*extenderv1.HostPriorityList, error)
+type preemptFunc func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error)
 
 type priorityConfig struct {
 	function priorityFunc
@@ -64,6 +69,7 @@ type Extender struct {
 	name             string
 	predicates       []fitPredicate
 	prioritizers     []priorityConfig
+	preemptor        preemptFunc
 	nodeCacheCapable bool
 	Client           clientset.Interface
 }
@@ -116,6 +122,41 @@ func (e *Extender) serveHTTP(t *testing.T, w http.ResponseWriter, req *http.Requ
 
 		if err := encoder.Encode(resp); err != nil {
 			t.Fatalf("Failed to encode %+v", resp)
+		}
+	} else if strings.Contains(req.URL.Path, preempt) {
+		var args extenderv1.ExtenderPreemptionArgs
+
+		if err := decoder.Decode(&args); err != nil {
+			http.Error(w, "Decode error", http.StatusBadRequest)
+			return
+		}
+
+		if e.preemptor != nil {
+			resp, err := e.preemptor(&args)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := encoder.Encode(resp); err != nil {
+				t.Fatalf("Failed to encode %+v", resp)
+			}
+		} else {
+			resp := &extenderv1.ExtenderPreemptionResult{
+				NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{},
+			}
+			if args.NodeNameToVictims != nil {
+				for node := range args.NodeNameToVictims {
+					resp.NodeNameToMetaVictims[node] = &extenderv1.MetaVictims{Pods: []*extenderv1.MetaPod{}}
+				}
+			}
+			if args.NodeNameToMetaVictims != nil {
+				for node := range args.NodeNameToMetaVictims {
+					resp.NodeNameToMetaVictims[node] = &extenderv1.MetaVictims{Pods: []*extenderv1.MetaPod{}}
+				}
+			}
+			if err := encoder.Encode(resp); err != nil {
+				t.Fatalf("Failed to encode %+v", resp)
+			}
 		}
 	} else {
 		http.Error(w, "Unknown method", http.StatusNotFound)
@@ -285,6 +326,50 @@ func machine3Prioritizer(pod *v1.Pod, nodes *v1.NodeList) (*extenderv1.HostPrior
 	return &result, nil
 }
 
+func createTestNodeWithResources(cs clientset.Interface, name string, cpuMillis int64, memoryMB int64) (*v1.Node, error) {
+	node := st.MakeNode().Name(name).
+		Capacity(map[v1.ResourceName]string{
+			v1.ResourcePods:   "32",
+			v1.ResourceCPU:    fmt.Sprintf("%dm", cpuMillis),
+			v1.ResourceMemory: fmt.Sprintf("%dMi", memoryMB),
+		}).
+		Obj()
+	return testutils.CreateNode(cs, node)
+}
+
+func makeTestPodWithResources(ns, name, nodeName string, priority int32, reqMap map[v1.ResourceName]string) *v1.Pod {
+	pw := st.MakePod().Namespace(ns).Name(name).
+		Priority(priority).
+		Res(reqMap).
+		ZeroTerminationGracePeriod()
+	if nodeName != "" {
+		pw.Node(nodeName)
+	}
+	return pw.Obj()
+}
+
+func simulateVictimDeletion(ctx context.Context, cs clientset.Interface, ns, name string) error {
+	err := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, false, func(ctx context.Context) (bool, error) {
+		pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return pod.DeletionTimestamp != nil, nil
+	})
+	if err != nil {
+		return fmt.Errorf("timed out waiting for victim pod %s/%s eviction: %w", ns, name, err)
+	}
+	var zero int64
+	err = cs.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
 func TestSchedulerExtender(t *testing.T) {
 	testCtx := testutils.InitTestAPIServer(t, "scheduler-extender", nil)
 	clientSet := testCtx.ClientSet
@@ -431,4 +516,602 @@ func DoTestPodScheduling(ns *v1.Namespace, t *testing.T, cs clientset.Interface)
 		t.Fatalf("Failed to delete pod: %v", err)
 	}
 	t.Logf("Scheduled pod using extenders")
+}
+
+// TestExtenderPreemption_EmptyInTreeVictimsPlaceholderChain tests extender preemption with placeholder
+// candidate nodes across a multi-extender chain (KEP-562 / KEP-3838).
+// When in-tree filter plugins fit without evicting in-tree pods (0 in-tree victims), but external extenders
+// fail the node due to custom resources, the scheduler creates an empty placeholder candidate (&extenderv1.Victims{Pods: []})
+// and passes it down the extender chain. An upstream extender can leave the placeholder unchanged, and a downstream
+// extender can add victims to allow preemptor scheduling.
+func TestExtenderPreemption_EmptyInTreeVictimsPlaceholderChain(t *testing.T) {
+	const (
+		lowPriority  int32 = 100
+		highPriority int32 = 1000
+		customGPU          = "example.com/gpu"
+		customLicense      = "example.com/license"
+	)
+
+	t.Run("ChainedPassthroughAndPreempt", func(t *testing.T) {
+		testCtx := testutils.InitTestAPIServer(t, "ext-placeholder-chain", nil)
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeName := "node-placeholder-chain"
+		if _, err := createTestNodeWithResources(cs, nodeName, 8000, 8192); err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		// Low-priority victim pod running on node, consuming 1 license and minor in-tree resources.
+		victimPod := makeTestPodWithResources(ns, "victim-license-pod", nodeName, lowPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customLicense:     "1",
+		})
+		victimPod, err := testutils.RunPausePod(cs, victimPod)
+		if err != nil {
+			t.Fatalf("Failed to run victim pod: %v", err)
+		}
+
+		var extenderAObservedPlaceholder atomic.Bool
+		var extenderBObservedPlaceholder atomic.Bool
+		var extenderAPreemptCalls atomic.Int32
+		var extenderBPreemptCalls atomic.Int32
+
+		// Extender A: Manages customGPU. Preemptor requests GPU (which is available), so Extender A filter passes.
+		// In preemption, Extender A receives the empty placeholder candidate and preserves it (returns empty victims).
+		extenderA := &Extender{
+			name: "extender-gpu",
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					return true, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				extenderAPreemptCalls.Add(1)
+				if args.NodeNameToVictims != nil && args.NodeNameToVictims[nodeName] != nil {
+					if len(args.NodeNameToVictims[nodeName].Pods) == 0 {
+						extenderAObservedPlaceholder.Store(true)
+					}
+				}
+				// Return empty victims map entry to preserve placeholder for downstream extenders
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{
+						nodeName: {Pods: []*extenderv1.MetaPod{}},
+					},
+				}, nil
+			},
+		}
+		esA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderA.serveHTTP(t, w, req)
+		}))
+		defer esA.Close()
+
+		// Extender B: Manages customLicense. Filters out node when victimPod is active.
+		// In preemption, Extender B receives placeholder candidate passed through by Extender A,
+		// and nominates victimPod.
+		extenderB := &Extender{
+			name: "extender-license",
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					_, err := cs.CoreV1().Pods(ns).Get(context.Background(), victimPod.Name, metav1.GetOptions{})
+					if err == nil {
+						// Victim holding license, fail filter
+						return false, nil
+					}
+					// Victim deleted, pass filter
+					return true, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				extenderBPreemptCalls.Add(1)
+				if args.NodeNameToVictims != nil && args.NodeNameToVictims[nodeName] != nil {
+					if len(args.NodeNameToVictims[nodeName].Pods) == 0 {
+						extenderBObservedPlaceholder.Store(true)
+					}
+				}
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{
+						nodeName: {
+							Pods: []*extenderv1.MetaPod{{UID: string(victimPod.UID)}},
+						},
+					},
+				}, nil
+			},
+		}
+		esB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderB.serveHTTP(t, w, req)
+		}))
+		defer esB.Close()
+
+		extenders := []schedulerapi.Extender{
+			{
+				URLPrefix:   esA.URL,
+				FilterVerb:  filter,
+				PreemptVerb: preempt,
+				EnableHTTPS: false,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customGPU, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+			{
+				URLPrefix:   esB.URL,
+				FilterVerb:  filter,
+				PreemptVerb: preempt,
+				EnableHTTPS: false,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customLicense, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+		}
+
+		testCtx = testutils.InitTestSchedulerWithOptions(t, testCtx, 0, scheduler.WithExtenders(extenders...))
+		testutils.SyncSchedulerInformerFactory(testCtx)
+		go testCtx.Scheduler.Run(testCtx.Ctx)
+
+		// Create high-priority preemptor requesting both GPU and license
+		preemptorPod := makeTestPodWithResources(ns, "preemptor-license-pod", "", highPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customGPU:         "1",
+			customLicense:     "1",
+		})
+		preemptorPod, err = testutils.CreatePausePod(cs, preemptorPod)
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+
+		// Simulate victim eviction and deletion
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimPod.Name); err != nil {
+			t.Fatalf("Error simulating victim deletion: %v", err)
+		}
+
+		// Verify preemptor pod is scheduled to nodeName
+		err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			testutils.PodScheduled(cs, ns, preemptorPod.Name))
+		if err != nil {
+			t.Fatalf("Preemptor pod failed to schedule: %v", err)
+		}
+
+		scheduledPod, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptorPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor pod: %v", err)
+		}
+		if scheduledPod.Spec.NodeName != nodeName {
+			t.Fatalf("Expected preemptor to be scheduled on %s, got %s", nodeName, scheduledPod.Spec.NodeName)
+		}
+
+		if !extenderAObservedPlaceholder.Load() {
+			t.Fatalf("Expected Extender A to receive placeholder empty-victim candidate")
+		}
+		if !extenderBObservedPlaceholder.Load() {
+			t.Fatalf("Expected Extender B to receive placeholder empty-victim candidate preserved across chain")
+		}
+		if extenderAPreemptCalls.Load() == 0 || extenderBPreemptCalls.Load() == 0 {
+			t.Fatalf("Expected both extenders to have their preempt handlers invoked")
+		}
+	})
+
+	t.Run("ChainedMultiExtenderMultipleVictims", func(t *testing.T) {
+		testCtx := testutils.InitTestAPIServer(t, "ext-multi-victims-chain", nil)
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeName := "node-multi-victims-chain"
+		if _, err := createTestNodeWithResources(cs, nodeName, 8000, 8192); err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		// Victim pod 1 holds custom GPU
+		victimGPU := makeTestPodWithResources(ns, "victim-gpu", nodeName, lowPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customGPU:         "1",
+		})
+		victimGPU, err := testutils.RunPausePod(cs, victimGPU)
+		if err != nil {
+			t.Fatalf("Failed to run victim GPU pod: %v", err)
+		}
+
+		// Victim pod 2 holds custom License
+		victimLicense := makeTestPodWithResources(ns, "victim-license", nodeName, lowPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customLicense:     "1",
+		})
+		victimLicense, err = testutils.RunPausePod(cs, victimLicense)
+		if err != nil {
+			t.Fatalf("Failed to run victim license pod: %v", err)
+		}
+
+		// Extender A: Manages customGPU. Filters out node when victimGPU exists.
+		// In preemption, Extender A adds victimGPU to the placeholder candidate.
+		extenderA := &Extender{
+			name: "extender-gpu",
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					_, err := cs.CoreV1().Pods(ns).Get(context.Background(), victimGPU.Name, metav1.GetOptions{})
+					return err != nil, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{
+						nodeName: {
+							Pods: []*extenderv1.MetaPod{{UID: string(victimGPU.UID)}},
+						},
+					},
+				}, nil
+			},
+		}
+		esA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderA.serveHTTP(t, w, req)
+		}))
+		defer esA.Close()
+
+		var extenderBObservedVictimGPU atomic.Bool
+
+		// Extender B: Manages customLicense. Filters out node when victimLicense exists.
+		// In preemption, Extender B receives victimGPU from Extender A and appends victimLicense.
+		extenderB := &Extender{
+			name: "extender-license",
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					_, err := cs.CoreV1().Pods(ns).Get(context.Background(), victimLicense.Name, metav1.GetOptions{})
+					return err != nil, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				if args.NodeNameToVictims != nil && args.NodeNameToVictims[nodeName] != nil {
+					for _, p := range args.NodeNameToVictims[nodeName].Pods {
+						if p.UID == victimGPU.UID {
+							extenderBObservedVictimGPU.Store(true)
+						}
+					}
+				}
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{
+						nodeName: {
+							Pods: []*extenderv1.MetaPod{
+								{UID: string(victimGPU.UID)},
+								{UID: string(victimLicense.UID)},
+							},
+						},
+					},
+				}, nil
+			},
+		}
+		esB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderB.serveHTTP(t, w, req)
+		}))
+		defer esB.Close()
+
+		extenders := []schedulerapi.Extender{
+			{
+				URLPrefix:   esA.URL,
+				FilterVerb:  filter,
+				PreemptVerb: preempt,
+				EnableHTTPS: false,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customGPU, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+			{
+				URLPrefix:   esB.URL,
+				FilterVerb:  filter,
+				PreemptVerb: preempt,
+				EnableHTTPS: false,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customLicense, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+		}
+
+		testCtx = testutils.InitTestSchedulerWithOptions(t, testCtx, 0, scheduler.WithExtenders(extenders...))
+		testutils.SyncSchedulerInformerFactory(testCtx)
+		go testCtx.Scheduler.Run(testCtx.Ctx)
+
+		// Create high-priority preemptor requesting both GPU and License
+		preemptorPod := makeTestPodWithResources(ns, "preemptor-dual", "", highPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customGPU:         "1",
+			customLicense:     "1",
+		})
+		preemptorPod, err = testutils.CreatePausePod(cs, preemptorPod)
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+
+		// Evict and delete both victims
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimGPU.Name); err != nil {
+			t.Fatalf("Error simulating victim GPU deletion: %v", err)
+		}
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimLicense.Name); err != nil {
+			t.Fatalf("Error simulating victim license deletion: %v", err)
+		}
+
+		err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			testutils.PodScheduled(cs, ns, preemptorPod.Name))
+		if err != nil {
+			t.Fatalf("Preemptor pod failed to schedule: %v", err)
+		}
+
+		scheduledPod, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptorPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor pod: %v", err)
+		}
+		if scheduledPod.Spec.NodeName != nodeName {
+			t.Fatalf("Expected preemptor to be scheduled on %s, got %s", nodeName, scheduledPod.Spec.NodeName)
+		}
+		if !extenderBObservedVictimGPU.Load() {
+			t.Fatalf("Expected Extender B to observe victim GPU nominated by Extender A")
+		}
+	})
+
+	t.Run("OmittedPlaceholderDroppedAcrossChain", func(t *testing.T) {
+		testCtx := testutils.InitTestAPIServer(t, "ext-omitted-chain", nil)
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeName := "node-omitted-chain"
+		if _, err := createTestNodeWithResources(cs, nodeName, 8000, 8192); err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		victimPod := makeTestPodWithResources(ns, "victim-license-pod", nodeName, lowPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customLicense:     "1",
+		})
+		victimPod, err := testutils.RunPausePod(cs, victimPod)
+		if err != nil {
+			t.Fatalf("Failed to run victim pod: %v", err)
+		}
+
+		var extenderBCalled atomic.Bool
+
+		// Extender A: Omits the candidate node (returns empty map).
+		extenderA := &Extender{
+			name: "extender-gpu",
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					return true, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				// Reject node by omitting it from result map
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{},
+				}, nil
+			},
+		}
+		esA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderA.serveHTTP(t, w, req)
+		}))
+		defer esA.Close()
+
+		// Extender B should never be called for preemption because Extender A dropped the node.
+		extenderB := &Extender{
+			name: "extender-license",
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					return false, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				extenderBCalled.Store(true)
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{
+						nodeName: {
+							Pods: []*extenderv1.MetaPod{{UID: string(victimPod.UID)}},
+						},
+					},
+				}, nil
+			},
+		}
+		esB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderB.serveHTTP(t, w, req)
+		}))
+		defer esB.Close()
+
+		extenders := []schedulerapi.Extender{
+			{
+				URLPrefix:   esA.URL,
+				FilterVerb:  filter,
+				PreemptVerb: preempt,
+				EnableHTTPS: false,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customGPU, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+			{
+				URLPrefix:   esB.URL,
+				FilterVerb:  filter,
+				PreemptVerb: preempt,
+				EnableHTTPS: false,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customLicense, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+		}
+
+		testCtx = testutils.InitTestSchedulerWithOptions(t, testCtx, 0, scheduler.WithExtenders(extenders...))
+		testutils.SyncSchedulerInformerFactory(testCtx)
+		go testCtx.Scheduler.Run(testCtx.Ctx)
+
+		preemptorPod := makeTestPodWithResources(ns, "preemptor-fail", "", highPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customGPU:         "1",
+			customLicense:     "1",
+		})
+		preemptorPod, err = testutils.CreatePausePod(cs, preemptorPod)
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+
+		time.Sleep(1 * time.Second)
+
+		currentVictim, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, victimPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get victim pod: %v", err)
+		}
+		if currentVictim.DeletionTimestamp != nil {
+			t.Fatalf("Victim pod was unexpectedly evicted")
+		}
+
+		currentPreemptor, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptorPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get preemptor pod: %v", err)
+		}
+		if currentPreemptor.Spec.NodeName != "" {
+			t.Fatalf("Preemptor was unexpectedly scheduled to %s", currentPreemptor.Spec.NodeName)
+		}
+		if extenderBCalled.Load() {
+			t.Fatalf("Extender B should not be called when upstream extender omitted the node")
+		}
+	})
+
+	t.Run("NodeCacheCapableChainedPreemption", func(t *testing.T) {
+		testCtx := testutils.InitTestAPIServer(t, "ext-cache-chain", nil)
+		cs := testCtx.ClientSet
+		ns := testCtx.NS.Name
+
+		nodeName := "node-cache-chain"
+		if _, err := createTestNodeWithResources(cs, nodeName, 8000, 8192); err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		victimPod := makeTestPodWithResources(ns, "victim-license-pod", nodeName, lowPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customLicense:     "1",
+		})
+		victimPod, err := testutils.RunPausePod(cs, victimPod)
+		if err != nil {
+			t.Fatalf("Failed to run victim pod: %v", err)
+		}
+
+		var extenderAObservedMetaPlaceholder atomic.Bool
+
+		// Extender A: NodeCacheCapable = true. Receives NodeNameToMetaVictims.
+		extenderA := &Extender{
+			name:             "extender-gpu-cache",
+			nodeCacheCapable: true,
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					return true, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				if args.NodeNameToMetaVictims != nil && args.NodeNameToMetaVictims[nodeName] != nil {
+					if len(args.NodeNameToMetaVictims[nodeName].Pods) == 0 {
+						extenderAObservedMetaPlaceholder.Store(true)
+					}
+				}
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{
+						nodeName: {Pods: []*extenderv1.MetaPod{}},
+					},
+				}, nil
+			},
+		}
+		esA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderA.serveHTTP(t, w, req)
+		}))
+		defer esA.Close()
+
+		// Extender B: NodeCacheCapable = false. Receives NodeNameToVictims.
+		extenderB := &Extender{
+			name:             "extender-license-nocache",
+			nodeCacheCapable: false,
+			predicates: []fitPredicate{
+				func(pod *v1.Pod, node *v1.Node) (bool, error) {
+					_, err := cs.CoreV1().Pods(ns).Get(context.Background(), victimPod.Name, metav1.GetOptions{})
+					return err != nil, nil
+				},
+			},
+			preemptor: func(args *extenderv1.ExtenderPreemptionArgs) (*extenderv1.ExtenderPreemptionResult, error) {
+				return &extenderv1.ExtenderPreemptionResult{
+					NodeNameToMetaVictims: map[string]*extenderv1.MetaVictims{
+						nodeName: {
+							Pods: []*extenderv1.MetaPod{{UID: string(victimPod.UID)}},
+						},
+					},
+				}, nil
+			},
+		}
+		esB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			extenderB.serveHTTP(t, w, req)
+		}))
+		defer esB.Close()
+
+		extenders := []schedulerapi.Extender{
+			{
+				URLPrefix:        esA.URL,
+				FilterVerb:       filter,
+				PreemptVerb:      preempt,
+				EnableHTTPS:      false,
+				NodeCacheCapable: true,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customGPU, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+			{
+				URLPrefix:        esB.URL,
+				FilterVerb:       filter,
+				PreemptVerb:      preempt,
+				EnableHTTPS:      false,
+				NodeCacheCapable: false,
+				ManagedResources: []schedulerapi.ExtenderManagedResource{
+					{Name: customLicense, IgnoredByScheduler: true},
+				},
+				Ignorable: false,
+			},
+		}
+
+		testCtx = testutils.InitTestSchedulerWithOptions(t, testCtx, 0, scheduler.WithExtenders(extenders...))
+		testutils.SyncSchedulerInformerFactory(testCtx)
+		go testCtx.Scheduler.Run(testCtx.Ctx)
+
+		preemptorPod := makeTestPodWithResources(ns, "preemptor-cache-chain", "", highPriority, map[v1.ResourceName]string{
+			v1.ResourceCPU:    "100m",
+			v1.ResourceMemory: "100Mi",
+			customGPU:         "1",
+			customLicense:     "1",
+		})
+		preemptorPod, err = testutils.CreatePausePod(cs, preemptorPod)
+		if err != nil {
+			t.Fatalf("Failed to create preemptor pod: %v", err)
+		}
+
+		if err := simulateVictimDeletion(testCtx.Ctx, cs, ns, victimPod.Name); err != nil {
+			t.Fatalf("Error simulating victim deletion: %v", err)
+		}
+
+		err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 10*time.Second, false,
+			testutils.PodScheduled(cs, ns, preemptorPod.Name))
+		if err != nil {
+			t.Fatalf("Preemptor pod failed to schedule: %v", err)
+		}
+
+		scheduledPod, err := cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptorPod.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get scheduled preemptor pod: %v", err)
+		}
+		if scheduledPod.Spec.NodeName != nodeName {
+			t.Fatalf("Expected preemptor to be scheduled on %s, got %s", nodeName, scheduledPod.Spec.NodeName)
+		}
+		if !extenderAObservedMetaPlaceholder.Load() {
+			t.Fatalf("Expected node-cache capable Extender A to observe empty meta placeholder")
+		}
+	})
 }

@@ -247,6 +247,7 @@ type AsyncPreemptionTestConfig struct {
 	InitialBackoffSeconds                              int64
 	MaxBackoffSeconds                                  int64
 	PreemptPodHook                                     PreemptPodHookFn
+	PodsToBlock                                        map[string]*BlockedPod
 }
 
 // InitTestForAsyncPreemption initializes the test environment for async preemption tests.
@@ -285,17 +286,29 @@ func InitTestForAsyncPreemption(t *testing.T, config AsyncPreemptionTestConfig) 
 		t.Fatalf("Error registering a queueSkipFilterPlugin plugin: %v", err)
 	}
 
+	enabledPlugins := []configv1.Plugin{
+		{Name: blockingBindPluginName},
+		{Name: delayedPreemptionPluginName},
+		{Name: reservingPluginName},
+		{Name: queueSkipFilterPluginName},
+	}
+
+	if len(config.PodsToBlock) > 0 {
+		err := registry.Register(BlockingPermitPluginName, func(ctx context.Context, o runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
+			return NewBlockingPermitPlugin(ctx, o, fh, config.PodsToBlock), nil
+		})
+		if err != nil {
+			t.Fatalf("Error registering a blocking permit plugin: %v", err)
+		}
+		enabledPlugins = append(enabledPlugins, configv1.Plugin{Name: BlockingPermitPluginName})
+	}
+
 	cfg := configtesting.V1ToInternalWithDefaults(t, configv1.KubeSchedulerConfiguration{
 		Profiles: []configv1.KubeSchedulerProfile{{
 			SchedulerName: new(v1.DefaultSchedulerName),
 			Plugins: &configv1.Plugins{
 				MultiPoint: configv1.PluginSet{
-					Enabled: []configv1.Plugin{
-						{Name: blockingBindPluginName},
-						{Name: delayedPreemptionPluginName},
-						{Name: reservingPluginName},
-						{Name: queueSkipFilterPluginName},
-					},
+					Enabled: enabledPlugins,
 					Disabled: []configv1.Plugin{
 						{Name: names.DefaultPreemption},
 						{Name: names.DefaultBinder},

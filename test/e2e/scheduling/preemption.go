@@ -708,6 +708,117 @@ var _ = SIGDescribe("SchedulerPreemption", framework.WithSerial(), func() {
 		e2epod.VerifyPodHasConditionWithType(ctx, f, victimPod, v1.DisruptionTarget)
 	})
 
+	/*
+		Release: v1.37
+		Testname: Verify DisruptionTarget condition on preemption victims during single-pod preemption
+		Description:
+		1. Run a low-priority pod with finalizer that consumes node resources
+		2. Schedule a higher-priority preemptor pod requiring the same node resources
+		3. Verify the lower-priority victim pod is preempted and marked Terminating
+		4. Verify the victim pod status is patched with DisruptionTarget condition (Status: True, Reason: PreemptionByScheduler, message)
+		5. Verify Preempted event is recorded for the victim pod
+		6. Remove the finalizer to allow the victim pod to be garbage collected and the preemptor to run
+	*/
+	framework.It("validates DisruptionTarget condition on preemption victims during single-pod preemption", func(ctx context.Context) {
+		podRes := v1.ResourceList{testExtendedResource: resource.MustParse("1")}
+
+		ginkgo.By("Select a node to run the lower and higher priority pods")
+		gomega.Expect(nodeList.Items).ToNot(gomega.BeEmpty(), "We need at least one node for the test to run")
+		node := nodeList.Items[0]
+		e2enode.AddExtendedResource(ctx, cs, node.Name, testExtendedResource, resource.MustParse("1"))
+
+		testNodeAffinity := v1.Affinity{
+			NodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchFields: []v1.NodeSelectorRequirement{
+								{Key: "metadata.name", Operator: v1.NodeSelectorOpIn, Values: []string{node.Name}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		ginkgo.By("Create a low priority pod with finalizer that consumes 1/1 of node resources")
+		victimPod := createPausePod(ctx, f, pausePodConfig{
+			Name:              "victim-dt-pod",
+			PriorityClassName: lowPriorityClassName,
+			Resources: &v1.ResourceRequirements{
+				Requests: podRes,
+				Limits:   podRes,
+			},
+			Finalizers: []string{testFinalizer},
+			Affinity:   &testNodeAffinity,
+		})
+		framework.Logf("Created pod: %v", victimPod.Name)
+
+		ginkgo.By("Wait for the victim pod to be scheduled")
+		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, cs, victimPod))
+
+		// Remove the finalizer so that the victim pod can be GCed
+		defer e2epod.NewPodClient(f).RemoveFinalizer(ctx, victimPod.Name, testFinalizer)
+
+		ginkgo.By("Create a high priority pod to trigger preemption of the lower priority victim pod")
+		preemptorPod := createPausePod(ctx, f, pausePodConfig{
+			Name:              "preemptor-dt-pod",
+			PriorityClassName: highPriorityClassName,
+			Resources: &v1.ResourceRequirements{
+				Requests: podRes,
+				Limits:   podRes,
+			},
+			Affinity: &testNodeAffinity,
+		})
+		framework.Logf("Created pod: %v", preemptorPod.Name)
+
+		ginkgo.By("Waiting for the victim pod to be terminating")
+		err := e2epod.WaitForPodTerminatingInNamespaceTimeout(ctx, f.ClientSet, victimPod.Name, victimPod.Namespace, framework.PodDeleteTimeout)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Verifying the DisruptionTarget condition status, reason, and message on the victim pod")
+		gomega.Eventually(ctx, func(ctx context.Context) error {
+			pod, err := cs.CoreV1().Pods(f.Namespace.Name).Get(ctx, victimPod.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			cond := e2epod.FindPodConditionByType(&pod.Status, v1.DisruptionTarget)
+			if cond == nil {
+				return fmt.Errorf("condition %s not found on pod %s", v1.DisruptionTarget, victimPod.Name)
+			}
+			if cond.Status != v1.ConditionTrue {
+				return fmt.Errorf("expected status %s, got %s on pod %s", v1.ConditionTrue, cond.Status, victimPod.Name)
+			}
+			if cond.Reason != v1.PodReasonPreemptionByScheduler {
+				return fmt.Errorf("expected reason %s, got %s on pod %s", v1.PodReasonPreemptionByScheduler, cond.Reason, victimPod.Name)
+			}
+			if !strings.Contains(cond.Message, "preempting to accommodate a higher priority") {
+				return fmt.Errorf("expected message to contain preemption reason, got %q on pod %s", cond.Message, victimPod.Name)
+			}
+			return nil
+		}).WithTimeout(30 * time.Second).WithPolling(1 * time.Second).Should(gomega.Succeed())
+
+		ginkgo.By("Verifying Preempted event is recorded for the victim pod")
+		gomega.Eventually(ctx, func(ctx context.Context) error {
+			events, err := cs.CoreV1().Events(f.Namespace.Name).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return err
+			}
+			for _, e := range events.Items {
+				if (e.InvolvedObject.Name == victimPod.Name || strings.HasPrefix(e.Name, victimPod.Name)) && e.Reason == "Preempted" {
+					return nil
+				}
+			}
+			return fmt.Errorf("Preempted event on victim pod %s not found", victimPod.Name)
+		}).WithTimeout(30 * time.Second).WithPolling(1 * time.Second).Should(gomega.Succeed())
+
+		ginkgo.By("Removing the finalizer to allow the victim pod to be deleted")
+		e2epod.NewPodClient(f).RemoveFinalizer(ctx, victimPod.Name, testFinalizer)
+
+		ginkgo.By("Verifying the preemptor pod is running")
+		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, cs, preemptorPod))
+	})
+
 	ginkgo.Context("PodTopologySpread Preemption", func() {
 		var nodeNames []string
 		var nodes []*v1.Node

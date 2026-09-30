@@ -10935,3 +10935,149 @@ func TestPreQueueingHint_PerPluginNarrowing(t *testing.T) {
 		t.Errorf("pluginB QueueingHintFn should be called for pod2, called for: %v", pluginBQueueingHintCalled)
 	}
 }
+
+// TestPriorityQueue_GatedPreemptorWildcardFlushAndMetricIntegrity verifies KEP-5142 behavior:
+//  1. Gated preemptor pods waiting in unschedulablePods are skipped on non-wildcard, non-matching cluster events.
+//  2. Wildcard events (e.g. EventUnschedulableTimeout, EventForceActivate) bypass gating event matching and force re-evaluation.
+//  3. If a preemptor remains gated during a wildcard flush, it returns to unschedulablePods and WasFlushedFromUnschedulable
+//     is reset to false to maintain queue telemetry and metric integrity.
+//  4. When the preemptor is no longer gated, a subsequent flush successfully moves it to activeQ with WasFlushedFromUnschedulable = true.
+//  5. When a non-flush cluster event wakes an un-gated pod, WasFlushedFromUnschedulable remains false.
+func TestPriorityQueue_GatedPreemptorWildcardFlushAndMetricIntegrity(t *testing.T) {
+	const allowedLabel = "allow"
+	const gatingPluginName = "preemptorGatingPlugin"
+	podDeleteEvent := fwk.ClusterEvent{Resource: fwk.Pod, ActionType: fwk.Delete}
+
+	c := testingclock.NewFakeClock(time.Now())
+	m := makeEmptyQueueingHintMapPerProfile()
+	m[""][podDeleteEvent] = []*QueueingHintFunction{
+		{
+			PluginName:     gatingPluginName,
+			QueueingHintFn: queueHintReturnQueue,
+		},
+	}
+	m[""][nodeAdd] = []*QueueingHintFunction{
+		{
+			PluginName:     "otherPlugin",
+			QueueingHintFn: queueHintReturnQueue,
+		},
+	}
+
+	plugin := &preEnqueuePlugin{name: gatingPluginName, allowlists: []string{allowedLabel}}
+	preEnqM := map[string]map[string]fwk.PreEnqueuePlugin{
+		"": {
+			gatingPluginName: plugin,
+		},
+	}
+
+	logger, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	q := NewTestQueue(ctx, newDefaultQueueSort(),
+		WithClock(c),
+		WithQueueingHintMapPerProfile(m),
+		WithPreEnqueuePluginMap(preEnqM),
+		WithPodMaxInUnschedulablePodsDuration(DefaultPodMaxInUnschedulablePodsDuration),
+	)
+
+	// Create a preemptor pod with allowedLabel initially so it can enter activeQ and be popped.
+	preemptor := st.MakePod().Name("preemptor-pod").Namespace("ns1").UID("preemptor-1").Priority(highPriority).Label(allowedLabel, "").Obj()
+	pInfo := &framework.QueuedPodInfo{
+		PodInfo: mustNewPodInfo(preemptor),
+		QueueingParams: framework.QueueingParams{
+			UnschedulablePlugins: sets.New(gatingPluginName),
+		},
+	}
+
+	// Add to activeQ and pop to simulate initial schedule attempt.
+	q.Add(ctx, pInfo.Pod)
+	_, err := q.Pop(logger)
+	if err != nil {
+		t.Fatalf("Pop failed: %v", err)
+	}
+
+	// Remove allowedLabel so the preemptor pod becomes gated.
+	delete(preemptor.Labels, allowedLabel)
+	pInfo = setQueuedPodInfoGated(pInfo, gatingPluginName, []fwk.ClusterEvent{podDeleteEvent})
+
+	// Place pod into unschedulableEntities.
+	if err := q.AddUnschedulablePodIfNotPresent(logger, pInfo, q.SchedulingCycle()); err != nil {
+		t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
+	}
+
+	// 1. Non-wildcard, non-matching event (nodeAdd) should be skipped for gated pod.
+	q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
+	if len(q.PodsInActiveQ()) != 0 || len(q.UnschedulablePods()) != 1 {
+		t.Fatalf("Expected gated pod to remain in unschedulable after non-matching nodeAdd event")
+	}
+
+	// 2. Wildcard flush while pod is STILL gated.
+	// Advance fake clock past podMaxInUnschedulablePodsDuration and trigger flush.
+	c.Step(DefaultPodMaxInUnschedulablePodsDuration + time.Second)
+	q.flushUnschedulableEntitiesLeftover(logger)
+
+	// Since pod is still gated (does not have allowedLabel), moveToActiveQ should reject it
+	// and reset WasFlushedFromUnschedulable to false.
+	if len(q.PodsInActiveQ()) != 0 {
+		t.Fatalf("Expected pod to not enter activeQ while still gated")
+	}
+	internalPInfo := q.unschedulableEntities.get(newQueuedPodInfoForLookup(preemptor))
+	if internalPInfo == nil {
+		t.Fatalf("Expected pod to remain in unschedulableEntities")
+	}
+	queuedPod := internalPInfo.(*framework.QueuedPodInfo)
+	if queuedPod.WasFlushedFromUnschedulable {
+		t.Errorf("Expected WasFlushedFromUnschedulable to be reset to false for still-gated pod, got true")
+	}
+
+	// 3. Explicit wildcard event (EventForceActivate) while pod is still gated.
+	q.MoveAllToActiveOrBackoffQueue(logger, framework.EventForceActivate, nil, nil, nil)
+	internalPInfo = q.unschedulableEntities.get(newQueuedPodInfoForLookup(preemptor))
+	if internalPInfo == nil {
+		t.Fatalf("Expected pod to remain in unschedulableEntities")
+	}
+	if internalPInfo.(*framework.QueuedPodInfo).WasFlushedFromUnschedulable {
+		t.Errorf("Expected WasFlushedFromUnschedulable to remain false after EventForceActivate on gated pod")
+	}
+
+	// 4. Pod becomes un-gated (allowlist label added to pod).
+	preemptor.Labels = map[string]string{allowedLabel: "true"}
+	// Advance clock and trigger periodic flush.
+	c.Step(DefaultPodMaxInUnschedulablePodsDuration + time.Second)
+	q.flushUnschedulableEntitiesLeftover(logger)
+
+	// The pod should now pass PreEnqueue and move to activeQ with WasFlushedFromUnschedulable = true.
+	if len(q.PodsInActiveQ()) != 1 {
+		t.Fatalf("Expected un-gated pod to be moved to activeQ after flush, got %d pods in activeQ", len(q.PodsInActiveQ()))
+	}
+	entity, err := q.Pop(logger)
+	if err != nil {
+		t.Fatalf("Pop failed: %v", err)
+	}
+	poppedPInfo := entity.(*framework.QueuedPodInfo)
+	if !poppedPInfo.WasFlushedFromUnschedulable {
+		t.Errorf("Expected WasFlushedFromUnschedulable to be true after successful flush, got false")
+	}
+
+	// 5. Simulate failed scheduling attempt returning to unschedulable (resetting flush flag).
+	if err := q.AddUnschedulablePodIfNotPresent(logger, q.newQueuedPodInfo(ctx, poppedPInfo.Pod, gatingPluginName), q.SchedulingCycle()); err != nil {
+		t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
+	}
+	// Advance clock past backoff duration so pod goes to activeQ rather than backoffQ.
+	c.Step(DefaultPodInitialBackoffDuration + time.Second)
+	// Normal matching event (podDeleteEvent) wakes the pod.
+	q.MoveAllToActiveOrBackoffQueue(logger, podDeleteEvent, st.MakePod().Name("victim-pod").Obj(), nil, nil)
+	if len(q.PodsInActiveQ()) != 1 {
+		t.Fatalf("Expected pod to move to activeQ on podDeleteEvent, activeQ len: %d, backoffQ len: %d, unsched len: %d",
+			len(q.PodsInActiveQ()), len(q.PodsInBackoffQ()), len(q.UnschedulablePods()))
+	}
+	entity, err = q.Pop(logger)
+	if err != nil {
+		t.Fatalf("Pop failed: %v", err)
+	}
+	poppedPInfo = entity.(*framework.QueuedPodInfo)
+	if poppedPInfo.WasFlushedFromUnschedulable {
+		t.Errorf("Expected WasFlushedFromUnschedulable to be false on normal event wake-up, got true")
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2/ktesting"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -389,4 +390,230 @@ func statusEqual(s1, s2 *fwk.Status) bool {
 		return false
 	}
 	return s1.Code() == s2.Code() && s1.Message() == s2.Message()
+}
+
+func TestDeferredPodScheduling_MultiContainerHeterogeneousResize(t *testing.T) {
+	// Pod with container c1 expanding CPU (100m -> 500m) and container c2 expanding Memory (100Mi -> 500Mi).
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "preemptor-multi",
+			Namespace: "default",
+			UID:       "preemptor-multi-uid",
+		},
+		Spec: v1.PodSpec{
+			NodeName: "node1",
+			Containers: []v1.Container{
+				{
+					Name: "c1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("500m"),
+							v1.ResourceMemory: resource.MustParse("100Mi"),
+						},
+					},
+				},
+				{
+					Name: "c2",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("100m"),
+							v1.ResourceMemory: resource.MustParse("500Mi"),
+						},
+					},
+				},
+			},
+		},
+		Status: v1.PodStatus{
+			Conditions: []v1.PodCondition{
+				{
+					Type:   v1.PodResizePending,
+					Status: v1.ConditionTrue,
+					Reason: v1.PodReasonDeferred,
+				},
+			},
+			ContainerStatuses: []v1.ContainerStatus{
+				{
+					Name: "c1",
+					AllocatedResources: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("100m"),
+						v1.ResourceMemory: resource.MustParse("100Mi"),
+					},
+				},
+				{
+					Name: "c2",
+					AllocatedResources: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("100m"),
+						v1.ResourceMemory: resource.MustParse("100Mi"),
+					},
+				},
+			},
+		},
+	}
+
+	// 1. Validate PreFilter behavior
+	pl := &DeferredPodScheduling{
+		enableInPlacePodVerticalScalingSchedulerPreemption: true,
+	}
+	_, status := pl.PreFilter(context.Background(), nil, pod, nil)
+	if status != nil {
+		t.Fatalf("PreFilter expected nil status for multi-container deferred pod, got: %v", status)
+	}
+
+	// 2. Validate Filter behavior on assigned node
+	node := st.MakeNode().Name("node1").Obj()
+	nodeInfo := framework.NewNodeInfo()
+	nodeInfo.SetNode(node)
+	status = pl.Filter(context.Background(), nil, pod, nodeInfo)
+	if status != nil {
+		t.Fatalf("Filter expected nil status for assigned node, got: %v", status)
+	}
+
+	// Filter on different node should fail
+	otherNode := st.MakeNode().Name("node2").Obj()
+	otherNodeInfo := framework.NewNodeInfo()
+	otherNodeInfo.SetNode(otherNode)
+	status = pl.Filter(context.Background(), nil, pod, otherNodeInfo)
+	if status == nil || status.Code() != fwk.UnschedulableAndUnresolvable {
+		t.Fatalf("Filter expected UnschedulableAndUnresolvable for different node, got: %v", status)
+	}
+
+	// 3. Validate Permit behavior (returns UnschedulableAndUnresolvable to wait for Kubelet actuation)
+	status, _ = pl.Permit(context.Background(), nil, pod, "node1")
+	if status == nil || status.Code() != fwk.UnschedulableAndUnresolvable {
+		t.Fatalf("Permit expected UnschedulableAndUnresolvable, got: %v", status)
+	}
+	if status.Message() != "pod resize fits, waiting for Kubelet actuation" {
+		t.Fatalf("Permit unexpected message: %v", status.Message())
+	}
+
+	// 4. Validate Delta Resource Calculations across multiple containers
+	var totalAllocatedCPU, totalAllocatedMem int64
+	for _, cStatus := range pod.Status.ContainerStatuses {
+		totalAllocatedCPU += cStatus.AllocatedResources.Cpu().MilliValue()
+		totalAllocatedMem += cStatus.AllocatedResources.Memory().Value()
+	}
+
+	var totalDesiredCPU, totalDesiredMem int64
+	for _, c := range pod.Spec.Containers {
+		totalDesiredCPU += c.Resources.Requests.Cpu().MilliValue()
+		totalDesiredMem += c.Resources.Requests.Memory().Value()
+	}
+
+	expectedDesiredCPU := int64(600)
+	expectedDesiredMem := int64(600 * 1024 * 1024)
+	if totalDesiredCPU != expectedDesiredCPU {
+		t.Errorf("Total desired CPU = %vm, want %vm", totalDesiredCPU, expectedDesiredCPU)
+	}
+	if totalDesiredMem != expectedDesiredMem {
+		t.Errorf("Total desired Memory = %v, want %v", totalDesiredMem, expectedDesiredMem)
+	}
+
+	expectedAllocatedCPU := int64(200)
+	expectedAllocatedMem := int64(200 * 1024 * 1024)
+	if totalAllocatedCPU != expectedAllocatedCPU {
+		t.Errorf("Total allocated CPU = %vm, want %vm", totalAllocatedCPU, expectedAllocatedCPU)
+	}
+	if totalAllocatedMem != expectedAllocatedMem {
+		t.Errorf("Total allocated Memory = %v, want %v", totalAllocatedMem, expectedAllocatedMem)
+	}
+
+	deltaCPU := totalDesiredCPU - totalAllocatedCPU
+	deltaMem := totalDesiredMem - totalAllocatedMem
+	if deltaCPU != 400 {
+		t.Errorf("Delta CPU = %v, want 400m", deltaCPU)
+	}
+	if deltaMem != 400*1024*1024 {
+		t.Errorf("Delta Mem = %v, want 400Mi", deltaMem)
+	}
+}
+
+func TestDeferredPodScheduling_ResizeCancellationReservationCleanup(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	// Initial pod with deferred resize: allocated 100m CPU, requesting 500m CPU (delta 400m CPU)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "preemptor-cancel",
+			Namespace: "default",
+			UID:       "preemptor-cancel-uid",
+		},
+		Spec: v1.PodSpec{
+			NodeName: "node1",
+			Containers: []v1.Container{
+				{
+					Name: "c1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("500m"),
+							v1.ResourceMemory: resource.MustParse("100Mi"),
+						},
+					},
+				},
+			},
+		},
+		Status: v1.PodStatus{
+			Conditions: []v1.PodCondition{
+				{
+					Type:   v1.PodResizePending,
+					Status: v1.ConditionTrue,
+					Reason: v1.PodReasonDeferred,
+				},
+			},
+			ContainerStatuses: []v1.ContainerStatus{
+				{
+					Name: "c1",
+					AllocatedResources: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("100m"),
+						v1.ResourceMemory: resource.MustParse("100Mi"),
+					},
+				},
+			},
+		},
+	}
+
+	node := st.MakeNode().Name("node1").Capacity(map[v1.ResourceName]string{
+		v1.ResourceCPU:    "1000m",
+		v1.ResourceMemory: "1000Mi",
+	}).Obj()
+
+	nodeInfo := framework.NewNodeInfo()
+	nodeInfo.SetNode(node)
+	nodeInfo.AddPod(pod)
+
+	// In the snapshot / nodeInfo, pod requests are accounted for (500m CPU)
+	if nodeInfo.Requested.MilliCPU != 500 {
+		t.Fatalf("Expected nodeInfo.Requested.MilliCPU to be 500m before cancellation, got %v", nodeInfo.Requested.MilliCPU)
+	}
+
+	// Downsizing pod spec back to 100m CPU and clearing deferred condition
+	cancelledPod := pod.DeepCopy()
+	cancelledPod.Spec.Containers[0].Resources.Requests = v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("100m"),
+		v1.ResourceMemory: resource.MustParse("100Mi"),
+	}
+	cancelledPod.Status.Conditions = []v1.PodCondition{
+		{
+			Type:   v1.PodScheduled,
+			Status: v1.ConditionTrue,
+		},
+	}
+
+	// Update the pod in NodeInfo (Remove old pod, Add updated pod)
+	if err := nodeInfo.RemovePod(logger, pod); err != nil {
+		t.Fatalf("Failed to remove pod from nodeInfo: %v", err)
+	}
+	nodeInfo.AddPod(cancelledPod)
+
+	// Verify that delta reservation is cleared and nodeInfo.Requested immediately drops to 100m CPU
+	if nodeInfo.Requested.MilliCPU != 100 {
+		t.Fatalf("Expected nodeInfo.Requested.MilliCPU to be 100m after cancellation, got %v", nodeInfo.Requested.MilliCPU)
+	}
+
+	// Verify DeferredPodScheduling plugin ignores cancelled pod
+	pl := &DeferredPodScheduling{
+		enableInPlacePodVerticalScalingSchedulerPreemption: true,
+	}
+	_, status := pl.PreFilter(context.Background(), nil, cancelledPod, nil)
+	if status == nil || status.Code() != fwk.Skip {
+		t.Fatalf("Expected PreFilter to return Skip for cancelled/non-deferred pod, got: %v", status)
+	}
 }
