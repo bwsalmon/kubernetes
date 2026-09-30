@@ -2346,3 +2346,185 @@ func TestIsPodGroupWaitingForVictims(t *testing.T) {
 		})
 	}
 }
+
+type fullPreemptionMetricsState struct {
+	workloadPreemptionVictims histogramState
+	preemptionVictims         histogramState
+	workloadDisruptions       histogramState
+	pdbViolations             counterState
+	executionDuration         histogramState
+	goroutinesDuration        histogramState
+	goroutinesExecutionTotal  counterState
+}
+
+func captureFullPreemptionMetricsState(g componentmetrics.Gatherer, preemptorType fwk.EntityKeyType, result string) fullPreemptionMetricsState {
+	preemptorLabel := metrics.EntityTypeToLabel(preemptorType)
+	return fullPreemptionMetricsState{
+		workloadPreemptionVictims: newHistogramState(g, "scheduler_workload_preemption_victims", map[string]string{}),
+		preemptionVictims:         newHistogramState(g, "scheduler_preemption_victims", map[string]string{}),
+		workloadDisruptions:       newHistogramState(g, "scheduler_preemption_workload_disruptions", map[string]string{"preemptor": preemptorLabel}),
+		pdbViolations:             newCounterState(g, "scheduler_preemption_pdb_violations_total", map[string]string{}, "preemptor", preemptorLabel),
+		executionDuration:         newHistogramState(g, "scheduler_preemption_execution_duration_seconds", map[string]string{"preemptor": preemptorLabel, "result": result}),
+		goroutinesDuration:        newHistogramState(g, "scheduler_preemption_goroutines_duration_seconds", map[string]string{"result": result}),
+		goroutinesExecutionTotal:  newCounterState(g, "scheduler_preemption_goroutines_execution_total", map[string]string{}, "result", result),
+	}
+}
+
+func TestPreemptionMetricsObservationInvariants(t *testing.T) {
+	nodeName := "node1"
+
+	tests := []struct {
+		name          string
+		preemptorType fwk.EntityKeyType
+	}{
+		{
+			name:          "Pod preemptor",
+			preemptorType: fwk.PodKeyType,
+		},
+		{
+			name:          "PodGroup preemptor",
+			preemptorType: fwk.PodGroupKeyType,
+		},
+		{
+			name:          "CompositePodGroup preemptor",
+			preemptorType: fwk.CompositePodGroupKeyType,
+		},
+	}
+
+	for _, tt := range tests {
+		for _, async := range []bool{false, true} {
+			for _, injectDeletionError := range []bool{false, true} {
+				expectedResult := "success"
+				if injectDeletionError {
+					expectedResult = "error"
+				}
+				testName := fmt.Sprintf("%s (async=%v, result=%s)", tt.name, async, expectedResult)
+				t.Run(testName, func(t *testing.T) {
+					featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+						features.GenericWorkload:                 true,
+						features.TopologyAwareWorkloadScheduling: true,
+						features.CompositePodGroup:               true,
+					})
+
+					testRegistry := componentmetrics.NewKubeRegistry()
+					testRegistry.MustRegister(
+						metrics.PreemptionVictims,
+						metrics.WorkloadPreemptionVictims,
+						metrics.PreemptionWorkloadDisruptions,
+						metrics.PreemptionPDBViolations,
+						metrics.PreemptionExecutionDuration,
+						metrics.PreemptionGoroutinesDuration,
+						metrics.PreemptionGoroutinesExecutionTotal,
+					)
+
+					_, ctx := ktesting.NewTestContext(t)
+					ctx, cancel := context.WithCancel(ctx)
+					defer cancel()
+
+					victim1 := st.MakePod().Name("v1").UID("v1").Node(nodeName).Priority(lowPriority).Obj()
+					victim2 := st.MakePod().Name("v2").UID("v2").Node(nodeName).Priority(lowPriority).Obj()
+					preemptorPod := st.MakePod().Name("preemptor").UID("preemptor").Priority(highPriority).Obj()
+
+					cs := clientsetfake.NewClientset(victim1, victim2, preemptorPod)
+					if injectDeletionError {
+						cs.PrependReactor("delete", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+							return true, nil, errors.New("delete failed")
+						})
+					}
+
+					informerFactory := informers.NewSharedInformerFactory(cs, 0)
+					eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: cs.EventsV1()})
+					queue := internalqueue.NewSchedulingQueue(nil, informerFactory)
+
+					schedFramework, err := tf.NewFramework(
+						ctx,
+						[]tf.RegisterPluginFunc{
+							tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+							tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+						},
+						"",
+						frameworkruntime.WithClientSet(cs),
+						frameworkruntime.WithInformerFactory(informerFactory),
+						frameworkruntime.WithWaitingPods(frameworkruntime.NewWaitingPodsMap()),
+						frameworkruntime.WithPodsInPreBind(frameworkruntime.NewPodsInPreBindMap()),
+						frameworkruntime.WithSnapshotSharedLister(internalcache.NewSnapshot([]*v1.Pod{victim1, victim2}, []*v1.Node{st.MakeNode().Name(nodeName).Capacity(veryLargeRes).Obj()})),
+						frameworkruntime.WithEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, "test-scheduler")),
+						frameworkruntime.WithPodNominator(queue),
+						frameworkruntime.WithPodActivator(queue),
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					informerFactory.Start(ctx.Done())
+
+					executor := NewExecutor(schedFramework, feature.Features{EnableAsyncPreemption: async})
+
+					var preemptor ExecutorPreemptor
+					switch tt.preemptorType {
+					case fwk.PodKeyType:
+						preemptor = &podExecutorPreemptor{Pod: preemptorPod}
+					case fwk.PodGroupKeyType:
+						pg := st.MakePodGroup().Name("pg1").Namespace("default").UID("pg1").Obj()
+						pgInfo := &framework.PodGroupInfo{GenericPodGroup: fwk.NewGenericPodGroup(pg)}
+						preemptor = &podGroupExecutorPreemptor{PodGroupInfo: pgInfo, pods: []*v1.Pod{preemptorPod}}
+					case fwk.CompositePodGroupKeyType:
+						cpg := &schedulingv1alpha3.CompositePodGroup{ObjectMeta: metav1.ObjectMeta{Name: "cpg1", Namespace: "default", UID: "cpg1"}}
+						pgInfo := &framework.PodGroupInfo{GenericPodGroup: fwk.NewGenericCompositePodGroup(cpg)}
+						preemptor = &podGroupExecutorPreemptor{PodGroupInfo: pgInfo, pods: []*v1.Pod{preemptorPod}}
+					}
+
+					cand := &candidate{
+						name: nodeName,
+						victims: &extenderv1.Victims{
+							Pods:             []*v1.Pod{victim1, victim2},
+							NumPDBViolations: 1,
+						},
+						numPodGroupDisruptions: 1,
+					}
+
+					before := captureFullPreemptionMetricsState(testRegistry, tt.preemptorType, expectedResult)
+
+					if async {
+						executor.prepareCandidateAsync(cand, preemptor, "test-plugin")
+						err := wait.PollUntilContextTimeout(ctx, time.Millisecond*50, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+							executor.mu.Lock()
+							defer executor.mu.Unlock()
+							return len(executor.preempting) == 0, nil
+						})
+						if err != nil {
+							t.Fatal("async preemption did not complete in time")
+						}
+					} else {
+						executor.prepareCandidate(ctx, cand, preemptor, "test-plugin")
+					}
+
+					after := captureFullPreemptionMetricsState(testRegistry, tt.preemptorType, expectedResult)
+
+					numVictims := float64(len(cand.Victims().Pods))
+					numPDBViolations := float64(cand.Victims().NumPDBViolations)
+					numDisruptions := float64(cand.NumPodGroupDisruptions())
+
+					if tt.preemptorType == fwk.PodKeyType {
+						after.preemptionVictims.assertDelta(t, before.preemptionVictims, 1, numVictims)
+						after.workloadPreemptionVictims.assertDelta(t, before.workloadPreemptionVictims, 0, 0)
+					} else {
+						after.workloadPreemptionVictims.assertDelta(t, before.workloadPreemptionVictims, 1, numVictims)
+						after.preemptionVictims.assertDelta(t, before.preemptionVictims, 0, 0)
+					}
+
+					after.workloadDisruptions.assertDelta(t, before.workloadDisruptions, 1, numDisruptions)
+					after.pdbViolations.assertDelta(t, before.pdbViolations, numPDBViolations)
+					after.executionDuration.assertDelta(t, before.executionDuration, 1, after.executionDuration.sum-before.executionDuration.sum)
+
+					if async {
+						after.goroutinesExecutionTotal.assertDelta(t, before.goroutinesExecutionTotal, 1)
+						after.goroutinesDuration.assertDelta(t, before.goroutinesDuration, 1, after.goroutinesDuration.sum-before.goroutinesDuration.sum)
+					} else {
+						after.goroutinesExecutionTotal.assertDelta(t, before.goroutinesExecutionTotal, 0)
+						after.goroutinesDuration.assertDelta(t, before.goroutinesDuration, 0, 0)
+					}
+				})
+			}
+		}
+	}
+}
