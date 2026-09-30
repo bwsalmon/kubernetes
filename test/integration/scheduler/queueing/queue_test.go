@@ -35,14 +35,17 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
 	"k8s.io/klog/v2"
 	configv1 "k8s.io/kube-scheduler/config/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler"
 	configtesting "k8s.io/kubernetes/pkg/scheduler/apis/config/testing"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -664,5 +667,120 @@ func TestCoreResourceEnqueue(t *testing.T) {
 		t.Run(strings.Join(append(tt.EnablePlugins, tt.Name), "/"), func(t *testing.T) {
 			RunTestCoreResourceEnqueue(t, tt)
 		})
+	}
+}
+
+type queueSkipVictimFilterPlugin struct {
+	nameOfVictimPod string
+}
+
+func (pl *queueSkipVictimFilterPlugin) Name() string {
+	return "queueSkipVictimFilterPlugin"
+}
+
+func (pl *queueSkipVictimFilterPlugin) EventsToRegister(context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return []fwk.ClusterEventWithHint{
+		{
+			Event: fwk.ClusterEvent{Resource: fwk.Pod, ActionType: fwk.Delete},
+			QueueingHintFn: func(_ klog.Logger, _ *v1.Pod, _, _ interface{}) (fwk.QueueingHint, error) {
+				// Simulate fine-grained QueueingHint dropping/skipping PodDelete events.
+				return fwk.QueueSkip, nil
+			},
+		},
+	}, nil
+}
+
+func (pl *queueSkipVictimFilterPlugin) Filter(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
+	for _, scheduledPod := range nodeInfo.GetPods() {
+		if strings.Contains(scheduledPod.GetPod().Name, pl.nameOfVictimPod) {
+			return fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("node %s has blocking victim pod %s", nodeInfo.Node().Name, scheduledPod.GetPod().Name))
+		}
+	}
+	return nil
+}
+
+var _ fwk.FilterPlugin = &queueSkipVictimFilterPlugin{}
+var _ fwk.EnqueueExtensions = &queueSkipVictimFilterPlugin{}
+
+// TestSchedulingQueue_GatedPreemptorFlushRecovery verifies KEP-5142 behavior:
+// In an async preemption scenario where normal victim deletion events are not delivered to the queue
+// (simulated by a QueueingHint returning QueueSkip for PodDelete), the fallback periodic queue flush
+// timer (PodMaxInUnschedulablePodsDuration) acts as a recovery mechanism, flushing the gated preemptor
+// and allowing it to successfully schedule and bind once the victim is gone.
+func TestSchedulingQueue_GatedPreemptorFlushRecovery(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.SchedulerAsyncPreemption: true,
+	})
+
+	registry := frameworkruntime.Registry{
+		"queueSkipVictimFilterPlugin": func(_ context.Context, _ runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
+			return &queueSkipVictimFilterPlugin{
+				nameOfVictimPod: "victim-pod",
+			}, nil
+		},
+	}
+
+	cfg := configtesting.V1ToInternalWithDefaults(t, configv1.KubeSchedulerConfiguration{
+		Profiles: []configv1.KubeSchedulerProfile{{
+			SchedulerName: ptr.To(v1.DefaultSchedulerName),
+			Plugins: &configv1.Plugins{
+				MultiPoint: configv1.PluginSet{
+					Enabled: []configv1.Plugin{
+						{Name: "queueSkipVictimFilterPlugin"},
+					},
+					Disabled: []configv1.Plugin{
+						{Name: names.NodeResourcesFit},
+					},
+				},
+			},
+		}},
+	})
+
+	testCtx := testutils.InitTestSchedulerWithOptions(
+		t,
+		testutils.InitTestAPIServer(t, "preemptor-flush-recovery", nil),
+		0,
+		scheduler.WithPodInitialBackoffSeconds(1),
+		scheduler.WithPodMaxBackoffSeconds(2),
+		scheduler.WithPodMaxInUnschedulablePodsDuration(2*time.Second),
+		scheduler.WithProfiles(cfg.Profiles...),
+		scheduler.WithFrameworkOutOfTreeRegistry(registry),
+	)
+	testutils.SyncSchedulerInformerFactory(testCtx)
+
+	go testCtx.Scheduler.Run(testCtx.Ctx)
+
+	cs, ns, ctx := testCtx.ClientSet, testCtx.NS.Name, testCtx.Ctx
+	pause := imageutils.GetPauseImageName()
+
+	// 1. Create a single node.
+	node := st.MakeNode().Name("node-1").Capacity(map[v1.ResourceName]string{v1.ResourceCPU: "1000m"}).Obj()
+	if _, err := cs.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create Node %q: %v", node.Name, err)
+	}
+
+	// 2. Create low-priority victim pod and wait for it to be scheduled.
+	lowPriority := int32(100)
+	victimPod := st.MakePod().Namespace(ns).Name("victim-pod").Priority(lowPriority).ZeroTerminationGracePeriod().Container(pause).Obj()
+	if _, err := cs.CoreV1().Pods(ns).Create(ctx, victimPod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create victim pod: %v", err)
+	}
+	if err := wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, wait.ForeverTestTimeout, false, testutils.PodScheduled(cs, ns, victimPod.Name)); err != nil {
+		t.Fatalf("Failed waiting for victim pod to be scheduled: %v", err)
+	}
+
+	// 3. Create high-priority preemptor pod.
+	highPriority := int32(1000)
+	preemptorPod := st.MakePod().Namespace(ns).Name("preemptor-pod").Priority(highPriority).Container(pause).Obj()
+	if _, err := cs.CoreV1().Pods(ns).Create(ctx, preemptorPod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create preemptor pod: %v", err)
+	}
+
+	// 4. Preemptor pod should trigger preemption of the victim pod, but victim PodDelete event
+	// is skipped by queueSkipVictimFilterPlugin.QueueingHint.
+	// The periodic queue flush (PodMaxInUnschedulablePodsDuration = 2s) should recover the preemptor
+	// pod and schedule it on node-1 once the victim pod is gone.
+	if err := wait.PollUntilContextTimeout(ctx, 200*time.Millisecond, 30*time.Second, false, testutils.PodScheduled(cs, ns, preemptorPod.Name)); err != nil {
+		t.Fatalf("Expected preemptor pod to be scheduled via fallback flush recovery: %v", err)
 	}
 }
