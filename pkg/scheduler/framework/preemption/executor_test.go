@@ -1775,6 +1775,290 @@ func TestPrepareCandidateAsyncActivatesPreemptorAfterLastVictimInMemoryPreemptio
 	}
 }
 
+// TestPrepareCandidateAsync_MixedWaitingAndRunningVictims validates that the worker pool
+// isolates in-memory cancellations from API deletions, fires callbacks in order, and clears nominations.
+func TestPrepareCandidateAsync_MixedWaitingAndRunningVictims(t *testing.T) {
+	metrics.Register()
+	var (
+		defaultSchedulerName = "default-scheduler"
+		preemptorPod         = st.MakePod().Namespace("ns").Name("preemptor").UID("preemptor").
+					Priority(1000).SchedulerName(defaultSchedulerName).Obj()
+		runningVictim = st.MakePod().Namespace("ns").Name("running-victim").UID("running-victim").
+				Node("node1").Priority(100).SchedulerName(defaultSchedulerName).Obj()
+		waitingVictim = st.MakePod().Namespace("ns").Name("waiting-victim").UID("waiting-victim").
+				Node("node1").Priority(100).SchedulerName(defaultSchedulerName).Obj()
+		preBindVictim = st.MakePod().Namespace("ns").Name("prebind-victim").UID("prebind-victim").
+				Node("node1").Priority(100).SchedulerName(defaultSchedulerName).Obj()
+		lowPriorityNominatedPod = st.MakePod().Namespace("ns").Name("low-nominated-pod").UID("low-nominated-pod").
+					Priority(50).NominatedNodeName("node1").SchedulerName(defaultSchedulerName).Obj()
+		highPriorityNominatedPod = st.MakePod().Namespace("ns").Name("high-nominated-pod").UID("high-nominated-pod").
+					Priority(2000).NominatedNodeName("node1").SchedulerName(defaultSchedulerName).Obj()
+		otherNodeNominatedPod = st.MakePod().Namespace("ns").Name("other-node-nominated-pod").UID("other-node-nominated-pod").
+					Priority(50).NominatedNodeName("node2").SchedulerName(defaultSchedulerName).Obj()
+	)
+
+	tests := []struct {
+		name                  string
+		victims               []*v1.Pod
+		waitingVictimUIDs     []types.UID
+		preBindVictimUIDs     []types.UID
+		nominatedPods         []*v1.Pod
+		expectedAPIDeletions  []string // Pod names expected to have DELETE called
+		expectedAPIPatches    []string // Pod names expected to have status PATCH called (DisruptionTarget)
+		expectedClearedNoms   []string // Pod names expected to have nomination cleared (PATCH nominatedNodeName: null)
+		wantPreemptorActivate bool
+	}{
+		{
+			name:                  "Waiting victim (non-last) and running victim (last)",
+			victims:               []*v1.Pod{waitingVictim, runningVictim},
+			waitingVictimUIDs:     []types.UID{waitingVictim.UID},
+			nominatedPods:         []*v1.Pod{lowPriorityNominatedPod, highPriorityNominatedPod, otherNodeNominatedPod},
+			expectedAPIDeletions:  []string{runningVictim.Name},
+			expectedAPIPatches:    []string{runningVictim.Name},
+			expectedClearedNoms:   []string{lowPriorityNominatedPod.Name},
+			wantPreemptorActivate: false, // last victim was running pod (API deleted)
+		},
+		{
+			name:                  "Running victim (non-last) and waiting victim (last)",
+			victims:               []*v1.Pod{runningVictim, waitingVictim},
+			waitingVictimUIDs:     []types.UID{waitingVictim.UID},
+			nominatedPods:         []*v1.Pod{lowPriorityNominatedPod, highPriorityNominatedPod},
+			expectedAPIDeletions:  []string{runningVictim.Name},
+			expectedAPIPatches:    []string{runningVictim.Name},
+			expectedClearedNoms:   []string{lowPriorityNominatedPod.Name},
+			wantPreemptorActivate: true, // last victim was waiting pod (preempted in-memory)
+		},
+		{
+			name:                  "PreBind victim (non-last), waiting victim (non-last), running victim (last)",
+			victims:               []*v1.Pod{preBindVictim, waitingVictim, runningVictim},
+			waitingVictimUIDs:     []types.UID{waitingVictim.UID},
+			preBindVictimUIDs:     []types.UID{preBindVictim.UID},
+			nominatedPods:         []*v1.Pod{lowPriorityNominatedPod, otherNodeNominatedPod},
+			expectedAPIDeletions:  []string{runningVictim.Name},
+			expectedAPIPatches:    []string{runningVictim.Name},
+			expectedClearedNoms:   []string{lowPriorityNominatedPod.Name},
+			wantPreemptorActivate: false, // last victim was running pod
+		},
+		{
+			name:                  "Running victim (non-last) and preBind victim (last)",
+			victims:               []*v1.Pod{runningVictim, preBindVictim},
+			preBindVictimUIDs:     []types.UID{preBindVictim.UID},
+			nominatedPods:         []*v1.Pod{lowPriorityNominatedPod},
+			expectedAPIDeletions:  []string{runningVictim.Name},
+			expectedAPIPatches:    []string{runningVictim.Name},
+			expectedClearedNoms:   []string{lowPriorityNominatedPod.Name},
+			wantPreemptorActivate: true, // last victim was preBind pod (preempted in-memory)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			mu := &sync.RWMutex{}
+			fakeActivator := &fakePodActivator{activatedPods: make(map[string]*v1.Pod), mu: mu, activatedCh: make(chan struct{})}
+			podsInPreBind := frameworkruntime.NewPodsInPreBindMap()
+			waitingPods := frameworkruntime.NewWaitingPodsMap()
+			registeredPlugins := []tf.RegisterPluginFunc{
+				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+				tf.RegisterPermitPlugin(waitingPermitPluginName, newWaitingPermitPlugin),
+			}
+
+			preemptor := &podExecutorPreemptor{Pod: preemptorPod.DeepCopy()}
+
+			var (
+				actionsMu          sync.Mutex
+				actualAPIDeletions []string
+				actualAPIPatches   []string
+				actualClearedNoms  []string
+			)
+
+			objects := make([]runtime.Object, 0, len(tt.victims)+len(tt.nominatedPods)+1)
+			objects = append(objects, preemptorPod)
+			for _, pod := range tt.victims {
+				objects = append(objects, pod)
+			}
+			for _, pod := range tt.nominatedPods {
+				objects = append(objects, pod)
+			}
+
+			cs := clientsetfake.NewSimpleClientset(objects...)
+			cs.PrependReactor("*", "*", func(action clienttesting.Action) (bool, runtime.Object, error) {
+				actionsMu.Lock()
+				defer actionsMu.Unlock()
+				switch a := action.(type) {
+				case clienttesting.DeleteAction:
+					actualAPIDeletions = append(actualAPIDeletions, a.GetName())
+					return true, nil, nil
+				case clienttesting.PatchAction:
+					patchData := string(a.GetPatch())
+					if strings.Contains(patchData, `"nominatedNodeName":null`) || strings.Contains(patchData, `"nominatedNodeName": null`) || strings.Contains(patchData, `"nominatedNodeName":""`) {
+						actualClearedNoms = append(actualClearedNoms, a.GetName())
+					}
+					if strings.Contains(patchData, string(v1.DisruptionTarget)) {
+						actualAPIPatches = append(actualAPIPatches, a.GetName())
+					}
+					return true, &v1.Pod{}, nil
+				}
+				return false, nil, nil
+			})
+
+			informerFactory := informers.NewSharedInformerFactory(cs, 0)
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: cs.EventsV1()})
+
+			fakeNominator := &fakePodNominatorWithPods{
+				nominatedPods: tt.nominatedPods,
+			}
+
+			schedFwk, err := tf.NewFramework(
+				ctx,
+				registeredPlugins, "",
+				frameworkruntime.WithClientSet(cs),
+				frameworkruntime.WithSnapshotSharedLister(internalcache.NewSnapshot(tt.victims, []*v1.Node{st.MakeNode().Name("node1").Obj()})),
+				frameworkruntime.WithInformerFactory(informerFactory),
+				frameworkruntime.WithWaitingPods(waitingPods),
+				frameworkruntime.WithPodsInPreBind(podsInPreBind),
+				frameworkruntime.WithLogger(logger),
+				frameworkruntime.WithEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, "test-scheduler")),
+				frameworkruntime.WithPodActivator(fakeActivator),
+				frameworkruntime.WithPodNominator(fakeNominator),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			waitingUIDsSet := sets.New[types.UID](tt.waitingVictimUIDs...)
+			for _, v := range tt.victims {
+				if waitingUIDsSet.Has(v.UID) {
+					pluginsWaitTime, status := schedFwk.RunPermitPlugins(ctx, framework.NewCycleState(), v, "node1")
+					if !status.IsWait() {
+						t.Fatalf("Failed to add victim %s to waiting list", v.Name)
+					}
+					schedFwk.AddWaitingPod(v, pluginsWaitTime)
+				}
+			}
+
+			preBindUIDsSet := sets.New[types.UID](tt.preBindVictimUIDs...)
+			preBindContexts := make(map[types.UID]context.Context)
+			for _, v := range tt.victims {
+				if preBindUIDsSet.Has(v.UID) {
+					victimCtx, cancelVictim := context.WithCancelCause(context.Background())
+					preBindContexts[v.UID] = victimCtx
+					schedFwk.AddPodInPreBind(v.UID, cancelVictim)
+				}
+			}
+
+			executor := NewExecutor(schedFwk, feature.Features{EnableAsyncPreemption: true})
+			fakeActivator.isPreempting = func() bool {
+				executor.mu.RLock()
+				defer executor.mu.RUnlock()
+				return executor.preempting.Has(preemptor.UID())
+			}
+
+			candidate := &candidate{
+				name: "node1",
+				victims: &extenderv1.Victims{
+					Pods: tt.victims,
+				},
+			}
+			executor.prepareCandidateAsync(candidate, preemptor, "test-plugin")
+
+			if tt.wantPreemptorActivate {
+				select {
+				case <-fakeActivator.activatedCh:
+				case <-time.After(wait.ForeverTestTimeout):
+					t.Fatal("Timed out waiting for preemptor activation")
+				}
+			} else {
+				if err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+					executor.mu.RLock()
+					defer executor.mu.RUnlock()
+					return len(executor.preempting) == 0, nil
+				}); err != nil {
+					t.Fatalf("Timed out waiting for async preemption to finish: %v", err)
+				}
+			}
+
+			// Ensure cleanup has fully finished
+			if err := wait.PollUntilContextTimeout(ctx, 10*time.Millisecond, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+				executor.mu.RLock()
+				defer executor.mu.RUnlock()
+				return len(executor.preempting) == 0 && len(executor.lastVictimsPendingPreemption) == 0, nil
+			}); err != nil {
+				t.Fatalf("Timed out waiting for executor state cleanup: %v", err)
+			}
+
+			mu.RLock()
+			defer mu.RUnlock()
+			if fakeActivator.activatedWhilePreempting {
+				t.Fatal("Preemptor was activated before its preempting state was cleared")
+			}
+			wantActivatedPods := 0
+			if tt.wantPreemptorActivate {
+				wantActivatedPods = 1
+			}
+			if len(fakeActivator.activatedPods) != wantActivatedPods {
+				t.Fatalf("Activated pod count = %d, want %d; activated pods: %v", len(fakeActivator.activatedPods), wantActivatedPods, fakeActivator.activatedPods)
+			}
+
+			actionsMu.Lock()
+			defer actionsMu.Unlock()
+
+			// Check API deletions
+			if diff := cmp.Diff(tt.expectedAPIDeletions, actualAPIDeletions); diff != "" {
+				t.Fatalf("API deletions mismatch (-want +got):\n%s", diff)
+			}
+
+			// Check API patches (DisruptionTarget)
+			if diff := cmp.Diff(tt.expectedAPIPatches, actualAPIPatches); diff != "" {
+				t.Fatalf("API patches mismatch (-want +got):\n%s", diff)
+			}
+
+			// Check cleared nominations
+			if diff := cmp.Diff(tt.expectedClearedNoms, actualClearedNoms); diff != "" {
+				t.Fatalf("Cleared nominations mismatch (-want +got):\n%s", diff)
+			}
+
+			// Verify prebind contexts were canceled
+			for uid, vCtx := range preBindContexts {
+				if vCtx.Err() == nil {
+					t.Fatalf("Expected prebind victim UID %s context to be canceled", uid)
+				}
+			}
+
+			// Verify waiting pods were preempted in memory (Preempt() returns false when already done)
+			for _, uid := range tt.waitingVictimUIDs {
+				wp := schedFwk.GetWaitingPod(uid)
+				if wp == nil {
+					t.Fatalf("Expected waiting victim UID %s to exist in waitingPods", uid)
+				}
+				if wp.Preempt("test-plugin", "test") {
+					t.Fatalf("Expected waiting victim UID %s to already have been preempted (done=true)", uid)
+				}
+			}
+		})
+	}
+}
+
+type fakePodNominatorWithPods struct {
+	internalqueue.SchedulingQueue
+	nominatedPods []*v1.Pod
+}
+
+func (f *fakePodNominatorWithPods) NominatedPodsForNode(logger klog.Logger, nodeName string) []fwk.PodInfo {
+	var result []fwk.PodInfo
+	for _, p := range f.nominatedPods {
+		if p.Status.NominatedNodeName == nodeName {
+			pi, _ := framework.NewPodInfo(p)
+			result = append(result, pi)
+		}
+	}
+	return result
+}
+
 // waitingPermitPlugin is a PermitPlugin that always returns Wait.
 type waitingPermitPlugin struct{}
 
@@ -2344,5 +2628,187 @@ func TestIsPodGroupWaitingForVictims(t *testing.T) {
 				t.Errorf("IsPodGroupWaitingForVictims() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+type fullPreemptionMetricsState struct {
+	workloadPreemptionVictims histogramState
+	preemptionVictims         histogramState
+	workloadDisruptions       histogramState
+	pdbViolations             counterState
+	executionDuration         histogramState
+	goroutinesDuration        histogramState
+	goroutinesExecutionTotal  counterState
+}
+
+func captureFullPreemptionMetricsState(g componentmetrics.Gatherer, preemptorType fwk.EntityKeyType, result string) fullPreemptionMetricsState {
+	preemptorLabel := metrics.EntityTypeToLabel(preemptorType)
+	return fullPreemptionMetricsState{
+		workloadPreemptionVictims: newHistogramState(g, "scheduler_workload_preemption_victims", map[string]string{}),
+		preemptionVictims:         newHistogramState(g, "scheduler_preemption_victims", map[string]string{}),
+		workloadDisruptions:       newHistogramState(g, "scheduler_preemption_workload_disruptions", map[string]string{"preemptor": preemptorLabel}),
+		pdbViolations:             newCounterState(g, "scheduler_preemption_pdb_violations_total", map[string]string{}, "preemptor", preemptorLabel),
+		executionDuration:         newHistogramState(g, "scheduler_preemption_execution_duration_seconds", map[string]string{"preemptor": preemptorLabel, "result": result}),
+		goroutinesDuration:        newHistogramState(g, "scheduler_preemption_goroutines_duration_seconds", map[string]string{"result": result}),
+		goroutinesExecutionTotal:  newCounterState(g, "scheduler_preemption_goroutines_execution_total", map[string]string{}, "result", result),
+	}
+}
+
+func TestPreemptionMetricsObservationInvariants(t *testing.T) {
+	nodeName := "node1"
+
+	tests := []struct {
+		name          string
+		preemptorType fwk.EntityKeyType
+	}{
+		{
+			name:          "Pod preemptor",
+			preemptorType: fwk.PodKeyType,
+		},
+		{
+			name:          "PodGroup preemptor",
+			preemptorType: fwk.PodGroupKeyType,
+		},
+		{
+			name:          "CompositePodGroup preemptor",
+			preemptorType: fwk.CompositePodGroupKeyType,
+		},
+	}
+
+	for _, tt := range tests {
+		for _, async := range []bool{false, true} {
+			for _, injectDeletionError := range []bool{false, true} {
+				expectedResult := "success"
+				if injectDeletionError {
+					expectedResult = "error"
+				}
+				testName := fmt.Sprintf("%s (async=%v, result=%s)", tt.name, async, expectedResult)
+				t.Run(testName, func(t *testing.T) {
+					featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+						features.GenericWorkload:                 true,
+						features.TopologyAwareWorkloadScheduling: true,
+						features.CompositePodGroup:               true,
+					})
+
+					testRegistry := componentmetrics.NewKubeRegistry()
+					testRegistry.MustRegister(
+						metrics.PreemptionVictims,
+						metrics.WorkloadPreemptionVictims,
+						metrics.PreemptionWorkloadDisruptions,
+						metrics.PreemptionPDBViolations,
+						metrics.PreemptionExecutionDuration,
+						metrics.PreemptionGoroutinesDuration,
+						metrics.PreemptionGoroutinesExecutionTotal,
+					)
+
+					_, ctx := ktesting.NewTestContext(t)
+					ctx, cancel := context.WithCancel(ctx)
+					defer cancel()
+
+					victim1 := st.MakePod().Name("v1").UID("v1").Node(nodeName).Priority(lowPriority).Obj()
+					victim2 := st.MakePod().Name("v2").UID("v2").Node(nodeName).Priority(lowPriority).Obj()
+					preemptorPod := st.MakePod().Name("preemptor").UID("preemptor").Priority(highPriority).Obj()
+
+					cs := clientsetfake.NewClientset(victim1, victim2, preemptorPod)
+					if injectDeletionError {
+						cs.PrependReactor("delete", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+							return true, nil, errors.New("delete failed")
+						})
+					}
+
+					informerFactory := informers.NewSharedInformerFactory(cs, 0)
+					eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: cs.EventsV1()})
+					queue := internalqueue.NewSchedulingQueue(nil, informerFactory)
+
+					schedFramework, err := tf.NewFramework(
+						ctx,
+						[]tf.RegisterPluginFunc{
+							tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+							tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+						},
+						"",
+						frameworkruntime.WithClientSet(cs),
+						frameworkruntime.WithInformerFactory(informerFactory),
+						frameworkruntime.WithWaitingPods(frameworkruntime.NewWaitingPodsMap()),
+						frameworkruntime.WithPodsInPreBind(frameworkruntime.NewPodsInPreBindMap()),
+						frameworkruntime.WithSnapshotSharedLister(internalcache.NewSnapshot([]*v1.Pod{victim1, victim2}, []*v1.Node{st.MakeNode().Name(nodeName).Capacity(veryLargeRes).Obj()})),
+						frameworkruntime.WithEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, "test-scheduler")),
+						frameworkruntime.WithPodNominator(queue),
+						frameworkruntime.WithPodActivator(queue),
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					informerFactory.Start(ctx.Done())
+
+					executor := NewExecutor(schedFramework, feature.Features{EnableAsyncPreemption: async})
+
+					var preemptor ExecutorPreemptor
+					switch tt.preemptorType {
+					case fwk.PodKeyType:
+						preemptor = &podExecutorPreemptor{Pod: preemptorPod}
+					case fwk.PodGroupKeyType:
+						pg := st.MakePodGroup().Name("pg1").Namespace("default").UID("pg1").Obj()
+						pgInfo := &framework.PodGroupInfo{GenericPodGroup: fwk.NewGenericPodGroup(pg)}
+						preemptor = &podGroupExecutorPreemptor{PodGroupInfo: pgInfo, pods: []*v1.Pod{preemptorPod}}
+					case fwk.CompositePodGroupKeyType:
+						cpg := &schedulingv1alpha3.CompositePodGroup{ObjectMeta: metav1.ObjectMeta{Name: "cpg1", Namespace: "default", UID: "cpg1"}}
+						pgInfo := &framework.PodGroupInfo{GenericPodGroup: fwk.NewGenericCompositePodGroup(cpg)}
+						preemptor = &podGroupExecutorPreemptor{PodGroupInfo: pgInfo, pods: []*v1.Pod{preemptorPod}}
+					}
+
+					cand := &candidate{
+						name: nodeName,
+						victims: &extenderv1.Victims{
+							Pods:             []*v1.Pod{victim1, victim2},
+							NumPDBViolations: 1,
+						},
+						numPodGroupDisruptions: 1,
+					}
+
+					before := captureFullPreemptionMetricsState(testRegistry, tt.preemptorType, expectedResult)
+
+					if async {
+						executor.prepareCandidateAsync(cand, preemptor, "test-plugin")
+						err := wait.PollUntilContextTimeout(ctx, time.Millisecond*50, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+							executor.mu.Lock()
+							defer executor.mu.Unlock()
+							return len(executor.preempting) == 0, nil
+						})
+						if err != nil {
+							t.Fatal("async preemption did not complete in time")
+						}
+					} else {
+						executor.prepareCandidate(ctx, cand, preemptor, "test-plugin")
+					}
+
+					after := captureFullPreemptionMetricsState(testRegistry, tt.preemptorType, expectedResult)
+
+					numVictims := float64(len(cand.Victims().Pods))
+					numPDBViolations := float64(cand.Victims().NumPDBViolations)
+					numDisruptions := float64(cand.NumPodGroupDisruptions())
+
+					if tt.preemptorType == fwk.PodKeyType {
+						after.preemptionVictims.assertDelta(t, before.preemptionVictims, 1, numVictims)
+						after.workloadPreemptionVictims.assertDelta(t, before.workloadPreemptionVictims, 0, 0)
+					} else {
+						after.workloadPreemptionVictims.assertDelta(t, before.workloadPreemptionVictims, 1, numVictims)
+						after.preemptionVictims.assertDelta(t, before.preemptionVictims, 0, 0)
+					}
+
+					after.workloadDisruptions.assertDelta(t, before.workloadDisruptions, 1, numDisruptions)
+					after.pdbViolations.assertDelta(t, before.pdbViolations, numPDBViolations)
+					after.executionDuration.assertDelta(t, before.executionDuration, 1, after.executionDuration.sum-before.executionDuration.sum)
+
+					if async {
+						after.goroutinesExecutionTotal.assertDelta(t, before.goroutinesExecutionTotal, 1)
+						after.goroutinesDuration.assertDelta(t, before.goroutinesDuration, 1, after.goroutinesDuration.sum-before.goroutinesDuration.sum)
+					} else {
+						after.goroutinesExecutionTotal.assertDelta(t, before.goroutinesExecutionTotal, 0)
+						after.goroutinesDuration.assertDelta(t, before.goroutinesDuration, 0, 0)
+					}
+				})
+			}
+		}
 	}
 }

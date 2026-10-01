@@ -151,6 +151,30 @@ type Step struct {
 	// WaitForPodsDeleted waits for the specified pods to be deleted from the cluster.
 	// The value is the array of Pod indexes representing the order of Pod creation.
 	WaitForPodsDeleted []int
+	// DeletePod deletes the pod with the given name from the cluster.
+	DeletePod string
+	// MutatePod applies a mutation function to a pod or cluster resource.
+	MutatePod func(testCtx *testutils.TestContext, t *testing.T, cs kubernetes.Interface, createdPods []*v1.Pod)
+	// VerifyNominatedNodeName checks if a pod has the expected NominatedNodeName.
+	VerifyNominatedNodeName *VerifyNominatedNodeName
+	// VerifyPodRunningPreemption verifies if the given pod index is or is not running preemption.
+	VerifyPodRunningPreemption *VerifyPodRunningPreemption
+	// VerifyPodsNotDeleted asserts that the specified pods by index still exist and have not been deleted.
+	VerifyPodsNotDeleted []int
+	// CustomStep executes arbitrary custom test logic.
+	CustomStep func(testCtx *testutils.TestContext, t *testing.T, config *AsyncPreemptionStepRunnerConfig)
+}
+
+// VerifyNominatedNodeName verifies that the given pod has the expected NominatedNodeName.
+type VerifyNominatedNodeName struct {
+	PodName          string
+	ExpectedNodeName string
+}
+
+// VerifyPodRunningPreemption verifies if the given pod index is or is not running preemption.
+type VerifyPodRunningPreemption struct {
+	PodIndex int
+	Expected bool
 }
 
 // AsyncPreemptionStepRunnerConfig is a configuration for running async preemption test steps.
@@ -194,17 +218,36 @@ func RunAsyncPreemptionSteps(testCtx *testutils.TestContext, t *testing.T, steps
 			testCtx.Scheduler.SchedulingQueue.MoveAllToActiveOrBackoffQueue(config.Logger, framework.EventUnschedulableTimeout, nil, nil, nil)
 		case len(step.WaitForPodsDeleted) != 0:
 			waitForPodsDeleted(testCtx, t, step.WaitForPodsDeleted, config.CreatedPods, config.ClientSet)
+		case step.DeletePod != "":
+			deletePod(testCtx, t, step.DeletePod, config.ClientSet)
+		case step.MutatePod != nil:
+			step.MutatePod(testCtx, t, config.ClientSet, config.CreatedPods)
+		case step.VerifyNominatedNodeName != nil:
+			verifyNominatedNodeName(testCtx, t, config.ClientSet, step.VerifyNominatedNodeName)
+		case step.VerifyPodRunningPreemption != nil:
+			verifyPodRunningPreemption(testCtx, t, config.CreatedPods, step.VerifyPodRunningPreemption, config.PreemptionPlugin)
+		case len(step.VerifyPodsNotDeleted) != 0:
+			verifyPodsNotDeleted(testCtx, t, step.VerifyPodsNotDeleted, config.CreatedPods, config.ClientSet)
+		case step.CustomStep != nil:
+			step.CustomStep(testCtx, t, &config)
 		}
 	}
 }
 
+// PreemptPodHookFn allows intercepting PreemptPod calls during async preemption tests.
+// If handled is true, the hook's return values are used directly without calling the default implementation.
+type PreemptPodHookFn func(ctx context.Context, c fwk.PreemptionCandidate, preemptor preemption.ExecutorPreemptor, victim *v1.Pod, pluginName string) (bool, error, bool)
+
 // AsyncPreemptionTestConfig is a config for initialising the environment for async preemption tests.
 type AsyncPreemptionTestConfig struct {
-	EnableGenericWorkload  bool
-	PreemptionDoneChannels *sync.Map
-	BlockBindingChannel    chan struct{}
-	InitialBackoffSeconds  int64
-	MaxBackoffSeconds      int64
+	EnableGenericWorkload                              bool
+	EnableInPlacePodVerticalScalingSchedulerPreemption bool
+	PreemptionDoneChannels                             *sync.Map
+	BlockBindingChannel                                chan struct{}
+	InitialBackoffSeconds                              int64
+	MaxBackoffSeconds                                  int64
+	PreemptPodHook                                     PreemptPodHookFn
+	PodsToBlock                                        map[string]*BlockedPod
 }
 
 // InitTestForAsyncPreemption initializes the test environment for async preemption tests.
@@ -215,11 +258,15 @@ func InitTestForAsyncPreemption(t *testing.T, config AsyncPreemptionTestConfig) 
 		features.SchedulerAsyncPreemption: true,
 		features.GenericWorkload:          config.EnableGenericWorkload,
 	}
+	if config.EnableInPlacePodVerticalScalingSchedulerPreemption {
+		featuresOverrides[features.InPlacePodVerticalScaling] = true
+		featuresOverrides[features.InPlacePodVerticalScalingSchedulerPreemption] = true
+	}
 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuresOverrides)
 
 	registry := make(frameworkruntime.Registry)
 	// We need to use a custom preemption plugin to test async preemption behavior
-	delayedPreemptionPluginName, getPreemptionPlugin, err := registerDelayedPreemptionPlugin(&registry, config.PreemptionDoneChannels, config.EnableGenericWorkload)
+	delayedPreemptionPluginName, getPreemptionPlugin, err := registerDelayedPreemptionPlugin(&registry, config.PreemptionDoneChannels, config.EnableGenericWorkload, config.EnableInPlacePodVerticalScalingSchedulerPreemption, config.PreemptPodHook)
 	if err != nil {
 		t.Fatalf("Error registering a preemption plugin: %v", err)
 	}
@@ -239,17 +286,29 @@ func InitTestForAsyncPreemption(t *testing.T, config AsyncPreemptionTestConfig) 
 		t.Fatalf("Error registering a queueSkipFilterPlugin plugin: %v", err)
 	}
 
+	enabledPlugins := []configv1.Plugin{
+		{Name: blockingBindPluginName},
+		{Name: delayedPreemptionPluginName},
+		{Name: reservingPluginName},
+		{Name: queueSkipFilterPluginName},
+	}
+
+	if len(config.PodsToBlock) > 0 {
+		err := registry.Register(BlockingPermitPluginName, func(ctx context.Context, o runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
+			return NewBlockingPermitPlugin(ctx, o, fh, config.PodsToBlock), nil
+		})
+		if err != nil {
+			t.Fatalf("Error registering a blocking permit plugin: %v", err)
+		}
+		enabledPlugins = append(enabledPlugins, configv1.Plugin{Name: BlockingPermitPluginName})
+	}
+
 	cfg := configtesting.V1ToInternalWithDefaults(t, configv1.KubeSchedulerConfiguration{
 		Profiles: []configv1.KubeSchedulerProfile{{
 			SchedulerName: new(v1.DefaultSchedulerName),
 			Plugins: &configv1.Plugins{
 				MultiPoint: configv1.PluginSet{
-					Enabled: []configv1.Plugin{
-						{Name: blockingBindPluginName},
-						{Name: delayedPreemptionPluginName},
-						{Name: reservingPluginName},
-						{Name: queueSkipFilterPluginName},
-					},
+					Enabled: enabledPlugins,
 					Disabled: []configv1.Plugin{
 						{Name: names.DefaultPreemption},
 						{Name: names.DefaultBinder},
@@ -321,11 +380,15 @@ func registerBlockBindingPlugin(registry frameworkruntime.Registry, blockBinding
 }
 
 // registerDelayedPreemptionPlugin register a custom preemption plugin to test async preemption behavior.
-func registerDelayedPreemptionPlugin(registry *frameworkruntime.Registry, preemptionDoneChannels *sync.Map, enableGenericWorkload bool) (string, func() *defaultpreemption.DefaultPreemption, error) {
+func registerDelayedPreemptionPlugin(registry *frameworkruntime.Registry, preemptionDoneChannels *sync.Map, enableGenericWorkload bool, enableInPlacePodVerticalScalingSchedulerPreemption bool, preemptPodHook PreemptPodHookFn) (string, func() *defaultpreemption.DefaultPreemption, error) {
 	delayedPreemptionPluginName := "delay-preemption"
 	var preemptionPlugin *defaultpreemption.DefaultPreemption
 	err := registry.Register(delayedPreemptionPluginName, func(c context.Context, r runtime.Object, fh fwk.Handle) (fwk.Plugin, error) {
-		p, err := frameworkruntime.FactoryAdapter(plfeature.Features{EnableAsyncPreemption: true, EnableGenericWorkload: enableGenericWorkload}, defaultpreemption.New)(c, &config.DefaultPreemptionArgs{
+		p, err := frameworkruntime.FactoryAdapter(plfeature.Features{
+			EnableAsyncPreemption:                              true,
+			EnableGenericWorkload:                              enableGenericWorkload,
+			EnableInPlacePodVerticalScalingSchedulerPreemption: enableInPlacePodVerticalScalingSchedulerPreemption,
+		}, defaultpreemption.New)(c, &config.DefaultPreemptionArgs{
 			// Set default values to pass the validation at the initialization, not related to the test.
 			MinCandidateNodesPercentage: 10,
 			MinCandidateNodesAbsolute:   100,
@@ -347,10 +410,22 @@ func registerDelayedPreemptionPlugin(registry *frameworkruntime.Registry, preemp
 
 		preemptPodFn := exec.PreemptPod
 		exec.PreemptPod = func(ctx context.Context, c fwk.PreemptionCandidate, preemptor preemption.ExecutorPreemptor, victim *v1.Pod, pluginName string) (bool, error) {
+			if preemptPodHook != nil {
+				preemptedInMemory, err, handled := preemptPodHook(ctx, c, preemptor, victim, pluginName)
+				if handled {
+					return preemptedInMemory, err
+				}
+			}
 			// block the preemption goroutine to complete until the test case allows it to proceed.
-			ch, ok := preemptionDoneChannels.Load(preemptor.GetName())
-			if ok {
-				<-ch.(chan struct{})
+			if preemptionDoneChannels != nil {
+				ch, ok := preemptionDoneChannels.Load(preemptor.GetName())
+				if ok {
+					select {
+					case <-ch.(chan struct{}):
+					case <-ctx.Done():
+						return false, ctx.Err()
+					}
+				}
 			}
 			return preemptPodFn(ctx, c, preemptor, victim, pluginName)
 		}
@@ -358,6 +433,58 @@ func registerDelayedPreemptionPlugin(registry *frameworkruntime.Registry, preemp
 		return preemptionPlugin, nil
 	})
 	return delayedPreemptionPluginName, func() *defaultpreemption.DefaultPreemption { return preemptionPlugin }, err
+}
+
+func deletePod(testCtx *testutils.TestContext, t *testing.T, podName string, cs kubernetes.Interface) {
+	if err := cs.CoreV1().Pods(testCtx.NS.Name).Delete(testCtx.Ctx, podName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("Failed to delete pod %s: %v", podName, err)
+	}
+}
+
+func verifyNominatedNodeName(testCtx *testutils.TestContext, t *testing.T, cs kubernetes.Interface, step *VerifyNominatedNodeName) {
+	if err := wait.PollUntilContextTimeout(testCtx.Ctx, 50*time.Millisecond, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+		pod, err := cs.CoreV1().Pods(testCtx.NS.Name).Get(ctx, step.PodName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		if pod.Status.NominatedNodeName == step.ExpectedNodeName {
+			return true, nil
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatalf("Expected pod %s to have NominatedNodeName %q, but failed waiting: %v", step.PodName, step.ExpectedNodeName, err)
+	}
+}
+
+func verifyPodRunningPreemption(testCtx *testutils.TestContext, t *testing.T, createdPods []*v1.Pod, step *VerifyPodRunningPreemption, preemptionPlugin *defaultpreemption.DefaultPreemption) {
+	if err := wait.PollUntilContextTimeout(testCtx.Ctx, time.Millisecond*50, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+		pod := createdPods[step.PodIndex]
+		var isRunning bool
+		if pod.Spec.SchedulingGroup != nil && pod.Spec.SchedulingGroup.PodGroupName != nil {
+			pg, err := testCtx.InformerFactory.Scheduling().V1beta1().PodGroups().Lister().PodGroups(pod.Namespace).Get(*pod.Spec.SchedulingGroup.PodGroupName)
+			if err == nil {
+				isRunning = preemptionPlugin.Executor.IsPodGroupRunningPreemption(pg.UID)
+			}
+		} else {
+			isRunning = preemptionPlugin.Executor.IsPodRunningPreemption(pod.GetUID())
+		}
+		return isRunning == step.Expected, nil
+	}); err != nil {
+		t.Fatalf("Expected pod %s running preemption to be %v: %v", createdPods[step.PodIndex].Name, step.Expected, err)
+	}
+}
+
+func verifyPodsNotDeleted(testCtx *testutils.TestContext, t *testing.T, podIndexes []int, createdPods []*v1.Pod, cs kubernetes.Interface) {
+	for _, podIndex := range podIndexes {
+		podName := createdPods[podIndex].Name
+		pod, err := cs.CoreV1().Pods(testCtx.NS.Name).Get(testCtx.Ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Expected pod %s to still exist, but got error: %v", podName, err)
+		}
+		if pod.DeletionTimestamp != nil {
+			t.Fatalf("Expected pod %s to not be terminating, but DeletionTimestamp is %v", podName, pod.DeletionTimestamp)
+		}
+	}
 }
 
 func waitForPodsDeleted(testCtx *testutils.TestContext, t *testing.T, podIndexes []int, createdPods []*v1.Pod, cs kubernetes.Interface) {

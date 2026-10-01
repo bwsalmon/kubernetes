@@ -701,3 +701,128 @@ func TestBatchRescoreChain(t *testing.T) {
 		t.Fatalf("remaining node after pod3: got %q, want %q", got, "n1")
 	}
 }
+
+// TestPodSignaturePreemptionCandidateInvalidation verifies that nominating a preemptor
+// invalidates batch candidate evaluation caches so subsequent pods with identical signatures
+// do not collide on stale preemption evaluations or assume reclaimed capacity.
+func TestPodSignaturePreemptionCandidateInvalidation(t *testing.T) {
+	tests := []struct {
+		name                string
+		firstPodID          string
+		firstSig            string
+		firstChosenNode     string
+		firstOtherNodes     framework.SortedScoredNodes
+		firstScheduled      bool
+		secondPodID         string
+		secondSig           string
+		secondNominatedNode string
+		skipPod             bool
+		expectedHint        string
+	}{
+		{
+			name:                "pod with nominated node bypasses batch and gets no node hint",
+			firstPodID:          blockingPodID("1"),
+			firstSig:            "sig-preempt",
+			firstChosenNode:     "node-1",
+			firstOtherNodes:     newTestNodes([]string{"node-2", "node-3"}),
+			firstScheduled:      true,
+			secondPodID:         blockingPodID("2"),
+			secondSig:           "sig-preempt",
+			secondNominatedNode: "node-1",
+			expectedHint:        "",
+		},
+		{
+			name:                "failed scheduling cycle with preemption nomination invalidates candidate cache for next pod",
+			firstPodID:          blockingPodID("1"),
+			firstSig:            "sig-preempt",
+			firstChosenNode:     "node-1",
+			firstOtherNodes:     newTestNodes([]string{"node-2"}),
+			firstScheduled:      false,
+			secondPodID:         blockingPodID("2"),
+			secondSig:           "sig-preempt",
+			expectedHint:        "",
+		},
+		{
+			name:                "cycle count jump after preemption nomination invalidates candidate cache",
+			firstPodID:          blockingPodID("1"),
+			firstSig:            "sig-preempt",
+			firstChosenNode:     "node-1",
+			firstOtherNodes:     newTestNodes([]string{"node-2"}),
+			firstScheduled:      true,
+			skipPod:             true,
+			secondPodID:         blockingPodID("2"),
+			secondSig:           "sig-preempt",
+			expectedHint:        "",
+		},
+		{
+			name:                "distinct signature after preemption nomination does not reuse candidate cache",
+			firstPodID:          nonBlockingPodID("1"),
+			firstSig:            "sig-preempt-1",
+			firstChosenNode:     "node-1",
+			firstOtherNodes:     newTestNodes([]string{"node-2"}),
+			firstScheduled:      true,
+			secondPodID:         nonBlockingPodID("2"),
+			secondSig:           "sig-preempt-2",
+			expectedHint:        "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			testFwk, lister, err := newBatchTestFramework(ctx, nil, nil)
+			if err != nil {
+				t.Fatalf("Failed to create framework for testing: %v", err)
+			}
+
+			pod1 := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod1",
+					UID:  types.UID(tt.firstPodID),
+				},
+			}
+			batch := newOpportunisticBatch(testFwk, false, time.Minute)
+			state := framework.NewCycleState()
+
+			// Run first pod
+			sig1 := fwk.PodSignature(tt.firstSig)
+			hint1 := batch.GetNodeHint(ctx, pod1, sig1, state, 1)
+			if hint1 != "" {
+				t.Fatalf("unexpected hint %q for first pod", hint1)
+			}
+			if tt.firstScheduled {
+				batch.StoreScheduleResults(ctx, []byte(tt.firstSig), hint1, tt.firstChosenNode, tt.firstOtherNodes, 1)
+			}
+
+			// Prepare lister for second cycle
+			chosenNodeInfo := framework.NewNodeInfo(pod1)
+			chosenNodeInfo.SetNode(&v1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name: tt.firstChosenNode,
+				UID:  types.UID(tt.firstChosenNode),
+			}})
+			lister.nodes = nodeInfoLister{chosenNodeInfo}
+
+			cycleCount := int64(2)
+			if tt.skipPod {
+				cycleCount = 3
+			}
+
+			pod2 := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod2",
+					UID:  types.UID(tt.secondPodID),
+				},
+				Status: v1.PodStatus{
+					NominatedNodeName: tt.secondNominatedNode,
+				},
+			}
+			sig2 := fwk.PodSignature(tt.secondSig)
+			hint2 := batch.GetNodeHint(ctx, pod2, sig2, state, cycleCount)
+			if hint2 != tt.expectedHint {
+				t.Fatalf("got hint %q, want %q", hint2, tt.expectedHint)
+			}
+		})
+	}
+}
