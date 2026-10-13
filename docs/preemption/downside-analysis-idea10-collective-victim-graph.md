@@ -16,8 +16,6 @@
 ### 1.1 Verdict: **DEFINITIVE ARCHITECTURAL DISMISSAL AS A STANDALONE PRECOMPUTED GRAPH; ADOPT IN-PLACE DISRUPTION CREDIT HEURISTIC WITHIN GANG SEARCH**
 
 While preliminary proposals for **Idea 10: Pre-Calculated Collective Victim Dependency Graph for CompositePodGroups** hypothesized that precomputing multi-node resource yield vectors ($\Delta \vec{R}_n = \langle \text{CPU}_n, \text{Mem}_n \rangle$) and aggregated preemption disruption penalties ($P_{\text{victim}}$, PDB blast radius) would accelerate multi-node gang preemption under KEP-6012 (`CompositePodGroup`), an adversarial, downside-focused architectural audit and empirical benchmark investigation reveal that **Idea 10 introduces critical latency overheads, severe memory bloat, cascading eviction blast-radius hazards, and substantial algorithmic maintenance debt**.
-angle$) and aggregated preemption disruption penalties ($P_{\text{victim}}$, PDB blast radius) would accelerate multi-node gang preemption under KEP-6012 (`CompositePodGroup`), an adversarial, downside-focused architectural audit and empirical benchmark investigation reveal that **Idea 10 introduces critical latency overheads, severe memory bloat, cascading eviction blast-radius hazards, and substantial algorithmic maintenance debt**.
-
 The core premise of Idea 10—that compiling a cluster-wide bipartite dependency graph prior to preemption search provides net computational acceleration—fails across four foundational engineering dimensions:
 
 1. **Catastrophic Upfront Latency & Amortization Failure (3.13 ms Setup Tax):**  
@@ -45,7 +43,7 @@ graph, err := BuildCollectiveVictimGraph(ctx, snapshot, podGroupSnapshot, compos
 This compilation step executes synchronously on the scheduler’s main thread during `PostFilter` when a gang fails normal placement.
 
 #### Algorithmic Breakdown of Construction Costs:
-1. **Cluster-Wide Snapshot Traversal $\mathcal{O}(N_{	ext{nodes}} \cdot P_{	ext{node}})$:**  
+1. **Cluster-Wide Snapshot Traversal $\mathcal{O}(N_{\text{nodes}} \cdot P_{\text{node}})$:**  
    The graph compiler must iterate over every scheduled pod on every node in the cluster snapshot to discover victim candidates. It resolves individual pod requests, container resource vectors, and overheads.
 2. **Hierarchical Workload Tree Resolution:**  
    For every pod associated with a `SchedulingGroup`, the compiler must resolve the parent `PodGroup` and ancestor `CompositePodGroup` hierarchies up to `WorkloadMaxTreeDepth`. It executes recursive string formatting (`fmt.Sprintf("%s/%s", v.Type(), groupName)`) and map insertions.
@@ -130,7 +128,7 @@ In standard enterprise Kubernetes clusters (e.g., standard microservices, web se
 
 #### Impact on Non-Composite Clusters:
 - **100% Wasted Construction Tax:** The graph compiler unconditionally traverses all pods and builds a graph where every `CollectiveVictimUnit` contains exactly 1 pod on 1 node.
-- **Degenerate Bipartite Graph:** The graph degenerates into an identity mapping: $|V_{	ext{units}}| = |V_{	ext{pods}}|$. Every unit has an `AffectedNodes` set of size 1.
+- **Degenerate Bipartite Graph:** The graph degenerates into an identity mapping: $|V_{\text{units}}| = |V_{\text{pods}}|$. Every unit has an `AffectedNodes` set of size 1.
 - **Zero Cross-Node Benefit:** Since no victim unit spans multiple nodes, `plan.GetNodeCredit(nodeName)` on remote nodes is always zero! The cross-node crediting logic yields zero optimization, while the scheduler pays the full 3.13 ms construction tax and 33x slower search throughput.
 - **Conclusion:** On non-composite clusters, Idea 10 is **100% negative overhead with zero functional benefit**.
 
@@ -177,8 +175,8 @@ Consider a cluster with 5 nodes (Node 1 through Node 5) hosting a large distribu
 - Node 4: Pod 4 (4 CPUs)
 - Node 5: Pod 5 (4 CPUs)
 
-Now, an incoming high-priority Gang $\mathcal{G}_{	ext{in}}$ (Priority 100) arrives requiring placement:
-- $\mathcal{G}_{	ext{in}}$ consists of **only 2 pods**, each requesting 2 CPUs.
+Now, an incoming high-priority Gang $\mathcal{G}_{\text{in}}$ (Priority 100) arrives requiring placement:
+- $\mathcal{G}_{\text{in}}$ consists of **only 2 pods**, each requesting 2 CPUs.
 - Preemptor Pod $g_1$ evaluates Node 1. Node 1 has insufficient idle capacity, so $g_1$ considers evicting Pod 1.
 - Because Pod 1 belongs to $\mathcal{C}_1$, evicting Pod 1 forces the atomic eviction of the entire composite group $\mathcal{C}_1$ across all 5 nodes.
 - **The Graph Credit Mechanism:** The collective victim graph immediately credits:
@@ -217,8 +215,8 @@ This creates an adverse optimization incentive: **the solver preferentially dest
 ### 4.2 PDB Multi-Domain Violation Accounting & Remote Cascades
 
 Under KEP-5710 (`OrderedScoreFuncs`), preemption cost minimization prioritizes PDB violations as Tier 1:
-$$	ext{PreemptionCost} = \langle 	ext{PDBViolations}, 	ext{HighestPriority}, 	ext{SumPriorities}, 	ext{VictimCount} 
-angle$$
+$$\text{PreemptionCost} = \langle \text{PDBViolations}, \text{HighestPriority}, \text{SumPriorities}, \text{VictimCount} 
+\rangle$$
 
 #### The Remote PDB Cascade Hazard:
 When a composite victim unit $\mathcal{U}_k$ is evicted:
