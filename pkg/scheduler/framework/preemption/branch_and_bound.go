@@ -137,19 +137,33 @@ func ComputeVictimsCost(victims []*v1.Pod, pdbViolations int) PreemptionCost {
 
 // TopologySpreadConstraint models domain constraints (e.g. topology.kubernetes.io/zone).
 type TopologySpreadConstraint struct {
-	TopologyKey string
-	MaxSkew     int
-	NodeDomains map[string]string // nodeName -> domainValue
+	TopologyKey         string
+	MaxSkew             int
+	NodeDomains         map[string]string // nodeName -> domainValue
+	Domains             []string          // all domains in topology (optional; inferred if empty)
+	InitialDomainCounts map[string]int    // existing pods per domain (optional)
+	MinDomains          int               // optional minDomains parameter
 }
 
 // ValidateSkew checks if the distribution of pods across domains satisfies maxSkew.
 func (t *TopologySpreadConstraint) ValidateSkew(domainCounts map[string]int) bool {
-	if len(domainCounts) <= 1 || t.MaxSkew <= 0 {
+	if t.MaxSkew <= 0 {
+		return true
+	}
+	domains := t.GetDomains()
+	if len(domains) <= 1 {
 		return true
 	}
 	minVal := math.MaxInt32
 	maxVal := math.MinInt32
-	for _, count := range domainCounts {
+	for _, d := range domains {
+		count := 0
+		if t.InitialDomainCounts != nil {
+			count += t.InitialDomainCounts[d]
+		}
+		if domainCounts != nil {
+			count += domainCounts[d]
+		}
 		if count < minVal {
 			minVal = count
 		}
@@ -310,6 +324,22 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 		minPodCost[i] = minC
 	}
 
+	// 1b. Topology Spread Analytical Feasibility Pre-Check:
+	// Verify whether the gang size and initial domain distribution can analytically satisfy maxSkew.
+	for _, tc := range prob.TopologyConstraints {
+		if !tc.CheckFeasibility(nil, numPods) {
+			return &GangPlacementResult{
+				PodAssignments:  nil,
+				NodeAssignments: nil,
+				TotalCost:       MaxPreemptionCost(),
+				SearchDuration:  time.Since(startTime),
+				Status:          fwk.NewStatus(fwk.Unschedulable, "gang placement analytically infeasible under topology spread constraints"),
+				StatesExplored:  0,
+				BranchesPruned:  0,
+			}
+		}
+	}
+
 	// 2. Precompute suffix lower bound sums for O(1) admissible bound calculations:
 	// suffixLB[k] = optimistic lower bound of remaining pods [k .. numPods-1]
 	suffixLB := make([]PreemptionCost, numPods+1)
@@ -425,19 +455,18 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 
 			// 2. Check Topology Spread Constraints
 			topoFeasible := true
+			remainingPods := numPods - podIdx
 			for tIdx, tc := range prob.TopologyConstraints {
 				domain := tc.NodeDomains[nodeName]
 				if domain != "" {
-					topoCounts[tIdx][domain]++
-					if !tc.ValidateSkew(topoCounts[tIdx]) {
-						topoCounts[tIdx][domain]--
+					if !tc.CanDomainAcceptPod(domain, topoCounts[tIdx], remainingPods) {
 						topoFeasible = false
 						break
 					}
-					topoCounts[tIdx][domain]--
 				}
 			}
 			if !topoFeasible {
+				branchesPruned++
 				continue
 			}
 
@@ -573,16 +602,14 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 
 			// Topology check
 			topoFeasible := true
+			remainingPods := numPods - podIdx
 			for tIdx, tc := range prob.TopologyConstraints {
 				domain := tc.NodeDomains[nodeName]
 				if domain != "" {
-					topoCounts[tIdx][domain]++
-					if !tc.ValidateSkew(topoCounts[tIdx]) {
-						topoCounts[tIdx][domain]--
+					if !tc.CanDomainAcceptPod(domain, topoCounts[tIdx], remainingPods) {
 						topoFeasible = false
 						break
 					}
-					topoCounts[tIdx][domain]--
 				}
 			}
 			if !topoFeasible {
