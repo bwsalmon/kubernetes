@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	policylisters "k8s.io/client-go/listers/policy/v1"
+	"k8s.io/component-helpers/resource"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
@@ -472,6 +473,16 @@ func (ev *Evaluator) DryRunPreemption(ctx context.Context, state fwk.CycleState,
 
 	var mu sync.Mutex
 	var errs []error
+
+	// Precalculate the preemptor pod's resource requests once across all candidate nodes
+	// to avoid repetitive map and quantity allocations in parallel workers.
+	var preemptorReq v1.ResourceList
+	if !ev.hasInterestedPreemptExtender(pod) {
+		preemptorReq = resource.PodRequests(pod, resource.PodResourcesOptions{
+			SkipPodLevelResources: !ev.fts.EnablePodLevelResources,
+		})
+	}
+
 	// checkNode evaluates a single candidate node in isolation. Each goroutine discovers candidate victims
 	// via GetVictimsOnNode, so a PodGroup victim that spans nodes A and B will be
 	// considered as a candidate victim in both A's and B's evaluations. This is intentional: SelectCandidate
@@ -486,7 +497,7 @@ func (ev *Evaluator) DryRunPreemption(ctx context.Context, state fwk.CycleState,
 		// If an interested preemption extender is configured, bypass coarse-grained pruning so the extender
 		// can manage its external resources/victims.
 		if !ev.hasInterestedPreemptExtender(pod) {
-			if canFit, pruneStatus := ev.canNodeFitPreemptorHeadroom(logger, pod, nodeInfo); !canFit {
+			if canFit, pruneStatus := ev.canNodeFitPreemptorHeadroom(logger, pod, preemptorReq, nodeInfo); !canFit {
 				logger.V(5).Info("Node pruned by coarse-grained capacity and headroom filter", "node", nodeInfo.Node().Name, "pod", klog.KObj(pod), "reason", pruneStatus.Message())
 				mu.Lock()
 				nodeStatuses.Set(nodeInfo.Node().Name, pruneStatus)
@@ -548,8 +559,8 @@ func (ev *Evaluator) DryRunPreemption(ctx context.Context, state fwk.CycleState,
 	return append(nonViolatingCandidates.get(), violatingCandidates.get()...), nodeStatuses, utilerrors.NewAggregate(errs)
 }
 
-func (ev *Evaluator) canNodeFitPreemptorHeadroom(logger klog.Logger, pod *v1.Pod, nodeInfo fwk.NodeInfo) (bool, *fwk.Status) {
-	return CanNodeFitPreemptorHeadroom(logger, pod, nodeInfo, ev.podGroupSnapshot, ev.compositePodGroupSnapshot, ev.fts.EnablePodLevelResources)
+func (ev *Evaluator) canNodeFitPreemptorHeadroom(logger klog.Logger, pod *v1.Pod, podReq v1.ResourceList, nodeInfo fwk.NodeInfo) (bool, *fwk.Status) {
+	return CanNodeFitPreemptorHeadroomWithRequests(logger, pod, podReq, nodeInfo, ev.podGroupSnapshot, ev.compositePodGroupSnapshot, ev.fts.EnablePodLevelResources)
 }
 
 // GetVictimsOnNode returns a list of potential preemption victims on the given node.
