@@ -234,6 +234,12 @@ func DefaultBranchAndBoundOptions() BranchAndBoundOptions {
 // Used as the exact ground-truth baseline oracle for validating BranchAndBound equivalence.
 func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *GangPlacementResult {
 	startTime := time.Now()
+	if err := ctx.Err(); err != nil {
+		return &GangPlacementResult{
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+		}
+	}
 	numPods := len(prob.PreemptorPods)
 	if numPods == 0 {
 		return &GangPlacementResult{
@@ -254,6 +260,9 @@ func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *Gang
 
 	var search func(podIdx int)
 	search = func(podIdx int) {
+		if ctx.Err() != nil {
+			return
+		}
 		if podIdx == numPods {
 			statesExplored++
 			// Validate feasibility and compute total cost of the complete assignment
@@ -280,6 +289,14 @@ func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *Gang
 
 	search(0)
 
+	if ctx.Err() != nil {
+		return &GangPlacementResult{
+			StatesExplored: statesExplored,
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", ctx.Err())),
+		}
+	}
+
 	if bestCost.Equal(MaxPreemptionCost()) {
 		return &GangPlacementResult{
 			StatesExplored: statesExplored,
@@ -296,6 +313,12 @@ func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *Gang
 // Admissible Lower Bound heuristic pruning with greedy initial upper bound.
 func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, opts BranchAndBoundOptions) *GangPlacementResult {
 	startTime := time.Now()
+	if err := ctx.Err(); err != nil {
+		return &GangPlacementResult{
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+		}
+	}
 	numPods := len(prob.PreemptorPods)
 	if numPods == 0 {
 		return &GangPlacementResult{
@@ -328,8 +351,9 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 
 	// 1b. Topology Spread Analytical Feasibility Pre-Check:
 	// Verify whether the gang size and initial domain distribution can analytically satisfy maxSkew.
-	for _, tc := range prob.TopologyConstraints {
-		if !tc.CheckFeasibility(nil, numPods) {
+	for i := range prob.TopologyConstraints {
+		prob.TopologyConstraints[i].GetDomains()
+		if !prob.TopologyConstraints[i].CheckFeasibility(nil, numPods) {
 			return &GangPlacementResult{
 				PodAssignments:  nil,
 				NodeAssignments: nil,
@@ -355,12 +379,24 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 	bestCost := MaxPreemptionCost()
 	var bestAssignments []int
 	if opts.UseGreedyUpperBound {
+		if err := ctx.Err(); err != nil {
+			return &GangPlacementResult{
+				SearchDuration: time.Since(startTime),
+				Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+			}
+		}
 		greedyAssignments, greedyCost, found := computeGreedyPlacement(prob)
 		if found {
 			bestCost = greedyCost
 			bestAssignments = greedyAssignments
 			// If greedy solution already matches the global theoretical minimum, we can exit early!
 			if opts.EnableEarlyExit && bestCost.Equal(globalTheoreticalLowerBound) {
+				if err := ctx.Err(); err != nil {
+					return &GangPlacementResult{
+						SearchDuration: time.Since(startTime),
+						Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+					}
+				}
 				return buildPlacementResult(prob, bestAssignments, bestCost, 1, 0, true, startTime)
 			}
 		}
@@ -466,7 +502,8 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			// 2. Check Topology Spread Constraints
 			topoFeasible := true
 			remainingPods := numPods - podIdx
-			for tIdx, tc := range prob.TopologyConstraints {
+			for tIdx := range prob.TopologyConstraints {
+				tc := &prob.TopologyConstraints[tIdx]
 				domain := tc.NodeDomains[nodeName]
 				if domain != "" {
 					if !tc.CanDomainAcceptPod(domain, topoCounts[tIdx], remainingPods) {
@@ -563,11 +600,18 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 
 	search(0, ZeroPreemptionCost())
 
+	if ctx.Err() != nil {
+		return &GangPlacementResult{
+			StatesExplored: statesExplored,
+			BranchesPruned: branchesPruned,
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", ctx.Err())),
+		}
+	}
+
 	if bestCost.Equal(MaxPreemptionCost()) {
 		statusMsg := "No feasible gang placement found"
-		if ctx.Err() != nil {
-			statusMsg = fmt.Sprintf("search aborted: %v", ctx.Err())
-		} else if opts.MaxExploredStates > 0 && statesExplored >= opts.MaxExploredStates {
+		if opts.MaxExploredStates > 0 && statesExplored >= opts.MaxExploredStates {
 			statusMsg = fmt.Sprintf("search aborted: state exploration cap (%d) reached", opts.MaxExploredStates)
 		}
 		return &GangPlacementResult{
