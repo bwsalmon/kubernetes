@@ -1020,7 +1020,7 @@ func TestDryRunPreemption(t *testing.T) {
 					},
 				},
 			},
-			expectedNumFilterCalled: []int32{3}, // no preemption would happen on node2 and no filter call is counted.
+			expectedNumFilterCalled: []int32{2}, // node2: 0, node1: 2 (under priority-tier bucketing, higher-tier p1.2 is not removed, saving 1 reprieve filter evaluation).
 		},
 		{
 			name: "preemption to resolve pod topology spread filter failure",
@@ -1057,7 +1057,7 @@ func TestDryRunPreemption(t *testing.T) {
 					},
 				},
 			},
-			expectedNumFilterCalled: []int32{5}, // node-a (3), node-b (2), node-x (0)
+			expectedNumFilterCalled: []int32{4}, // node-a (2), node-b (2), node-x (0) - higher-tier pod-a1 is not removed, saving 1 reprieve filter evaluation.
 		},
 		{
 			name: "get Unschedulable in the preemption phase when the filter plugins filtering the nodes",
