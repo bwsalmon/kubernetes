@@ -26,6 +26,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 
@@ -225,21 +226,42 @@ func (ev *PodGroupEvaluator) selectVictimsOnDomain(
 				}
 			}
 		}()
+		affectedNodes := sets.New[string]()
+		for _, pi := range v.Pods() {
+			if pi != nil && pi.GetPod() != nil && pi.GetPod().Spec.NodeName != "" {
+				affectedNodes.Insert(pi.GetPod().Spec.NodeName)
+			}
+		}
+
 		fits = true
 		for _, assignment := range preemptorAssignments {
 			nodeInfo, err := mutableLister.NodeInfos().Get(assignment.GetNodeName())
 			if err != nil {
 				return false, err
 			}
-			s := ev.Handle.RunFilterPluginsWithNominatedPods(ctx, assignment.GetCycleState(), assignment.GetPod(), nodeInfo)
-			if !s.IsSuccess() {
-				if err = removeVictimPodsWithPreFilter(v, preemptorAssignments); err != nil {
-					return false, err
+
+			// Only evaluate filter plugins if the node is affected by the reprieved victim pods
+			// or if the preemptor pod has cross-node constraints (non-signable template).
+			needsFilter := affectedNodes.Len() == 0 || affectedNodes.Has(assignment.GetNodeName())
+			if !needsFilter {
+				// Check if the pod is signable; if not signable, it might have cross-node constraints.
+				sig := ev.Handle.SignPod(ctx, assignment.GetPod())
+				if len(sig) == 0 {
+					needsFilter = true
 				}
-				if l := logger.V(6); l.Enabled() {
-					l.Info("Pods are potential preemption victims", "pods", toPodNames(v.Pods()))
+			}
+
+			if needsFilter {
+				s := ev.Handle.RunFilterPluginsWithNominatedPods(ctx, assignment.GetCycleState(), assignment.GetPod(), nodeInfo)
+				if !s.IsSuccess() {
+					if err = removeVictimPodsWithPreFilter(v, preemptorAssignments); err != nil {
+						return false, err
+					}
+					if l := logger.V(6); l.Enabled() {
+						l.Info("Pods are potential preemption victims", "pods", toPodNames(v.Pods()))
+					}
+					return false, nil
 				}
-				return false, nil
 			}
 			// Simulate assuming a preemptor pod and reserving stateful plugins resources.
 			// We do not need to add the preemptor pod to the cycle state of upcoming preemptor pods.

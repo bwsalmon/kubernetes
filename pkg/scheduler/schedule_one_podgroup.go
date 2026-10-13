@@ -339,6 +339,9 @@ func initPodSchedulingContext(ctx context.Context, pod *v1.Pod, placementCycleSt
 	state.Write(framework.PodsToActivateKey, podsToActivate)
 
 	podGroupCycleState := placementCycleState.GetPodGroupCycleState()
+	if podGroupCycleState == nil && placementCycleState != nil {
+		podGroupCycleState = placementCycleState
+	}
 	// Marks this cycle as a pod group scheduling cycle.
 	state.SetPodGroupCycleState(podGroupCycleState)
 	// Set the placement cycle state so per-pod plugins can access placement-scoped data.
@@ -439,6 +442,10 @@ func (sched *Scheduler) podGroupSchedulingDefaultAlgorithm(ctx context.Context, 
 		status:              fwk.NewStatus(fwk.Unschedulable),
 		waitingOnPreemption: false,
 		placementCycleState: placementCycleState,
+	}
+
+	if placementCycleState != nil {
+		framework.GetOrCreateTemplateFeasibilityCache(placementCycleState)
 	}
 
 	logger := klog.FromContext(ctx)

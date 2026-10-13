@@ -1426,3 +1426,198 @@ func TestCSILimits_DeferredResizeSkipped(t *testing.T) {
 		t.Errorf("Filter: got status %v, want Success (nil)", filterStatus.Code())
 	}
 }
+
+func TestCSILimitsStoragePreemption(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	csiTranslator := csitrans.New()
+
+	podEBS0 := st.MakePod().Name("pod-ebs-0").UID("uid-ebs-0").PVC("csi-ebs.csi.aws.com-0").Obj()
+	podEBS1 := st.MakePod().Name("pod-ebs-1").UID("uid-ebs-1").PVC("csi-ebs.csi.aws.com-1").Obj()
+	podEBSTwoVolNew := st.MakePod().Name("pod-ebs-two").UID("uid-ebs-two").PVC("csi-ebs.csi.aws.com-2").PVC("csi-ebs.csi.aws.com-3").Obj()
+	podNonCSI := st.MakePod().Name("pod-non-csi").UID("uid-non-csi").Volume(v1.Volume{
+		Name: "config-vol",
+		VolumeSource: v1.VolumeSource{
+			ConfigMap: &v1.ConfigMapVolumeSource{},
+		},
+	}).Obj()
+	podGCE := st.MakePod().Name("pod-gce").UID("uid-gce-0").PVC("csi-pd.csi.storage.gke.io-0").Obj()
+
+	t.Run("single CSI volume limit preemption allows new pod after victim removal", func(t *testing.T) {
+		node, csiNode := getNodeWithPodAndVolumeLimits("csinode", []*v1.Pod{podEBS0}, 1, ebsCSIDriverName)
+		fakecli := buildFakeClientWithVALister(0, ebsCSIDriverName)
+		informerFactory := informers.NewSharedInformerFactory(fakecli, 0)
+		if err := informerFactory.Storage().V1().VolumeAttachments().Informer().AddIndexers(cache.Indexers{vaIndexKey: volumeAttachmentIndexer}); err != nil {
+			t.Fatal(err)
+		}
+		informerFactory.Start(ctx.Done())
+		informerFactory.WaitForCacheSync(ctx.Done())
+
+		p := &CSILimits{
+			csiManager:           NewCSIManager(getFakeCSINodeLister(csiNode)),
+			pvLister:             getFakeCSIPVLister("csi", ebsCSIDriverName),
+			pvcLister:            getFakeCSIPVCLister("csi", scName, ebsCSIDriverName),
+			scLister:             getFakeCSIStorageClassLister(scName, ebsCSIDriverName),
+			vaIndexer:            informerFactory.Storage().V1().VolumeAttachments().Informer().GetIndexer(),
+			randomVolumeIDPrefix: rand.String(32),
+			translator:           csiTranslator,
+		}
+
+		// Initially, node is at max capacity (1/1 EBS volume used). PodEBS1 should fail Filter.
+		status := p.Filter(ctx, nil, podEBS1, node)
+		if status == nil || status.Code() != fwk.Unschedulable || status.Message() != ErrReasonMaxVolumeCountExceeded {
+			t.Fatalf("expected Filter to fail with %s, got: %v", ErrReasonMaxVolumeCountExceeded, status)
+		}
+
+		// Simulate preemption: remove victim podEBS0 from NodeInfo.
+		nodeInfoCopy := node.(*framework.NodeInfo).SnapshotConcrete()
+		if err := nodeInfoCopy.RemovePod(logger, podEBS0); err != nil {
+			t.Fatalf("failed to remove pod: %v", err)
+		}
+
+		// After victim pod is removed, PodEBS1 should pass Filter.
+		status = p.Filter(ctx, nil, podEBS1, nodeInfoCopy)
+		if status != nil && !status.IsSuccess() {
+			t.Fatalf("expected Filter to succeed after victim removal, got: %v", status)
+		}
+	})
+
+	t.Run("removing non-CSI pod does not resolve CSI volume limit deficit", func(t *testing.T) {
+		node, csiNode := getNodeWithPodAndVolumeLimits("csinode", []*v1.Pod{podEBS0, podNonCSI}, 1, ebsCSIDriverName)
+		fakecli := buildFakeClientWithVALister(0, ebsCSIDriverName)
+		informerFactory := informers.NewSharedInformerFactory(fakecli, 0)
+		if err := informerFactory.Storage().V1().VolumeAttachments().Informer().AddIndexers(cache.Indexers{vaIndexKey: volumeAttachmentIndexer}); err != nil {
+			t.Fatal(err)
+		}
+		informerFactory.Start(ctx.Done())
+		informerFactory.WaitForCacheSync(ctx.Done())
+
+		p := &CSILimits{
+			csiManager:           NewCSIManager(getFakeCSINodeLister(csiNode)),
+			pvLister:             getFakeCSIPVLister("csi", ebsCSIDriverName),
+			pvcLister:            getFakeCSIPVCLister("csi", scName, ebsCSIDriverName),
+			scLister:             getFakeCSIStorageClassLister(scName, ebsCSIDriverName),
+			vaIndexer:            informerFactory.Storage().V1().VolumeAttachments().Informer().GetIndexer(),
+			randomVolumeIDPrefix: rand.String(32),
+			translator:           csiTranslator,
+		}
+
+		// Filter fails initially
+		status := p.Filter(ctx, nil, podEBS1, node)
+		if status == nil || status.Code() != fwk.Unschedulable {
+			t.Fatalf("expected Filter to fail initially, got: %v", status)
+		}
+
+		// Ineffective preemption: removing podNonCSI does not free CSI volume slot.
+		nodeInfoCopy := node.(*framework.NodeInfo).SnapshotConcrete()
+		if err := nodeInfoCopy.RemovePod(logger, podNonCSI); err != nil {
+			t.Fatalf("failed to remove podNonCSI: %v", err)
+		}
+
+		status = p.Filter(ctx, nil, podEBS1, nodeInfoCopy)
+		if status == nil || status.Code() != fwk.Unschedulable || status.Message() != ErrReasonMaxVolumeCountExceeded {
+			t.Fatalf("expected Filter to still fail after removing non-CSI pod, got: %v", status)
+		}
+
+		// Effective preemption: removing podEBS0 frees the CSI volume slot.
+		if err := nodeInfoCopy.RemovePod(logger, podEBS0); err != nil {
+			t.Fatalf("failed to remove podEBS0: %v", err)
+		}
+
+		status = p.Filter(ctx, nil, podEBS1, nodeInfoCopy)
+		if status != nil && !status.IsSuccess() {
+			t.Fatalf("expected Filter to succeed after removing podEBS0, got: %v", status)
+		}
+	})
+
+	t.Run("multi-volume request requires multiple victims to pass Filter", func(t *testing.T) {
+		node, csiNode := getNodeWithPodAndVolumeLimits("csinode", []*v1.Pod{podEBS0, podEBS1}, 2, ebsCSIDriverName)
+		fakecli := buildFakeClientWithVALister(0, ebsCSIDriverName)
+		informerFactory := informers.NewSharedInformerFactory(fakecli, 0)
+		if err := informerFactory.Storage().V1().VolumeAttachments().Informer().AddIndexers(cache.Indexers{vaIndexKey: volumeAttachmentIndexer}); err != nil {
+			t.Fatal(err)
+		}
+		informerFactory.Start(ctx.Done())
+		informerFactory.WaitForCacheSync(ctx.Done())
+
+		p := &CSILimits{
+			csiManager:           NewCSIManager(getFakeCSINodeLister(csiNode)),
+			pvLister:             getFakeCSIPVLister("csi", ebsCSIDriverName),
+			pvcLister:            getFakeCSIPVCLister("csi", scName, ebsCSIDriverName),
+			scLister:             getFakeCSIStorageClassLister(scName, ebsCSIDriverName),
+			vaIndexer:            informerFactory.Storage().V1().VolumeAttachments().Informer().GetIndexer(),
+			randomVolumeIDPrefix: rand.String(32),
+			translator:           csiTranslator,
+		}
+
+		// PodEBSTwoVolNew needs 2 new volume slots, but node has 2/2 used.
+		status := p.Filter(ctx, nil, podEBSTwoVolNew, node)
+		if status == nil || status.Code() != fwk.Unschedulable {
+			t.Fatalf("expected Filter to fail, got: %v", status)
+		}
+
+		// Removing 1 victim only frees 1 slot (need 2).
+		nodeInfoCopy := node.(*framework.NodeInfo).SnapshotConcrete()
+		if err := nodeInfoCopy.RemovePod(logger, podEBS0); err != nil {
+			t.Fatalf("failed to remove podEBS0: %v", err)
+		}
+		status = p.Filter(ctx, nil, podEBSTwoVolNew, nodeInfoCopy)
+		if status == nil || status.Code() != fwk.Unschedulable {
+			t.Fatalf("expected Filter to fail with only 1 victim removed, got: %v", status)
+		}
+
+		// Removing second victim frees 2 slots.
+		if err := nodeInfoCopy.RemovePod(logger, podEBS1); err != nil {
+			t.Fatalf("failed to remove podEBS1: %v", err)
+		}
+		status = p.Filter(ctx, nil, podEBSTwoVolNew, nodeInfoCopy)
+		if status != nil && !status.IsSuccess() {
+			t.Fatalf("expected Filter to succeed with both victims removed, got: %v", status)
+		}
+	})
+
+	t.Run("multi-driver node isolates driver limits during preemption simulation", func(t *testing.T) {
+		node, csiNode := getNodeWithPodAndVolumeLimits("csinode", []*v1.Pod{podEBS0, podGCE}, 1, ebsCSIDriverName, gceCSIDriverName)
+		fakecli := buildFakeClientWithVALister(0, ebsCSIDriverName, gceCSIDriverName)
+		informerFactory := informers.NewSharedInformerFactory(fakecli, 0)
+		if err := informerFactory.Storage().V1().VolumeAttachments().Informer().AddIndexers(cache.Indexers{vaIndexKey: volumeAttachmentIndexer}); err != nil {
+			t.Fatal(err)
+		}
+		informerFactory.Start(ctx.Done())
+		informerFactory.WaitForCacheSync(ctx.Done())
+
+		p := &CSILimits{
+			csiManager:           NewCSIManager(getFakeCSINodeLister(csiNode)),
+			pvLister:             getFakeCSIPVLister("csi", ebsCSIDriverName, gceCSIDriverName),
+			pvcLister:            getFakeCSIPVCLister("csi", scName, ebsCSIDriverName, gceCSIDriverName),
+			scLister:             getFakeCSIStorageClassLister(scName, ebsCSIDriverName),
+			vaIndexer:            informerFactory.Storage().V1().VolumeAttachments().Informer().GetIndexer(),
+			randomVolumeIDPrefix: rand.String(32),
+			translator:           csiTranslator,
+		}
+
+		// PodEBS1 requires EBS driver slot. Node EBS slot is 1/1 used.
+		status := p.Filter(ctx, nil, podEBS1, node)
+		if status == nil || status.Code() != fwk.Unschedulable {
+			t.Fatalf("expected Filter to fail for PodEBS1, got: %v", status)
+		}
+
+		// Removing podGCE (GCE driver) does not relieve EBS limit.
+		nodeInfoCopy := node.(*framework.NodeInfo).SnapshotConcrete()
+		if err := nodeInfoCopy.RemovePod(logger, podGCE); err != nil {
+			t.Fatalf("failed to remove podGCE: %v", err)
+		}
+		status = p.Filter(ctx, nil, podEBS1, nodeInfoCopy)
+		if status == nil || status.Code() != fwk.Unschedulable {
+			t.Fatalf("expected Filter to still fail for PodEBS1 after removing podGCE, got: %v", status)
+		}
+
+		// Removing podEBS0 relieves EBS limit.
+		if err := nodeInfoCopy.RemovePod(logger, podEBS0); err != nil {
+			t.Fatalf("failed to remove podEBS0: %v", err)
+		}
+		status = p.Filter(ctx, nil, podEBS1, nodeInfoCopy)
+		if status != nil && !status.IsSuccess() {
+			t.Fatalf("expected Filter to succeed for PodEBS1 after removing podEBS0, got: %v", status)
+		}
+	})
+}

@@ -18,8 +18,10 @@ package preemption
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -30,9 +32,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
+	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/events"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	componentmetrics "k8s.io/component-base/metrics"
 	"k8s.io/klog/v2/ktesting"
@@ -1536,6 +1542,47 @@ func TestPodGroupEvaluator_Preempt(t *testing.T) {
 			},
 			expectedStatus: fwk.NewStatus(fwk.Unschedulable, "not eligible due to preemptionPolicy=Never."),
 		},
+		{
+			name: "Preemptor group preserves multiple nominated node names across distinct nodes during ongoing preemption",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Obj(),
+				st.MakeNode().Name("node2").Obj(),
+			},
+			initPods: []*v1.Pod{
+				st.MakePod().Name("victim-1").UID("v1").Node("node1").Priority(lowPriority).Condition(v1.DisruptionTarget, v1.ConditionTrue, v1.PodReasonPreemptionByScheduler).Terminating().Obj(),
+				st.MakePod().Name("victim-2").UID("v2").Node("node2").Priority(lowPriority).Condition(v1.DisruptionTarget, v1.ConditionTrue, v1.PodReasonPreemptionByScheduler).Terminating().Obj(),
+			},
+			preemptorPodGroup: st.MakePodGroup().Name("preemptor-pg").Priority(highPriority).Obj(),
+			preemptorPods: []*v1.Pod{
+				st.MakePod().Name("p1").UID("p1").Priority(highPriority).NominatedNodeName("node1").Obj(),
+				st.MakePod().Name("p2").UID("p2").Priority(highPriority).NominatedNodeName("node2").Obj(),
+			},
+			expectedStatus: fwk.NewStatus(fwk.Success, "ongoing preemption on nominated nodes"),
+			expectedNominating: map[types.NamespacedName]*fwk.NominatingInfo{
+				{Namespace: "", Name: "p1"}: {NominatingMode: fwk.ModeOverride, NominatedNodeName: "node1"},
+				{Namespace: "", Name: "p2"}: {NominatingMode: fwk.ModeOverride, NominatedNodeName: "node2"},
+			},
+		},
+		{
+			name: "Snapshot consistency in ongoing preemption evaluation: victim PodGroup snapshot priority is used",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node1").Obj(),
+			},
+			initPods: []*v1.Pod{
+				st.MakePod().Name("victim").UID("v1").Node("node1").Priority(highPriority).PodGroupName("victim-pg").Condition(v1.DisruptionTarget, v1.ConditionTrue, v1.PodReasonPreemptionByScheduler).Terminating().Obj(),
+			},
+			initPodGroups: []*schedulingv1beta1.PodGroup{
+				st.MakePodGroup().Name("victim-pg").UID("victim-pg").Priority(lowPriority).DisruptionModeSingle().Obj(),
+			},
+			preemptorPodGroup: st.MakePodGroup().Name("preemptor-pg").Priority(midPriority).Obj(),
+			preemptorPods: []*v1.Pod{
+				st.MakePod().Name("p1").UID("p1").Priority(midPriority).NominatedNodeName("node1").Obj(),
+			},
+			expectedStatus: fwk.NewStatus(fwk.Success, "ongoing preemption on nominated nodes"),
+			expectedNominating: map[types.NamespacedName]*fwk.NominatingInfo{
+				{Namespace: "", Name: "p1"}: {NominatingMode: fwk.ModeOverride, NominatedNodeName: "node1"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1726,6 +1773,283 @@ func TestPodGroupPreemptionEvaluationDurationMetric(t *testing.T) {
 			diff := stateAfter.count - stateBefore.count
 			if diff != 1 {
 				t.Errorf("Expected %s count delta to be 1, got %d", expectedStatus, diff)
+			}
+		})
+	}
+}
+
+func TestPodGroupPreemptionMetrics_Invariants(t *testing.T) {
+	nodeName := "node1"
+
+	tests := []struct {
+		name                    string
+		compositePodGroup       bool
+		async                   bool
+		evaluationStatus        *fwk.Status
+		injectDeletionError     bool
+		expectVictimsEvaluated  bool
+		expectPreemptionActuate bool
+		expectedEvalStatus      string
+		expectedExecResult      string
+	}{
+		{
+			name:                    "PodGroup sync preemption success",
+			compositePodGroup:       false,
+			async:                   false,
+			evaluationStatus:        fwk.NewStatus(fwk.Success),
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: true,
+			expectedEvalStatus:      "Success",
+			expectedExecResult:      "success",
+		},
+		{
+			name:                    "PodGroup async preemption success",
+			compositePodGroup:       false,
+			async:                   true,
+			evaluationStatus:        fwk.NewStatus(fwk.Success),
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: true,
+			expectedEvalStatus:      "Success",
+			expectedExecResult:      "success",
+		},
+		{
+			name:                    "CompositePodGroup sync preemption success",
+			compositePodGroup:       true,
+			async:                   false,
+			evaluationStatus:        fwk.NewStatus(fwk.Success),
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: true,
+			expectedEvalStatus:      "Success",
+			expectedExecResult:      "success",
+		},
+		{
+			name:                    "CompositePodGroup async preemption success",
+			compositePodGroup:       true,
+			async:                   true,
+			evaluationStatus:        fwk.NewStatus(fwk.Success),
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: true,
+			expectedEvalStatus:      "Success",
+			expectedExecResult:      "success",
+		},
+		{
+			name:                    "PodGroup sync preemption actuation error",
+			compositePodGroup:       false,
+			async:                   false,
+			evaluationStatus:        fwk.NewStatus(fwk.Success),
+			injectDeletionError:     true,
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: true,
+			expectedEvalStatus:      "Success",
+			expectedExecResult:      "error",
+		},
+		{
+			name:                    "PodGroup async preemption actuation error",
+			compositePodGroup:       false,
+			async:                   true,
+			evaluationStatus:        fwk.NewStatus(fwk.Success),
+			injectDeletionError:     true,
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: true,
+			expectedEvalStatus:      "Success",
+			expectedExecResult:      "error",
+		},
+		{
+			name:                    "PodGroup evaluation unschedulable (no fit even after preemption)",
+			compositePodGroup:       false,
+			async:                   false,
+			evaluationStatus:        fwk.NewStatus(fwk.Unschedulable, "still does not fit"),
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: false,
+			expectedEvalStatus:      "Unschedulable",
+		},
+		{
+			name:                    "PodGroup evaluation error",
+			compositePodGroup:       false,
+			async:                   false,
+			evaluationStatus:        fwk.NewStatus(fwk.Error, "evaluation plugin failure"),
+			expectVictimsEvaluated:  true,
+			expectPreemptionActuate: false,
+			expectedEvalStatus:      "Error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+				features.GenericWorkload:                 true,
+				features.TopologyAwareWorkloadScheduling: true,
+				features.CompositePodGroup:               tt.compositePodGroup,
+			})
+
+			testRegistry := componentmetrics.NewKubeRegistry()
+			testRegistry.MustRegister(
+				metrics.PreemptionEvaluationDuration,
+				metrics.WorkloadPreemptionVictims,
+				metrics.PreemptionExecutionDuration,
+				metrics.PreemptionGoroutinesDuration,
+				metrics.PreemptionGoroutinesExecutionTotal,
+			)
+
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			node := st.MakeNode().Name(nodeName).Obj()
+			victimPod := st.MakePod().Name("victim").UID("victim").Node(nodeName).Priority(lowPriority).Obj()
+			preemptorPod := st.MakePod().Name("p1").UID("p1").Priority(highPriority).Obj()
+
+			var preemptorPGInfo fwk.PodGroupInfo
+			var preemptorTypeLabel string
+			if tt.compositePodGroup {
+				cpg := st.MakeCompositePodGroup().Name("preemptor-cpg").UID("cpg1").Priority(highPriority).Obj()
+				preemptorPGInfo = newTestPodGroupInfo(nil, cpg, []*v1.Pod{preemptorPod})
+				preemptorTypeLabel = "compositepodgroup"
+			} else {
+				pg := st.MakePodGroup().Name("preemptor-pg").UID("pg1").Priority(highPriority).Obj()
+				preemptorPGInfo = newTestPodGroupInfo(pg, nil, []*v1.Pod{preemptorPod})
+				preemptorTypeLabel = "podgroup"
+			}
+
+			client := clientsetfake.NewClientset(node, victimPod, preemptorPod)
+			if tt.injectDeletionError {
+				client.PrependReactor("delete", "pods", func(action clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("deletion error")
+				})
+			}
+
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+			queue := internalqueue.NewSchedulingQueue(nil, informerFactory)
+			mockFilterFactory := func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+				return &mockFilterPlugin{
+					nodeCapacities: []nodeCapacity{{nodeName: nodeName, capacity: 1}},
+				}, nil
+			}
+			registeredPlugins := []tf.RegisterPluginFunc{
+				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+				tf.RegisterPluginAsExtensions("mockFilterPlugin", mockFilterFactory, "Filter"),
+				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+			}
+			snapshot := internalcache.NewSnapshot([]*v1.Pod{victimPod}, []*v1.Node{node})
+
+			schedulerFeatures := feature.Features{
+				EnableAsyncPreemption: tt.async,
+			}
+
+			var executor *Executor
+			fh, err := tf.NewFramework(
+				ctx,
+				registeredPlugins, "",
+				frameworkruntime.WithClientSet(client),
+				frameworkruntime.WithPodNominator(queue),
+				frameworkruntime.WithPodActivator(queue),
+				frameworkruntime.WithWaitingPods(frameworkruntime.NewWaitingPodsMap()),
+				frameworkruntime.WithPodsInPreBind(frameworkruntime.NewPodsInPreBindMap()),
+				frameworkruntime.WithEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, "test-scheduler")),
+				frameworkruntime.WithInformerFactory(informerFactory),
+				frameworkruntime.WithSnapshotSharedLister(snapshot),
+				frameworkruntime.WithMutableSnapshotLister(snapshot),
+				frameworkruntime.WithLogger(logger),
+				frameworkruntime.WithPreemptionManager(func(fh fwk.Handle) fwk.PreemptionManager {
+					pm := NewPreemptionManager(fh, schedulerFeatures)
+					executor = pm.Executor().(*Executor)
+					return pm
+				}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			informerFactory.Start(ctx.Done())
+			informerFactory.WaitForCacheSync(ctx.Done())
+
+			pl := &PodGroupEvaluator{
+				Handle: fh,
+			}
+
+			mockSchedulingFunc := func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
+				cycleState := framework.NewCycleState()
+				fh.RunPreFilterPlugins(ctx, cycleState, preemptorPod)
+				if tt.evaluationStatus.IsSuccess() {
+					return &fwk.PodGroupAssignments{
+						ProposedAssignments: []fwk.ProposedAssignment{
+							&mockProposedAssignment{pod: preemptorPod, nodeName: nodeName, cycleState: cycleState},
+						},
+					}, tt.evaluationStatus
+				}
+				return nil, tt.evaluationStatus
+			}
+
+			evalBefore := captureEvaluationDurationMetric(testRegistry, "podgroup", tt.expectedEvalStatus)
+			victimsBefore := newHistogramState(testRegistry, "scheduler_workload_preemption_victims", map[string]string{})
+			execBefore := newHistogramState(testRegistry, "scheduler_preemption_execution_duration_seconds", map[string]string{"preemptor": preemptorTypeLabel, "result": tt.expectedExecResult})
+			asyncTotalBefore := newCounterState(testRegistry, "scheduler_preemption_goroutines_execution_total", map[string]string{}, "result", tt.expectedExecResult)
+			asyncDurBefore := newHistogramState(testRegistry, "scheduler_preemption_goroutines_duration_seconds", map[string]string{"result": tt.expectedExecResult})
+
+			if err := pl.Handle.MutableSnapshotSharedLister().StartMutations(); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			_, status := pl.Preempt(ctx, preemptorPGInfo, mockSchedulingFunc)
+			if err := pl.Handle.MutableSnapshotSharedLister().EndMutations(); err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+
+			if tt.async && tt.expectPreemptionActuate {
+				err := wait.PollUntilContextTimeout(ctx, time.Millisecond*50, wait.ForeverTestTimeout, false, func(ctx context.Context) (bool, error) {
+					executor.mu.Lock()
+					defer executor.mu.Unlock()
+					return len(executor.preempting) == 0, nil
+				})
+				if err != nil {
+					t.Fatal("async preemption did not complete in time")
+				}
+			}
+
+			if tt.expectPreemptionActuate {
+				if tt.injectDeletionError && !tt.async {
+					if status.IsSuccess() {
+						t.Errorf("Expected failure when pod deletion fails synchronously, got success")
+					}
+				} else {
+					if !status.IsSuccess() {
+						t.Errorf("Expected Preempt success, got %v", status)
+					}
+				}
+			} else {
+				if status.IsSuccess() {
+					t.Errorf("Expected failure for non-actuated case, got success")
+				}
+			}
+
+			evalAfter := captureEvaluationDurationMetric(testRegistry, "podgroup", tt.expectedEvalStatus)
+			expectedEvalDelta := uint64(0)
+			if tt.expectVictimsEvaluated {
+				expectedEvalDelta = 1
+			}
+			if diff := evalAfter.count - evalBefore.count; diff != expectedEvalDelta {
+				t.Errorf("Expected evaluation duration count delta %d, got %d", expectedEvalDelta, diff)
+			}
+
+			victimsAfter := newHistogramState(testRegistry, "scheduler_workload_preemption_victims", map[string]string{})
+			expectedVictimsDelta := uint64(0)
+			expectedVictimsSum := float64(0)
+			if tt.expectPreemptionActuate {
+				expectedVictimsDelta = 1
+				expectedVictimsSum = 1
+			}
+			victimsAfter.assertDelta(t, victimsBefore, expectedVictimsDelta, expectedVictimsSum)
+
+			if tt.expectPreemptionActuate {
+				execAfter := newHistogramState(testRegistry, "scheduler_preemption_execution_duration_seconds", map[string]string{"preemptor": preemptorTypeLabel, "result": tt.expectedExecResult})
+				execAfter.assertDelta(t, execBefore, 1, execAfter.sum-execBefore.sum)
+
+				if tt.async {
+					asyncTotalAfter := newCounterState(testRegistry, "scheduler_preemption_goroutines_execution_total", map[string]string{}, "result", tt.expectedExecResult)
+					asyncTotalAfter.assertDelta(t, asyncTotalBefore, 1)
+
+					asyncDurAfter := newHistogramState(testRegistry, "scheduler_preemption_goroutines_duration_seconds", map[string]string{"result": tt.expectedExecResult})
+					asyncDurAfter.assertDelta(t, asyncDurBefore, 1, asyncDurAfter.sum-asyncDurBefore.sum)
+				}
 			}
 		})
 	}

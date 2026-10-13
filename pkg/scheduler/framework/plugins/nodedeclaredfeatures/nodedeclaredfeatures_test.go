@@ -19,22 +19,41 @@ package nodedeclaredfeatures
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/informers"
+	clientsetfake "k8s.io/client-go/kubernetes/fake"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
 	ndftesting "k8s.io/component-helpers/nodedeclaredfeatures/testing"
 	"k8s.io/klog/v2/ktesting"
+	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultpreemption"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
+	"k8s.io/kubernetes/pkg/scheduler/framework/preemption"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	internalqueue "k8s.io/kubernetes/pkg/scheduler/backend/queue"
+	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
 // createMockFeature is a helper function to create and configure a MockFeature.
@@ -502,5 +521,262 @@ func TestNodeDeclaredFeatures_DeferredResizeSkipped(t *testing.T) {
 
 	if filterStatus := pl.Filter(ctx, nil, pod, nodeInfo); filterStatus.Code() != fwk.Success {
 		t.Errorf("Filter: got status %v, want Success (nil)", filterStatus.Code())
+	}
+}
+
+type dryRunPreemptionCandidate struct {
+	name    string
+	victims *extenderv1.Victims
+}
+
+func TestDryRunPreemptionCandidateFiltering(t *testing.T) {
+	metrics.Register()
+	var (
+		midPriority  = int32(500)
+		highPriority = int32(1000)
+
+		largeRes = map[v1.ResourceName]string{
+			v1.ResourceCPU:    "1000m",
+			v1.ResourceMemory: "1000Mi",
+		}
+		nodeRes = map[v1.ResourceName]string{
+			v1.ResourceCPU:    "1000m",
+			v1.ResourceMemory: "1000Mi",
+			v1.ResourcePods:   "10",
+		}
+	)
+
+	mockAVX512 := ndftesting.NewMockFeature(t)
+	mockAVX512.SetName("intel.com/avx512")
+	mockAVX512.SetInferForScheduling(func(podInfo *ndf.PodInfo) bool {
+		return len(podInfo.Spec.Containers) > 0 && podInfo.Spec.Containers[0].Name == "container-req-avx512"
+	})
+	mockAVX512.SetMaxVersion(nil)
+	mockAVX512.SetInferForUpdate(func(_, _ *ndf.PodInfo) bool { return false })
+	mockAVX512.SetDiscover(func(*ndf.NodeConfiguration) bool { return false })
+
+	mockSVE2 := ndftesting.NewMockFeature(t)
+	mockSVE2.SetName("arm.com/sve2")
+	mockSVE2.SetInferForScheduling(func(podInfo *ndf.PodInfo) bool {
+		return len(podInfo.Spec.Containers) > 0 && podInfo.Spec.Containers[0].Name == "container-req-sve2"
+	})
+	mockSVE2.SetMaxVersion(nil)
+	mockSVE2.SetInferForUpdate(func(_, _ *ndf.PodInfo) bool { return false })
+	mockSVE2.SetDiscover(func(*ndf.NodeConfiguration) bool { return false })
+
+	mockUnsatFeature := ndftesting.NewMockFeature(t)
+	mockUnsatFeature.SetName("other.com/unsatisfied")
+	mockUnsatFeature.SetInferForScheduling(func(podInfo *ndf.PodInfo) bool {
+		return len(podInfo.Spec.Containers) > 0 && podInfo.Spec.Containers[0].Name == "container-req-unsat"
+	})
+	mockUnsatFeature.SetMaxVersion(nil)
+	mockUnsatFeature.SetInferForUpdate(func(_, _ *ndf.PodInfo) bool { return false })
+	mockUnsatFeature.SetDiscover(func(*ndf.NodeConfiguration) bool { return false })
+
+	ndfFramework := ndf.New([]ndf.Feature{mockAVX512, mockSVE2, mockUnsatFeature})
+	ndftesting.SetFrameworkDuringTest(t, *ndfFramework)
+
+	nodes := []*v1.Node{
+		st.MakeNode().Name("node-avx512").Capacity(nodeRes).DeclaredFeatures([]string{"intel.com/avx512"}).Obj(),
+		st.MakeNode().Name("node-sve2").Capacity(nodeRes).DeclaredFeatures([]string{"arm.com/sve2"}).Obj(),
+		st.MakeNode().Name("node-no-feature").Capacity(nodeRes).Obj(),
+	}
+
+	initPods := []*v1.Pod{
+		st.MakePod().Name("victim-avx512").UID("victim-avx512").Node("node-avx512").Priority(midPriority).Req(largeRes).Obj(),
+		st.MakePod().Name("victim-sve2").UID("victim-sve2").Node("node-sve2").Priority(midPriority).Req(largeRes).Obj(),
+		st.MakePod().Name("victim-no-feature").UID("victim-no-feature").Node("node-no-feature").Priority(midPriority).Req(largeRes).Obj(),
+	}
+
+	tests := []struct {
+		name      string
+		fts       feature.Features
+		preemptor *v1.Pod
+		expected  []dryRunPreemptionCandidate
+	}{
+		{
+			name: "preemptor requires AVX-512, only node-avx512 is preemption candidate",
+			fts:  feature.Features{EnableNodeDeclaredFeatures: true},
+			preemptor: st.MakePod().Name("preemptor-avx512").UID("preemptor-avx512").Priority(highPriority).
+				Containers([]v1.Container{st.MakeContainer().Name("container-req-avx512").Image(imageutils.GetPauseImageName()).ResourceRequests(largeRes).Obj()}).Obj(),
+			expected: []dryRunPreemptionCandidate{
+				{
+					name: "node-avx512",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-avx512").UID("victim-avx512").Node("node-avx512").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+			},
+		},
+		{
+			name: "preemptor requires SVE2, only node-sve2 is preemption candidate",
+			fts:  feature.Features{EnableNodeDeclaredFeatures: true},
+			preemptor: st.MakePod().Name("preemptor-sve2").UID("preemptor-sve2").Priority(highPriority).
+				Containers([]v1.Container{st.MakeContainer().Name("container-req-sve2").Image(imageutils.GetPauseImageName()).ResourceRequests(largeRes).Obj()}).Obj(),
+			expected: []dryRunPreemptionCandidate{
+				{
+					name: "node-sve2",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-sve2").UID("victim-sve2").Node("node-sve2").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+			},
+		},
+		{
+			name: "preemptor requires unsatisfied feature, no candidates returned",
+			fts:  feature.Features{EnableNodeDeclaredFeatures: true},
+			preemptor: st.MakePod().Name("preemptor-unsat").UID("preemptor-unsat").Priority(highPriority).
+				Containers([]v1.Container{st.MakeContainer().Name("container-req-unsat").Image(imageutils.GetPauseImageName()).ResourceRequests(largeRes).Obj()}).Obj(),
+			expected: nil,
+		},
+		{
+			name: "preemptor has no feature requirements, all nodes are preemption candidates",
+			fts:  feature.Features{EnableNodeDeclaredFeatures: true},
+			preemptor: st.MakePod().Name("preemptor-generic").UID("preemptor-generic").Priority(highPriority).
+				Containers([]v1.Container{st.MakeContainer().Name("generic-container").Image(imageutils.GetPauseImageName()).ResourceRequests(largeRes).Obj()}).Obj(),
+			expected: []dryRunPreemptionCandidate{
+				{
+					name: "node-avx512",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-avx512").UID("victim-avx512").Node("node-avx512").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+				{
+					name: "node-no-feature",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-no-feature").UID("victim-no-feature").Node("node-no-feature").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+				{
+					name: "node-sve2",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-sve2").UID("victim-sve2").Node("node-sve2").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+			},
+		},
+		{
+			name: "feature gate disabled, feature requirements are ignored and all nodes are candidates",
+			fts:  feature.Features{EnableNodeDeclaredFeatures: false},
+			preemptor: st.MakePod().Name("preemptor-avx512").UID("preemptor-avx512").Priority(highPriority).
+				Containers([]v1.Container{st.MakeContainer().Name("container-req-avx512").Image(imageutils.GetPauseImageName()).ResourceRequests(largeRes).Obj()}).Obj(),
+			expected: []dryRunPreemptionCandidate{
+				{
+					name: "node-avx512",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-avx512").UID("victim-avx512").Node("node-avx512").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+				{
+					name: "node-no-feature",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-no-feature").UID("victim-no-feature").Node("node-no-feature").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+				{
+					name: "node-sve2",
+					victims: &extenderv1.Victims{
+						Pods: []*v1.Pod{st.MakePod().Name("victim-sve2").UID("victim-sve2").Node("node-sve2").Priority(midPriority).Req(largeRes).Obj()},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !tt.fts.EnableNodeDeclaredFeatures {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.36"))
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeDeclaredFeatures, false)
+			} else {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeDeclaredFeatures, true)
+			}
+
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			registeredPlugins := []tf.RegisterPluginFunc{
+				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+				tf.RegisterPluginAsExtensions(noderesources.Name, frameworkruntime.FactoryAdapter(tt.fts, noderesources.NewFit), "Filter", "PreFilter"),
+				tf.RegisterPluginAsExtensions(Name, frameworkruntime.FactoryAdapter(tt.fts, New), "Filter", "PreFilter"),
+			}
+
+			var objs []runtime.Object
+			objs = append(objs, tt.preemptor)
+			for _, p := range initPods {
+				objs = append(objs, p)
+			}
+			for _, n := range nodes {
+				objs = append(objs, n)
+			}
+
+			informerFactory := informers.NewSharedInformerFactory(clientsetfake.NewClientset(objs...), 0)
+			snapshot := internalcache.NewSnapshot(initPods, nodes)
+			schedFwk, err := tf.NewFramework(
+				ctx,
+				registeredPlugins,
+				"",
+				frameworkruntime.WithPodNominator(internalqueue.NewSchedulingQueue(nil, informerFactory)),
+				frameworkruntime.WithInformerFactory(informerFactory),
+				frameworkruntime.WithParallelism(parallelize.DefaultParallelism),
+				frameworkruntime.WithSnapshotSharedLister(snapshot),
+				frameworkruntime.WithMutableSnapshotLister(snapshot),
+				frameworkruntime.WithLogger(logger),
+				frameworkruntime.WithPreemptionManager(func(fh fwk.Handle) fwk.PreemptionManager {
+					return preemption.NewPreemptionManager(fh, tt.fts)
+				}),
+			)
+			if err != nil {
+				t.Fatalf("Failed to create framework: %v", err)
+			}
+
+			informerFactory.Start(ctx.Done())
+			informerFactory.WaitForCacheSync(ctx.Done())
+
+			dpArgs := &config.DefaultPreemptionArgs{MinCandidateNodesPercentage: 100, MinCandidateNodesAbsolute: 100}
+			dpPlugin, err := defaultpreemption.New(ctx, dpArgs, schedFwk, tt.fts)
+			if err != nil {
+				t.Fatalf("Failed to create DefaultPreemption plugin: %v", err)
+			}
+
+			nodeInfos, err := snapshot.NodeInfos().List()
+			if err != nil {
+				t.Fatalf("Failed to list nodeInfos: %v", err)
+			}
+
+			state := framework.NewCycleState()
+			if _, status, _ := schedFwk.RunPreFilterPlugins(ctx, state, tt.preemptor); !status.IsSuccess() {
+				t.Fatalf("Unexpected PreFilter status: %v", status)
+			}
+
+			got, _, err := dpPlugin.Evaluator.DryRunPreemption(ctx, state, tt.preemptor, nodeInfos, nil, 0, int32(len(nodeInfos)))
+			if err != nil {
+				t.Fatalf("DryRunPreemption failed: %v", err)
+			}
+
+			for i := range got {
+				victims := got[i].Victims().Pods
+				sort.Slice(victims, func(a, b int) bool {
+					return victims[a].Name < victims[b].Name
+				})
+			}
+			sort.Slice(got, func(a, b int) bool {
+				return got[a].Name() < got[b].Name()
+			})
+
+			var candidates []dryRunPreemptionCandidate
+			for _, c := range got {
+				candidates = append(candidates, dryRunPreemptionCandidate{
+					name:    c.Name(),
+					victims: c.Victims(),
+				})
+			}
+
+			if diff := cmp.Diff(tt.expected, candidates, cmp.AllowUnexported(dryRunPreemptionCandidate{})); diff != "" {
+				t.Errorf("Unexpected preemption candidates (-want, +got):\n%s", diff)
+			}
+		})
 	}
 }

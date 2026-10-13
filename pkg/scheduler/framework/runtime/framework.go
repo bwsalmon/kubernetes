@@ -1127,10 +1127,60 @@ func (f *frameworkImpl) RunFilterPlugins(
 		logger = klog.LoggerWithName(logger, "Filter")
 	}
 
+	var cache *framework.TemplateFeasibilityCache
+	var sigStr string
+	if state != nil && nodeInfo != nil && nodeInfo.Node() != nil {
+		if cacheData, err := state.Read(framework.TemplateFeasibilityStateKey); err == nil && cacheData != nil {
+			cache, _ = cacheData.(*framework.TemplateFeasibilityCache)
+		} else if pgState := state.GetPodGroupCycleState(); pgState != nil {
+			if cacheData, err := pgState.Read(framework.TemplateFeasibilityStateKey); err == nil && cacheData != nil {
+				cache, _ = cacheData.(*framework.TemplateFeasibilityCache)
+			}
+		}
+		if cache != nil {
+			if sigData, err := state.Read(framework.PodSignatureStateKey); err == nil && sigData != nil {
+				if sigWrapper, ok := sigData.(*framework.PodSignatureWrapper); ok {
+					sigStr = sigWrapper.Signature
+				}
+			} else {
+				sig := f.SignPod(ctx, pod)
+				if len(sig) > 0 {
+					sigStr = string(sig)
+				}
+				state.Write(framework.PodSignatureStateKey, &framework.PodSignatureWrapper{Signature: sigStr})
+			}
+		}
+	}
+
+	nodeName := ""
+	if nodeInfo != nil && nodeInfo.Node() != nil {
+		nodeName = nodeInfo.Node().Name
+	}
+
+	skipStaticPlugins := false
+	if cache != nil && sigStr != "" && nodeName != "" {
+		if staticStatus, found := cache.GetStaticFeasibility(sigStr, nodeName); found {
+			if !staticStatus.IsSuccess() {
+				// Node is statically incompatible with this template.
+				return staticStatus
+			}
+			// Static filters previously passed for this template on this node.
+			skipStaticPlugins = true
+		}
+	}
+
 	for _, pl := range f.filterPlugins {
 		if state.GetSkipFilterPlugins().Has(pl.Name()) {
 			continue
 		}
+		isStatic := framework.IsStaticFilterPlugin(pl.Name())
+		if isStatic && skipStaticPlugins {
+			if cache != nil {
+				cache.RecordPluginsSaved(1)
+			}
+			continue
+		}
+
 		ctx := ctx
 		if verboseLogs {
 			logger := klog.LoggerWithName(logger, pl.Name())
@@ -1143,8 +1193,16 @@ func (f *frameworkImpl) RunFilterPlugins(
 				status = fwk.AsStatus(fmt.Errorf("running %q filter plugin: %w", pl.Name(), status.AsError()))
 			}
 			status.SetPlugin(pl.Name())
+
+			if isStatic && cache != nil && sigStr != "" && nodeName != "" {
+				cache.SetStaticFeasibility(sigStr, nodeName, status)
+			}
 			return status
 		}
+	}
+
+	if !skipStaticPlugins && cache != nil && sigStr != "" && nodeName != "" {
+		cache.SetStaticFeasibility(sigStr, nodeName, fwk.NewStatus(fwk.Success))
 	}
 
 	return nil
