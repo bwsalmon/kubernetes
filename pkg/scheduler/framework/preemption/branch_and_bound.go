@@ -217,6 +217,7 @@ type BranchAndBoundOptions struct {
 	EnableEarlyExit          bool
 	UseGreedyUpperBound      bool
 	UseBestFirstBranchOrder  bool
+	MaxExploredStates        int
 }
 
 // DefaultBranchAndBoundOptions provides standard optimal configuration.
@@ -225,6 +226,7 @@ func DefaultBranchAndBoundOptions() BranchAndBoundOptions {
 		EnableEarlyExit:         true,
 		UseGreedyUpperBound:     true,
 		UseBestFirstBranchOrder: true,
+		MaxExploredStates:       50000,
 	}
 }
 
@@ -406,6 +408,14 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 		if earlyExit {
 			return
 		}
+		if ctx.Err() != nil {
+			earlyExit = true
+			return
+		}
+		if opts.MaxExploredStates > 0 && statesExplored >= opts.MaxExploredStates {
+			earlyExit = true
+			return
+		}
 
 		if podIdx == numPods {
 			statesExplored++
@@ -554,11 +564,17 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 	search(0, ZeroPreemptionCost())
 
 	if bestCost.Equal(MaxPreemptionCost()) {
+		statusMsg := "No feasible gang placement found"
+		if ctx.Err() != nil {
+			statusMsg = fmt.Sprintf("search aborted: %v", ctx.Err())
+		} else if opts.MaxExploredStates > 0 && statesExplored >= opts.MaxExploredStates {
+			statusMsg = fmt.Sprintf("search aborted: state exploration cap (%d) reached", opts.MaxExploredStates)
+		}
 		return &GangPlacementResult{
 			StatesExplored: statesExplored,
 			BranchesPruned: branchesPruned,
 			SearchDuration: time.Since(startTime),
-			Status:         fwk.NewStatus(fwk.Unschedulable, "No feasible gang placement found"),
+			Status:         fwk.NewStatus(fwk.Unschedulable, statusMsg),
 		}
 	}
 
