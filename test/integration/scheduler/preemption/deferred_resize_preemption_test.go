@@ -3320,7 +3320,7 @@ func TestDeferredResizeMultiContainerExpansion(t *testing.T) {
 	victimSpare := initPausePod(&testutils.PausePodConfig{
 		Name:      "victim-spare",
 		Namespace: ns,
-		Priority:  &asyncframework.LowPriority,
+		Priority:  &asyncframework.MediumPriority,
 		Resources: &v1.ResourceRequirements{Requests: v1.ResourceList{
 			v1.ResourceCPU:    resource.MustParse("50m"),
 			v1.ResourceMemory: resource.MustParse("50Mi"),
@@ -3359,7 +3359,7 @@ func TestDeferredResizeMultiContainerExpansion(t *testing.T) {
 					Image: "pause",
 					Resources: v1.ResourceRequirements{
 						Requests: v1.ResourceList{
-							v1.ResourceCPU:    resource.MustParse("300m"),
+							v1.ResourceCPU:    resource.MustParse("100m"),
 							v1.ResourceMemory: resource.MustParse("50Mi"),
 						},
 					},
@@ -3370,7 +3370,7 @@ func TestDeferredResizeMultiContainerExpansion(t *testing.T) {
 					Resources: v1.ResourceRequirements{
 						Requests: v1.ResourceList{
 							v1.ResourceCPU:    resource.MustParse("50m"),
-							v1.ResourceMemory: resource.MustParse("300Mi"),
+							v1.ResourceMemory: resource.MustParse("100Mi"),
 						},
 					},
 				},
@@ -3387,11 +3387,6 @@ func TestDeferredResizeMultiContainerExpansion(t *testing.T) {
 		{
 			Type:   v1.PodScheduled,
 			Status: v1.ConditionTrue,
-		},
-		{
-			Type:   v1.PodResizePending,
-			Status: v1.ConditionTrue,
-			Reason: v1.PodReasonDeferred,
 		},
 	}
 	preemptorPod.Status.ContainerStatuses = []v1.ContainerStatus{
@@ -3425,6 +3420,47 @@ func TestDeferredResizeMultiContainerExpansion(t *testing.T) {
 	preemptorPod, err = cs.CoreV1().Pods(ns).UpdateStatus(testCtx.Ctx, preemptorPod, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("Failed to update status of preemptor-multi-expand pod: %v", err)
+	}
+
+	// Wait until the scheduler cache has processed the pod on the node
+	err = wait.PollUntilContextTimeout(testCtx.Ctx, 50*time.Millisecond, 5*time.Second, false, func(ctx context.Context) (bool, error) {
+		cachedPod, err := testCtx.Scheduler.Cache.GetPod(preemptorPod)
+		if err != nil {
+			return false, nil
+		}
+		return len(cachedPod.Status.ContainerStatuses) == 2, nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to sync preemptor pod in scheduler cache: %v", err)
+	}
+
+	// Update requests to desired expanded values
+	preemptorPod, err = cs.CoreV1().Pods(ns).Get(testCtx.Ctx, preemptorPod.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get preemptor pod: %v", err)
+	}
+	preemptorPod.Spec.Containers[0].Resources.Requests = v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("300m"),
+		v1.ResourceMemory: resource.MustParse("50Mi"),
+	}
+	preemptorPod.Spec.Containers[1].Resources.Requests = v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("50m"),
+		v1.ResourceMemory: resource.MustParse("300Mi"),
+	}
+	preemptorPod, err = cs.CoreV1().Pods(ns).UpdateResize(testCtx.Ctx, preemptorPod.Name, preemptorPod, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update resize for preemptor pod: %v", err)
+	}
+
+	// Mark pod resize as deferred in status
+	preemptorPod.Status.Conditions = append(preemptorPod.Status.Conditions, v1.PodCondition{
+		Type:   v1.PodResizePending,
+		Status: v1.ConditionTrue,
+		Reason: v1.PodReasonDeferred,
+	})
+	preemptorPod, err = cs.CoreV1().Pods(ns).UpdateStatus(testCtx.Ctx, preemptorPod, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update deferred status for preemptor pod: %v", err)
 	}
 
 	// victim-cpu must be evicted
