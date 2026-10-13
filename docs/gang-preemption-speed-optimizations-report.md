@@ -15,6 +15,7 @@ To resolve these scalability challenges, five optimization prototypes were inves
 | **Idea 3 (Task #1252)**<br>`gang-preempt-idea-3` | **Logarithmic Pod Reprieval in `SelectVictimsOnNode`** | $\mathcal{O}(K) \to \mathcal{O}(\log K)$ Filter calls via exponential doubling + binary search | **2.5x to 31.2x** fewer Filter plugin invocations (16 vs 500 calls on 500-pod nodes) | **100% Bit-for-Bit**<br>(Strict PR #140999 & #141785 order preservation) | **PASS**<br>(Zero races) | **PASS**<br>(Adopt in Layer 2) |
 | **Idea 4 (Task #1253)**<br>`gang-preempt-idea-4` | **Reusable Homogeneous Pod Template Feasibility Caching** | Cache static Filter evaluations (`NodeAffinity`, `Taints`) by PodSignature | **Eliminates static Filter calls** across homogeneous gang pods per node | **100% Bit-for-Bit**<br>(CompositePodGroup tier isolation verified) | **PASS**<br>(Zero races) | **PASS**<br>(Adopt in Layer 2) |
 | **Idea 5 (Task #1254)**<br>`gang-preempt-idea-5` | **Admissible Branch-and-Bound Search with Early Exit** | $\mathcal{O}(N^M) \to \mathcal{O}(1) \dots \mathcal{O}(M \log N)$ global gang node assignment | **505x to 18,371x speedup** on small gangs; solves $M=24, N=32$ in **42.25 µs** (vs $10^{36}$ states) | **100% Bit-for-Bit**<br>(Admissibility proved; matches exhaustive oracle) | **PASS**<br>(Zero races) | **PASS**<br>(Adopt in Layer 3) |
+| **Idea 6 (Task #3642)**<br>`gang-preempt-idea-6` | **Topology-Partitioned Hierarchical Failure Domain Search** | $\mathcal{O}(N) \to \mathcal{O}(D)$ failure domain decomposition & quorum pruning | **2.07x to 2.22x slower** due to domain tree allocation & slicing tax (74.2 ms vs 35.7 ms on 1,024 nodes) | **100% Bit-for-Bit**<br>(Conservative pruning verified) | **PASS**<br>(Zero races) | **DISMISSED / UNFAVORABLE**<br>(Subsumed by Ideas 1 & 5) |
 
 ---
 
@@ -186,6 +187,16 @@ Task #1251 investigated batching and parallelizing the inner victim permutation 
 #### 5. Extender Protocol & Invalidation of Sequential Invariants
 - **The Issue:** Preemption extenders (e.g. custom GPU or storage orchestrators) and stateful plugins rely on deterministic sequential victim candidate enumeration.
 - **Failure Mode:** Out-of-order batched victim evaluations violate extender protocol assumptions, causing external extenders to return inconsistent candidate rankings.
+
+### 3.3 Prototype Idea 6: Topology-Partitioned Hierarchical Failure Domain Search (Task #3642)
+
+**Verdict:** **DISMISSED / UNFAVORABLE (Subsumed by Ideas 1 & 5 with Net Negative Overhead)**
+
+Task #3642 investigated decomposing cluster candidate nodes into hierarchical failure domain trees (Zone $\to$ Rack $\to$ Node) and pruning non-viable domains *en masse* before invoking node-level preemption search. While mathematically sound under conservative bounds (achieving 100% bit-for-bit equivalence and zero data races), empirical benchmarking and architectural analysis demonstrate why Idea 6 is unfavorable for upstream adoption:
+1. **Net Negative Latency (2.07x to 2.22x Slower):** Constructing domain trees, computing aggregate resource/pod bitmasks, and re-allocating problem slices introduces an allocation tax of $\mathcal{O}(M \cdot N)$ heap objects. In benchmarks across 16, 64, and 256 pod gangs on 64 to 1,024 nodes, Idea 6 increased search duration from $35.7\text{ ms}$ to $74.2\text{ ms}$ on 1,024 nodes.
+2. **Subsumed by Existing Layers:** Infeasible nodes are already pruned in $\mathcal{O}(1)$ time by Layer 1 Headroom Pruning (Idea 1), and suboptimal node permutations are pruned instantly ($< 5\text{ µs}$) by Layer 3 Admissible Branch-and-Bound (Idea 5) via greedy upper-bound termination. Domain-level pre-filtering saves zero Branch-and-Bound expansions.
+3. **Friction with `PodTopologySpread` (`maxSkew`):** Unlike batch clusters where gangs reside on a single rack, Kubernetes gang workloads distribute across domains under `maxSkew` constraints. Pruning entire domains without full skew simulation risks false unschedulable reporting or partitioning errors.
+*(See `docs/preemption/gang-preemption-speed-idea6-hierarchical-domain-search.md` for full technical report).*
 
 ---
 
