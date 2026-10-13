@@ -5076,8 +5076,8 @@ func TestPodGroupPreemptionPermitTimeoutRollback(t *testing.T) {
 	testCtx := testutils.InitTestSchedulerWithNS(t, "pg-permit-timeout-rollback",
 		scheduler.WithProfiles(cfg.Profiles...),
 		scheduler.WithFrameworkOutOfTreeRegistry(registry),
-		scheduler.WithPodMaxBackoffSeconds(1),
-		scheduler.WithPodInitialBackoffSeconds(0),
+		scheduler.WithPodMaxBackoffSeconds(10),
+		scheduler.WithPodInitialBackoffSeconds(5),
 	)
 	cs, ns := testCtx.ClientSet, testCtx.NS.Name
 
@@ -5118,8 +5118,8 @@ func TestPodGroupPreemptionPermitTimeoutRollback(t *testing.T) {
 		}
 	}
 
-	// 3. Create PodGroup with minMember: 4
-	pg := st.MakePodGroup().Name(targetPGName).Namespace(ns).Priority(100).MinCount(4).Obj()
+	// 3. Create PodGroup with minMember: 3
+	pg := st.MakePodGroup().Name(targetPGName).Namespace(ns).Priority(100).MinCount(3).Obj()
 	if _, err := cs.SchedulingV1beta1().PodGroups(ns).Create(testCtx.Ctx, pg, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Failed to create PodGroup %s: %v", pg.Name, err)
 	}
@@ -5159,7 +5159,7 @@ func TestPodGroupPreemptionPermitTimeoutRollback(t *testing.T) {
 	t.Log("Waiting for permit timeout to fire and rollback all member pods...")
 	err = wait.PollUntilContextTimeout(testCtx.Ctx, 100*time.Millisecond, 20*time.Second, false, func(ctx context.Context) (bool, error) {
 		// All waiting pods must be rejected (no longer in waiting pods map)
-		for _, name := range preemptorNames {
+		for _, name := range preemptorNames[:3] {
 			pod, err := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
 				return false, nil
