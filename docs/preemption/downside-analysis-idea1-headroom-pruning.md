@@ -3,11 +3,11 @@
 **Date:** October 2026  
 **Auditor:** Adversarial Red-Team / Systems Architecture Review  
 **Target Subsystems:**
-- `pkg/scheduler/framework/preemption/headroom.go` (`CanNodeFitPreemptorHeadroom`)
+- `pkg/scheduler/framework/preemption/headroom.go` (`CanNodeFitPreemptorHeadroom`, `CanNodeFitPreemptorHeadroomWithRequests`)
 - `pkg/scheduler/framework/preemption/preemption.go` (`DryRunPreemption`, `canNodeFitPreemptorHeadroom`)
 - `pkg/scheduler/framework/plugins/defaultpreemption/`
 **Target Branch:** `bsalmon-preempt`  
-**Tracking Origin:** Task 984 / PR #74
+**Tracking Origin:** Task 984 / PR #74 / PR #80
 
 ---
 
@@ -15,9 +15,9 @@
 
 ### 1.1 Adversarial Verdict: **REJECT IN CURRENT FORM / REQUIRE COMPLETE REFACTORING**
 
-Coarse-Grained Capacity & Headroom Pruning (Idea 1, PR #74) was introduced as a preliminary heuristic to fast-fail nodes in `DryRunPreemption` before executing the full preemption evaluation pipeline (`GetVictimsOnNode` and `SelectVictimsOnNode`). 
+Coarse-Grained Capacity & Headroom Pruning (Idea 1, PR #74, partially updated in PR #80) was introduced as a preliminary heuristic to fast-fail nodes in `DryRunPreemption` before executing the full preemption evaluation pipeline (`GetVictimsOnNode` and `SelectVictimsOnNode`). 
 
-Following an exhaustive adversarial audit and red-team investigation, **Idea 1 in its current form introduces critical semantic bugs, severe security vulnerabilities, and negative performance regressions in key production topologies.** 
+Following an exhaustive adversarial audit and red-team investigation, **Idea 1 in its current form introduces critical semantic bugs, severe security vulnerabilities, and negative performance regressions in key production topologies.** Even after the partial hardening in PR #80 (which introduced saturated addition and deferred-resize node scoping), the fundamental architectural flaws and failure modes remain unaddressed. 
 
 Specifically, this audit uncovers:
 1. **Critical Security Vulnerability (Preemption Denial of Service):** `CanNodeFitPreemptorHeadroom` fundamentally misinterprets Kubernetes API semantics by treating existing pods with `PreemptionPolicy: PreemptNever` as non-preemptible. Untrusted low-priority tenants can set `PreemptNever` on batch pods to render them completely immune to eviction, permanently blocking high-priority and system-critical workloads from preempting them.
