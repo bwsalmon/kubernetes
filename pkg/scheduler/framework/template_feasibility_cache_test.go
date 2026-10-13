@@ -114,3 +114,55 @@ func TestTemplateFeasibilityCache_Concurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestTemplateFeasibilityCache_MultiTenantNamespaceIsolation(t *testing.T) {
+	cache := NewTemplateFeasibilityCache()
+
+	// In multi-tenant environments, pod templates across namespaces could have identical
+	// PodSignatures if signature does not include namespace.
+	// When scoped properly to per-gang PodGroupCycleState, distinct gangs in different namespaces
+	// get isolated cycle states. However, within a shared cache, signatures must distinguish or
+	// be scoped per gang.
+	sigTenantA := "ns-tenant-a/sig-worker"
+	sigTenantB := "ns-tenant-b/sig-worker"
+
+	cache.SetStaticFeasibility(sigTenantA, "node-isolated-1", fwk.NewStatus(fwk.Success))
+	cache.SetStaticFeasibility(sigTenantB, "node-isolated-1", fwk.NewStatus(fwk.Unschedulable, "namespace policy denied"))
+
+	statusA, foundA := cache.GetStaticFeasibility(sigTenantA, "node-isolated-1")
+	if !foundA || !statusA.IsSuccess() {
+		t.Fatalf("expected tenant A to succeed on node-isolated-1, got %v", statusA)
+	}
+
+	statusB, foundB := cache.GetStaticFeasibility(sigTenantB, "node-isolated-1")
+	if !foundB || statusB.IsSuccess() || statusB.Message() != "namespace policy denied" {
+		t.Fatalf("expected tenant B to fail on node-isolated-1 with namespace policy denied, got %v", statusB)
+	}
+}
+
+func TestTemplateFeasibilityCache_EdgeCasesAndInvalidation(t *testing.T) {
+	cache := NewTemplateFeasibilityCache()
+	sig := "sig-test-edge"
+
+	// Test empty inputs
+	if status, ok := cache.GetStaticFeasibility("", "node-1"); ok || status != nil {
+		t.Fatalf("expected empty sig to be rejected")
+	}
+	if status, ok := cache.GetStaticFeasibility(sig, ""); ok || status != nil {
+		t.Fatalf("expected empty node to be rejected")
+	}
+
+	// Cache status overwrite (simulating node update / taint addition)
+	cache.SetStaticFeasibility(sig, "node-1", fwk.NewStatus(fwk.Success))
+	status, ok := cache.GetStaticFeasibility(sig, "node-1")
+	if !ok || !status.IsSuccess() {
+		t.Fatalf("expected success")
+	}
+
+	// Dynamic update: node became unschedulable / tainted
+	cache.SetStaticFeasibility(sig, "node-1", fwk.NewStatus(fwk.Unschedulable, "node tainted"))
+	status, ok = cache.GetStaticFeasibility(sig, "node-1")
+	if !ok || status.IsSuccess() || status.Message() != "node tainted" {
+		t.Fatalf("expected updated failure status after node taint mutation")
+	}
+}
