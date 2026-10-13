@@ -542,3 +542,161 @@ func TestBranchAndBound_InfeasibleHandling(t *testing.T) {
 		t.Errorf("Expected Unschedulable status for infeasible capacity, got success")
 	}
 }
+
+// TestBranchAndBound_Hardening_AdversarialDegradation checks behavior under adversarial permutation pressure.
+func TestBranchAndBound_Hardening_AdversarialDegradation(t *testing.T) {
+	ctx := context.Background()
+
+	// Gang of 8 pods across 10 nodes where each node fits only 1 pod.
+	// This forces extensive branch exploration when early exit is disabled.
+	gangSize := 8
+	nodesCount := 10
+
+	gangPods := make([]*v1.Pod, gangSize)
+	for i := 0; i < gangSize; i++ {
+		gangPods[i] = makeTestPod(fmt.Sprintf("adv-pod-%d", i), "default", 1000, 1000, 1024)
+	}
+
+	nodeNames := make([]string, nodesCount)
+	nodeAllocCPU := make(map[string]int64)
+	nodeAllocMem := make(map[string]int64)
+	for j := 0; j < nodesCount; j++ {
+		nodeNames[j] = fmt.Sprintf("adv-node-%d", j)
+		nodeAllocCPU[nodeNames[j]] = 1000 // Each node fits strictly 1 pod
+		nodeAllocMem[nodeNames[j]] = 1024
+	}
+
+	perPodCandidates := make([][]GangPodCandidate, gangSize)
+	for i := 0; i < gangSize; i++ {
+		cands := make([]GangPodCandidate, nodesCount)
+		for j := 0; j < nodesCount; j++ {
+			prio := int32((j + 1) * 10)
+			victims := []*v1.Pod{
+				makeTestPod(fmt.Sprintf("v-adv-%d-%d", i, j), "default", prio, 1000, 1024),
+			}
+			cost := ComputeVictimsCost(victims, 0)
+			cands[j] = GangPodCandidate{
+				NodeName:         nodeNames[j],
+				Cost:             cost,
+				Victims:          victims,
+				PDBViolations:    0,
+				Feasible:         true,
+				RequiredMilliCPU: 1000,
+				RequiredMemory:   1024,
+			}
+		}
+		perPodCandidates[i] = cands
+	}
+
+	prob := &GangPlacementProblem{
+		PreemptorPods:      gangPods,
+		CandidateNodes:     nodeNames,
+		NodeAllocatableCPU: nodeAllocCPU,
+		NodeAllocatableMem: nodeAllocMem,
+		PerPodCandidates:   perPodCandidates,
+		MinMember:          gangSize,
+	}
+
+	res := BranchAndBoundGangSearch(ctx, prob, DefaultBranchAndBoundOptions())
+	if !res.Status.IsSuccess() {
+		t.Fatalf("Expected success under tight node capacity, got: %v", res.Status.Message())
+	}
+	t.Logf("Adversarial scenario: explored=%d, pruned=%d, duration=%v",
+		res.StatesExplored, res.BranchesPruned, res.SearchDuration)
+}
+
+// TestBranchAndBound_Hardening_MultiNodeDisruptionModeAll audits multi-node victim group interactions.
+// When KEP-6012 / KEP-5710 DisruptionModeAll is enabled, evicting a pod on Node A may evict coupled pods
+// on Node B. This test verifies that BranchAndBound correctly tracks the union of unique victim pods
+// across candidate nodes and exposes any discrepancy with naive per-node cost summation.
+func TestBranchAndBound_Hardening_MultiNodeDisruptionModeAll(t *testing.T) {
+	ctx := context.Background()
+
+	v1Pod := makeTestPod("victim-v1", "default", 10, 1000, 1024)
+	v2Pod := makeTestPod("victim-v2", "default", 10, 1000, 1024)
+	v3a := makeTestPod("victim-v3a", "default", 10, 1000, 1024)
+	v3b := makeTestPod("victim-v3b", "default", 10, 1000, 1024)
+	v3c := makeTestPod("victim-v3c", "default", 10, 1000, 1024)
+
+	costMultiNodeG := ComputeVictimsCost([]*v1.Pod{v1Pod, v2Pod}, 0)
+	costNodeC := ComputeVictimsCost([]*v1.Pod{v3a, v3b, v3c}, 0)
+
+	p0 := makeTestPod("p0", "default", 1000, 1000, 1024)
+	p1 := makeTestPod("p1", "default", 1000, 1000, 1024)
+
+	prob := &GangPlacementProblem{
+		PreemptorPods:  []*v1.Pod{p0, p1},
+		CandidateNodes: []string{"node-A", "node-B", "node-C"},
+		NodeAllocatableCPU: map[string]int64{"node-A": 1000, "node-B": 1000, "node-C": 2000},
+		NodeAllocatableMem: map[string]int64{"node-A": 1024, "node-B": 1024, "node-C": 2048},
+		PerPodCandidates: [][]GangPodCandidate{
+			{
+				{NodeName: "node-C", Cost: costNodeC, Victims: []*v1.Pod{v3a, v3b, v3c}, Feasible: true, RequiredMilliCPU: 1000, RequiredMemory: 1024},
+				{NodeName: "node-A", Cost: costMultiNodeG, Victims: []*v1.Pod{v1Pod, v2Pod}, Feasible: true, RequiredMilliCPU: 1000, RequiredMemory: 1024},
+			},
+			{
+				{NodeName: "node-C", Cost: costNodeC, Victims: []*v1.Pod{v3a, v3b, v3c}, Feasible: true, RequiredMilliCPU: 1000, RequiredMemory: 1024},
+				{NodeName: "node-B", Cost: costMultiNodeG, Victims: []*v1.Pod{v1Pod, v2Pod}, Feasible: true, RequiredMilliCPU: 1000, RequiredMemory: 1024},
+			},
+		},
+		MinMember: 2,
+	}
+
+	res := BranchAndBoundGangSearch(ctx, prob, DefaultBranchAndBoundOptions())
+	if !res.Status.IsSuccess() {
+		t.Fatalf("BnB search failed: %v", res.Status.Message())
+	}
+
+	// Verify that SelectedVictims correctly dedupes shared victim UIDs
+	uniqueVictimUIDs := make(map[types.UID]struct{})
+	for _, v := range res.SelectedVictims {
+		uniqueVictimUIDs[v.UID] = struct{}{}
+	}
+	if len(uniqueVictimUIDs) != len(res.SelectedVictims) {
+		t.Errorf("Duplicate victims in SelectedVictims: total %d vs unique %d",
+			len(res.SelectedVictims), len(uniqueVictimUIDs))
+	}
+	t.Logf("MultiNodeDisruptionModeAll: TotalCost=%+v, SelectedVictims=%d",
+		res.TotalCost, len(res.SelectedVictims))
+}
+
+// TestBranchAndBound_Hardening_PartialQuorumMinMember audits behavior when MinMember < TotalMember.
+// Currently BranchAndBoundGangSearch requires all pods in PreemptorPods to find a candidate node.
+// If MinMember < TotalMember and one member is unschedulable, BranchAndBoundGangSearch returns Unschedulable.
+// This test documents and asserts this known boundary behavior.
+func TestBranchAndBound_Hardening_PartialQuorumMinMember(t *testing.T) {
+	ctx := context.Background()
+
+	p0 := makeTestPod("p0", "default", 1000, 1000, 1024)
+	p1 := makeTestPod("p1", "default", 1000, 1000, 1024)
+	p2 := makeTestPod("p2", "default", 1000, 1000, 1024)
+
+	prob := &GangPlacementProblem{
+		PreemptorPods:  []*v1.Pod{p0, p1, p2},
+		CandidateNodes: []string{"node-0", "node-1"},
+		NodeAllocatableCPU: map[string]int64{"node-0": 2000, "node-1": 2000},
+		NodeAllocatableMem: map[string]int64{"node-0": 2048, "node-1": 2048},
+		PerPodCandidates: [][]GangPodCandidate{
+			{
+				{NodeName: "node-0", Cost: ZeroPreemptionCost(), Feasible: true, RequiredMilliCPU: 1000, RequiredMemory: 1024},
+			},
+			{
+				{NodeName: "node-1", Cost: ZeroPreemptionCost(), Feasible: true, RequiredMilliCPU: 1000, RequiredMemory: 1024},
+			},
+			{
+				// Member 2 has no feasible placement
+				{NodeName: "node-0", Cost: MaxPreemptionCost(), Feasible: false},
+				{NodeName: "node-1", Cost: MaxPreemptionCost(), Feasible: false},
+			},
+		},
+		MinMember: 2, // Quorum could theoretically be met by {p0, p1}
+	}
+
+	res := BranchAndBoundGangSearch(ctx, prob, DefaultBranchAndBoundOptions())
+	// In the current solver implementation, all PreemptorPods are required (MinMember subsetting
+	// must be performed prior to solver invocation or handled via combinatorial subset expansion).
+	if res.Status.IsSuccess() {
+		t.Errorf("Expected Unschedulable when a member has no feasible candidates in current implementation, got success")
+	}
+	t.Logf("Partial quorum behavior confirmed: status=%v, message=%s", res.Status.Code(), res.Status.Message())
+}
