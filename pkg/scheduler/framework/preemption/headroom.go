@@ -18,6 +18,7 @@ package preemption
 
 import (
 	"fmt"
+	"math"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -27,6 +28,16 @@ import (
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/helper"
 )
+
+func saturatingAdd(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
+}
 
 // CanNodeFitPreemptorHeadroom performs a conservative, coarse-grained check to determine
 // if the candidate node could possibly satisfy the preemptor pod's resource requests and
@@ -43,14 +54,46 @@ func CanNodeFitPreemptorHeadroom(
 	compositePodGroupSnapshot fwk.CompositePodGroupLister,
 	enablePodLevelResources bool,
 ) (bool, *fwk.Status) {
+	return CanNodeFitPreemptorHeadroomWithRequests(
+		logger,
+		pod,
+		nil,
+		nodeInfo,
+		podGroupSnapshot,
+		compositePodGroupSnapshot,
+		enablePodLevelResources,
+	)
+}
+
+// CanNodeFitPreemptorHeadroomWithRequests is an optimized variant of CanNodeFitPreemptorHeadroom
+// that accepts precalculated pod requests to eliminate repeated allocation churn across candidate nodes.
+func CanNodeFitPreemptorHeadroomWithRequests(
+	logger klog.Logger,
+	pod *v1.Pod,
+	podReq v1.ResourceList,
+	nodeInfo fwk.NodeInfo,
+	podGroupSnapshot fwk.PodGroupLister,
+	compositePodGroupSnapshot fwk.CompositePodGroupLister,
+	enablePodLevelResources bool,
+) (bool, *fwk.Status) {
 	if pod == nil || nodeInfo == nil || nodeInfo.Node() == nil {
 		return false, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "Node or pod is nil")
 	}
 
 	node := nodeInfo.Node()
 
+	// In-Place Pod Vertical Scaling (KEP-1287 & KEP-5836):
+	// If the pod has a deferred resize pending, it is already bound to a specific node (pod.Spec.NodeName).
+	// A deferred resize pod cannot run on or preempt pods on any other node in the cluster.
+	isDeferredResize := resource.IsPodResizeDeferred(pod)
+	if isDeferredResize && len(pod.Spec.NodeName) > 0 && pod.Spec.NodeName != node.Name {
+		return false, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "deferred resize pod cannot preempt on a different node")
+	}
+
 	// 1. Check static NodeSelector labels
-	if len(pod.Spec.NodeSelector) > 0 {
+	// When a pod is undergoing an in-place vertical resize on its existing assigned node,
+	// NodeSelector is skipped (matching NodeAffinity filter plugin behavior).
+	if !isDeferredResize && len(pod.Spec.NodeSelector) > 0 {
 		selector := labels.SelectorFromSet(pod.Spec.NodeSelector)
 		if !selector.Matches(labels.Set(node.Labels)) {
 			return false, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "node(s) didn't match Pod's node selector")
@@ -58,14 +101,18 @@ func CanNodeFitPreemptorHeadroom(
 	}
 
 	// 2. Check static NoSchedule and NoExecute taints
-	if _, untolerated := corev1helpers.FindMatchingUntoleratedTaint(
-		logger,
-		node.Spec.Taints,
-		pod.Spec.Tolerations,
-		helper.DoNotScheduleTaintsFilterFunc(),
-		false,
-	); untolerated {
-		return false, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "node(s) had untolerated taint(s)")
+	// When a pod is undergoing an in-place vertical resize on its existing assigned node,
+	// NoSchedule taints are skipped (matching TaintToleration filter plugin behavior).
+	if !isDeferredResize {
+		if _, untolerated := corev1helpers.FindMatchingUntoleratedTaint(
+			logger,
+			node.Spec.Taints,
+			pod.Spec.Tolerations,
+			helper.DoNotScheduleTaintsFilterFunc(),
+			false,
+		); untolerated {
+			return false, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "node(s) had untolerated taint(s)")
+		}
 	}
 
 	// 3. Check resource capacity and headroom
@@ -74,10 +121,12 @@ func CanNodeFitPreemptorHeadroom(
 		return true, nil
 	}
 
-	preemptorPriority := corev1helpers.PodPriority(pod)
-	podReq := resource.PodRequests(pod, resource.PodResourcesOptions{
-		SkipPodLevelResources: !enablePodLevelResources,
-	})
+	preemptorPriority := getPodPriority(pod, podGroupSnapshot, compositePodGroupSnapshot)
+	if podReq == nil {
+		podReq = resource.PodRequests(pod, resource.PodResourcesOptions{
+			SkipPodLevelResources: !enablePodLevelResources,
+		})
+	}
 	podCPU := podReq.Cpu().MilliValue()
 	podMem := podReq.Memory().Value()
 	podStorage := podReq.StorageEphemeral().Value()
@@ -106,15 +155,15 @@ func CanNodeFitPreemptorHeadroom(
 			nonPreemptiblePodCount++
 			res := pi.CalculateResource().Resource
 			if res != nil {
-				nonPreemptibleCPU += res.GetMilliCPU()
-				nonPreemptibleMem += res.GetMemory()
-				nonPreemptibleStorage += res.GetEphemeralStorage()
+				nonPreemptibleCPU = saturatingAdd(nonPreemptibleCPU, res.GetMilliCPU())
+				nonPreemptibleMem = saturatingAdd(nonPreemptibleMem, res.GetMemory())
+				nonPreemptibleStorage = saturatingAdd(nonPreemptibleStorage, res.GetEphemeralStorage())
 				if len(res.GetScalarResources()) > 0 {
 					if nonPreemptibleScalars == nil {
 						nonPreemptibleScalars = make(map[v1.ResourceName]int64)
 					}
 					for sName, sVal := range res.GetScalarResources() {
-						nonPreemptibleScalars[sName] += sVal
+						nonPreemptibleScalars[sName] = saturatingAdd(nonPreemptibleScalars[sName], sVal)
 					}
 				}
 			}
