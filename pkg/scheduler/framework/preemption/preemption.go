@@ -504,6 +504,16 @@ func (ev *Evaluator) DryRunPreemption(ctx context.Context, state fwk.CycleState,
 				mu.Unlock()
 				return
 			}
+			// Idea 11: DRA Structured Resource Claim Allocation Pre-Filtering (O(1) driver & device pool check)
+			if ev.Handler != nil && ev.Handler.SharedDRAManager() != nil && len(pod.Spec.ResourceClaims) > 0 {
+				if canFitDRA, draStatus := DRADevicePoolPreFilter(logger, state, pod, nodeInfo, ev.Handler.SharedDRAManager(), ev.podGroupSnapshot, ev.compositePodGroupSnapshot); !canFitDRA {
+					logger.V(5).Info("Node pruned by DRA device pool pre-filter", "node", nodeInfo.Node().Name, "pod", klog.KObj(pod), "reason", draStatus.Message())
+					mu.Lock()
+					nodeStatuses.Set(nodeInfo.Node().Name, draStatus)
+					mu.Unlock()
+					return
+				}
+			}
 		}
 
 		// GetVictimsOnNode is called with a shared nodeInfo. The returned DomainVictims
