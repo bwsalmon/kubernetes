@@ -26,6 +26,7 @@ import (
 	policy "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/component-helpers/resource"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
@@ -94,6 +95,10 @@ type DefaultPreemption struct {
 	// if WAP is enabled, it factors in the victim type by favoring PodGroups over standalone Pods. When comparing multiple PodGroups,
 	// it prioritizes those with larger group sizes, ultimately using the start time as the final tiebreaker.
 	MoreImportantVictim MoreImportantVictimFunc
+
+	// TopologyCache tracks device and NUMA/PCIe hardware topology allocations
+	// for nodes and pods to enable NUMA-Topology-Aligned Hardware Victim Slicing (Idea 12).
+	TopologyCache NodeResourceTopologyCache
 }
 
 var _ fwk.PostFilterPlugin = &DefaultPreemption{}
@@ -115,10 +120,11 @@ func New(_ context.Context, dpArgs runtime.Object, fh fwk.Handle, fts feature.Fe
 	}
 
 	pl := DefaultPreemption{
-		fh:       fh,
-		fts:      fts,
-		args:     *args,
-		Executor: fh.PreemptionManager().Executor(),
+		fh:            fh,
+		fts:           fts,
+		args:          *args,
+		Executor:      fh.PreemptionManager().Executor(),
+		TopologyCache: NewNodeResourceTopologyCache(),
 	}
 	pl.Evaluator = preemption.NewEvaluator(Name, fh, &pl, pl.fts)
 
@@ -350,31 +356,6 @@ func (pl *DefaultPreemption) SelectVictimsOnNode(
 		return nil, 0, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "No preemption victims found for incoming pod")
 	}
 
-	// As the first step, remove all victims eligible for preemption from the node.
-	for _, victim := range potentialVictims {
-		// If a Victim is a PodGroup spanning multiple nodes, some affected nodes
-		// might not be in the nameToNode map yet. We add them to ensure
-		// they are considered during preemption.
-		for name, nodeInfo := range victim.AffectedNodes() {
-			if _, ok := nameToNode[name]; !ok {
-				nameToNode[name] = nodeInfo
-			}
-		}
-		if err := removeVictim(victim); err != nil {
-			return nil, 0, fwk.AsStatus(err)
-		}
-	}
-
-	// If the preemptor does not fit after removing all the eligible victims,
-	// we are almost done and this node is not suitable for preemption. The only
-	// condition that we could check is if the preemptor is failing to schedule due to
-	// inter-pod affinity to one or more victims, but we have decided not to
-	// support this case for performance reasons. Having affinity to lower
-	// importance (priority) pods is not a recommended configuration anyway.
-	if status := pl.fh.RunFilterPluginsWithNominatedPods(ctx, cycleState, preemptor, nodeInfo); !status.IsSuccess() {
-		return nil, 0, status
-	}
-
 	// Sort potentialVictims by descending importance, which ensures reprieve of
 	// higher importance victims first.
 	sort.Slice(potentialVictims, func(i, j int) bool {
@@ -533,23 +514,210 @@ func (pl *DefaultPreemption) SelectVictimsOnNode(
 		return nil
 	}
 
-	numViolatingVictim := 0
-	if len(violatingVictims) > 0 {
-		violatingDomainVictims := make([]*preemption.DomainVictim, len(violatingVictims))
-		for i, vv := range violatingVictims {
-			violatingDomainVictims[i] = vv.Victim
+	// Check if NUMA-Topology-Aligned Hardware Victim Slicing (Idea 12) applies.
+	// When the preemptor requires SingleNUMANode or PCIe-switch alignment on a
+	// multi-accelerator node, group candidate victims by hardware locality domain
+	// and select the optimal domain with minimal preemption cost.
+	if IsSingleNUMAAlignmentRequired(preemptor, nodeInfo) {
+		numaSelector := NewNUMATopologyAlignedVictimSelector(pl.TopologyCache)
+		rankedDomains, domainVictimsMap, unpinnedVictims := numaSelector.EvaluateDomains(preemptor, nodeInfo, potentialVictims, pdbs, pl.MoreImportantVictim)
+		for _, cand := range rankedDomains {
+			domainVictims := domainVictimsMap[cand.Domain.DomainID]
+			domainCandidates := append([]*preemption.DomainVictim{}, domainVictims...)
+			domainCandidates = append(domainCandidates, unpinnedVictims...)
+
+			for _, victim := range domainCandidates {
+				for name, nInfo := range victim.AffectedNodes() {
+					if _, ok := nameToNode[name]; !ok {
+						nameToNode[name] = nInfo
+					}
+				}
+			}
+
+			var removed []*preemption.DomainVictim
+			removeFailed := false
+			for _, victim := range domainCandidates {
+				if err := removeVictim(victim); err != nil {
+					removeFailed = true
+					break
+				}
+				removed = append(removed, victim)
+			}
+			if removeFailed {
+				for j := len(removed) - 1; j >= 0; j-- {
+					_ = addVictim(removed[j])
+				}
+				continue
+			}
+
+			status := pl.fh.RunFilterPluginsWithNominatedPods(ctx, cycleState, preemptor, nodeInfo)
+			if status.IsSuccess() {
+				// Locality-biased victim slicing succeeded!
+				// Reprieve candidate victims logarithmically within the selected domain,
+				// preserving strict priority ordering and PDB minimization invariants.
+				sort.Slice(domainCandidates, func(i, j int) bool {
+					return pl.MoreImportantVictim(domainCandidates[i], domainCandidates[j])
+				})
+				domViolating, domNonViolating := preemption.FilterVictimsWithPDBViolation(domainCandidates, pdbs)
+				numViolatingVictim := 0
+				if len(domViolating) > 0 {
+					domViolatingVictims := make([]*preemption.DomainVictim, len(domViolating))
+					for i, vv := range domViolating {
+						domViolatingVictims[i] = vv.Victim
+					}
+					if err := reprieveVictimsLogarithmic(domViolatingVictims, func(v *preemption.DomainVictim, index int) {
+						numViolatingVictim += domViolating[index].ViolateCount
+					}); err != nil {
+						return nil, 0, fwk.AsStatus(err)
+					}
+				}
+
+				if len(domNonViolating) > 0 {
+					if err := reprieveVictimsLogarithmic(domNonViolating, func(v *preemption.DomainVictim, index int) {}); err != nil {
+						return nil, 0, fwk.AsStatus(err)
+					}
+				}
+
+				if len(domViolating) != 0 && len(domNonViolating) != 0 {
+					sort.Slice(victims, func(i, j int) bool { return pl.MoreImportantVictim(victims[i], victims[j]) })
+				}
+				var victimPods []*v1.Pod
+				for _, vi := range victims {
+					for _, pi := range vi.Pods() {
+						victimPods = append(victimPods, pi.GetPod())
+					}
+				}
+				return victimPods, numViolatingVictim, nil
+			}
+
+			// Preemptor did not fit with this domain's victims removed (e.g. non-scalar filter failure).
+			// Roll back removals and evaluate next ranked domain.
+			for j := len(removed) - 1; j >= 0; j-- {
+				_ = addVictim(removed[j])
+			}
 		}
-		if err := reprieveVictimsLogarithmic(violatingDomainVictims, func(v *preemption.DomainVictim, index int) {
-			numViolatingVictim += violatingVictims[index].ViolateCount
-		}); err != nil {
-			return nil, 0, fwk.AsStatus(err)
+		// If no domain could satisfy the contiguous request or all domains failed filter check,
+		// cleanly fall back to standard cluster-wide victim ordering (Cross-Socket Fallback).
+	}
+
+	// Check if Priority-Tier Bucket Pre-Partitioning (Idea 8) can be applied.
+	// When candidate victims have no PDB violations and span multiple priority tiers,
+	// we pre-partition them into discrete priority buckets from lowest to highest.
+	// We calculate cumulative resource headroom and remove only the prefix of tiers
+	// needed to satisfy the preemptor's deficits, skipping higher tiers entirely.
+	useBucketPartitioning := len(violatingVictims) == 0 && len(nonViolatingVictims) > 1
+	if useBucketPartitioning {
+		// If a custom MoreImportantVictim ordering inverts priority hierarchy (a lower-priority
+		// pod is ordered before a higher-priority pod), priority-tier bucketing cannot be used.
+		for i := 0; i < len(nonViolatingVictims)-1; i++ {
+			if nonViolatingVictims[i].Priority() < nonViolatingVictims[i+1].Priority() {
+				useBucketPartitioning = false
+				break
+			}
+		}
+	}
+	var buckets []priorityBucket
+	boundaryIndex := 0
+	if useBucketPartitioning {
+		buckets = partitionIntoPriorityBuckets(nonViolatingVictims, pl.MoreImportantVictim)
+		if len(buckets) > 1 {
+			podReq := resource.PodRequests(preemptor, resource.PodResourcesOptions{
+				SkipPodLevelResources: !pl.fts.EnablePodLevelResources,
+			})
+			defCPU, defMem, defStorage, defScalars := calculateResourceDeficits(podReq, nodeInfo)
+			boundaryIndex = findBoundaryBucket(buckets, mainNodeName, defCPU, defMem, defStorage, defScalars)
+		} else {
+			useBucketPartitioning = false
 		}
 	}
 
-	// Now we try to reprieve non-violating victims.
-	if len(nonViolatingVictims) > 0 {
-		if err := reprieveVictimsLogarithmic(nonViolatingVictims, func(v *preemption.DomainVictim, index int) {}); err != nil {
+	if useBucketPartitioning {
+		// Remove only buckets 0..boundaryIndex
+		for i := 0; i <= boundaryIndex; i++ {
+			for _, victim := range buckets[i].victims {
+				for name, nInfo := range victim.AffectedNodes() {
+					if _, ok := nameToNode[name]; !ok {
+						nameToNode[name] = nInfo
+					}
+				}
+				if err := removeVictim(victim); err != nil {
+					return nil, 0, fwk.AsStatus(err)
+				}
+			}
+		}
+
+		status := pl.fh.RunFilterPluginsWithNominatedPods(ctx, cycleState, preemptor, nodeInfo)
+		// Dynamic tier expansion: if non-scalar constraints (HostPort, PodAntiAffinity,
+		// TopologySpread, etc.) fail the filter, expand to include the next higher priority tier.
+		for !status.IsSuccess() && boundaryIndex+1 < len(buckets) {
+			boundaryIndex++
+			for _, victim := range buckets[boundaryIndex].victims {
+				for name, nInfo := range victim.AffectedNodes() {
+					if _, ok := nameToNode[name]; !ok {
+						nameToNode[name] = nInfo
+					}
+				}
+				if err := removeVictim(victim); err != nil {
+					return nil, 0, fwk.AsStatus(err)
+				}
+			}
+			status = pl.fh.RunFilterPluginsWithNominatedPods(ctx, cycleState, preemptor, nodeInfo)
+		}
+		if !status.IsSuccess() {
+			return nil, 0, status
+		}
+	} else {
+		// As the fallback / standard step, remove all victims eligible for preemption from the node.
+		for _, victim := range potentialVictims {
+			// If a Victim is a PodGroup spanning multiple nodes, some affected nodes
+			// might not be in the nameToNode map yet. We add them to ensure
+			// they are considered during preemption.
+			for name, nInfo := range victim.AffectedNodes() {
+				if _, ok := nameToNode[name]; !ok {
+					nameToNode[name] = nInfo
+				}
+			}
+			if err := removeVictim(victim); err != nil {
+				return nil, 0, fwk.AsStatus(err)
+			}
+		}
+
+		// If the preemptor does not fit after removing all the eligible victims,
+		// we are almost done and this node is not suitable for preemption.
+		if status := pl.fh.RunFilterPluginsWithNominatedPods(ctx, cycleState, preemptor, nodeInfo); !status.IsSuccess() {
+			return nil, 0, status
+		}
+	}
+
+	numViolatingVictim := 0
+	if useBucketPartitioning {
+		// Reprieve victims from the removed buckets, starting from the highest priority
+		// tier down to the lowest priority tier.
+		var candidatesToReprieve []*preemption.DomainVictim
+		for i := boundaryIndex; i >= 0; i-- {
+			candidatesToReprieve = append(candidatesToReprieve, buckets[i].victims...)
+		}
+		if err := reprieveVictimsLogarithmic(candidatesToReprieve, func(v *preemption.DomainVictim, index int) {}); err != nil {
 			return nil, 0, fwk.AsStatus(err)
+		}
+	} else {
+		if len(violatingVictims) > 0 {
+			violatingDomainVictims := make([]*preemption.DomainVictim, len(violatingVictims))
+			for i, vv := range violatingVictims {
+				violatingDomainVictims[i] = vv.Victim
+			}
+			if err := reprieveVictimsLogarithmic(violatingDomainVictims, func(v *preemption.DomainVictim, index int) {
+				numViolatingVictim += violatingVictims[index].ViolateCount
+			}); err != nil {
+				return nil, 0, fwk.AsStatus(err)
+			}
+		}
+
+		// Now we try to reprieve non-violating victims.
+		if len(nonViolatingVictims) > 0 {
+			if err := reprieveVictimsLogarithmic(nonViolatingVictims, func(v *preemption.DomainVictim, index int) {}); err != nil {
+				return nil, 0, fwk.AsStatus(err)
+			}
 		}
 	}
 
