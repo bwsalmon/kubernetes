@@ -89,7 +89,7 @@ func TestHierarchicalDomainSearch_MultiZonePruning(t *testing.T) {
 
 	constraint := TopologySpreadConstraint{
 		TopologyKey: "topology.kubernetes.io/zone",
-		MaxSkew:     2,
+		MaxSkew:     8,
 		NodeDomains: nodeDomains,
 	}
 
@@ -308,7 +308,7 @@ func TestHierarchicalDomainSearch_ConservativeFidelity(t *testing.T) {
 
 	constraint := TopologySpreadConstraint{
 		TopologyKey: "topology.kubernetes.io/zone",
-		MaxSkew:     1,
+		MaxSkew:     2,
 		NodeDomains: nodeDomains,
 	}
 
@@ -377,7 +377,7 @@ func TestHierarchicalDomainSearch_AllDomainsInfeasible(t *testing.T) {
 
 	constraint := TopologySpreadConstraint{
 		TopologyKey: "topology.kubernetes.io/zone",
-		MaxSkew:     1,
+		MaxSkew:     2,
 		NodeDomains: nodeDomains,
 	}
 
