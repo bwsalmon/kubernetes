@@ -824,6 +824,19 @@ func (pl *InterPodAffinity) Filter(ctx context.Context, cycleState fwk.CycleStat
 		return nil
 	}
 
+	// Idea 13: Inter-Pod Anti-Affinity Incremental Bitmask Matrix fast-path check
+	if matrix, ok := GetInterPodAntiAffinityBitmaskMatrix(cycleState); ok && matrix != nil && !matrix.FallbackToStandard() {
+		if nodeInfo.Node() != nil {
+			dIdx := matrix.DomainIndexForNode(nodeInfo.Node().Name)
+			if dIdx >= 0 {
+				pIdx := matrix.PodIndex(pod)
+				if pIdx >= 0 && matrix.IsViolated(dIdx, pIdx) {
+					return fwk.NewStatus(fwk.Unschedulable, ErrReasonAntiAffinityRulesNotMatch)
+				}
+			}
+		}
+	}
+
 	state, err := getPreFilterState(cycleState)
 	if err != nil {
 		return fwk.AsStatus(err)
