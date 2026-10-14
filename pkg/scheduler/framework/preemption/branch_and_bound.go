@@ -188,14 +188,15 @@ type GangPodCandidate struct {
 
 // GangPlacementProblem encapsulates the full problem space for gang preemption placement.
 type GangPlacementProblem struct {
-	PreemptorPods       []*v1.Pod
-	CandidateNodes      []string
-	NodeAllocatableCPU  map[string]int64 // Millicores available for preemptor pods
-	NodeAllocatableMem  map[string]int64 // Memory bytes available for preemptor pods
-	NodeMaxPods         map[string]int
-	PerPodCandidates    [][]GangPodCandidate // [podIndex][candidateIndex]
-	TopologyConstraints []TopologySpreadConstraint
-	MinMember           int
+	PreemptorPods                    []*v1.Pod
+	CandidateNodes                   []string
+	NodeAllocatableCPU               map[string]int64 // Millicores available for preemptor pods
+	NodeAllocatableMem               map[string]int64 // Memory bytes available for preemptor pods
+	NodeMaxPods                      map[string]int
+	PerPodCandidates                 [][]GangPodCandidate // [podIndex][candidateIndex]
+	TopologyConstraints              []TopologySpreadConstraint
+	CollectiveCommunicationBounding  *CollectiveCommunicationBoundingSpec // Idea 14: network fabric diameter bounding
+	MinMember                        int
 }
 
 // GangPlacementResult stores the output of the multi-node gang placement search.
@@ -203,6 +204,7 @@ type GangPlacementResult struct {
 	PodAssignments      map[types.UID]string // pod UID -> assigned node name
 	NodeAssignments     map[string][]*v1.Pod // node name -> assigned preemptor pods
 	TotalCost           PreemptionCost
+	CollectiveDiameter  int // Maximum fabric hop distance between any pair of assigned pods
 	SelectedVictims     []*v1.Pod
 	SelectedVictimUIDs  sets.Set[types.UID]
 	StatesExplored      int
@@ -403,6 +405,11 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 		topoCounts[tIdx] = make(map[string]int)
 	}
 
+	var networkTracker *NetworkDiameterBoundingTracker
+	if prob.CollectiveCommunicationBounding != nil {
+		networkTracker = NewNetworkDiameterBoundingTracker(prob.CollectiveCommunicationBounding)
+	}
+
 	var search func(podIdx int, currentCost PreemptionCost)
 	search = func(podIdx int, currentCost PreemptionCost) {
 		if earlyExit {
@@ -461,6 +468,12 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 				if nodePodCount[nodeName]+1 > prob.NodeMaxPods[nodeName] {
 					continue
 				}
+			}
+
+			// 1b. Check Network Diameter Bounding Sphere (Idea 14)
+			if networkTracker != nil && !networkTracker.CanAcceptNode(nodeName) {
+				branchesPruned++
+				continue
 			}
 
 			// 2. Check Topology Spread Constraints
@@ -531,6 +544,9 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			nodeVictimSets[nodeName] = nextSet
 			nodeVictimPods[nodeName] = nextVictims
 			nodePDBViolations[nodeName] = nextPDB
+			if networkTracker != nil {
+				networkTracker.PushNode(nodeName)
+			}
 			for tIdx, tc := range prob.TopologyConstraints {
 				domain := tc.NodeDomains[nodeName]
 				if domain != "" {
@@ -545,6 +561,9 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			nodeUsedCPU[nodeName] -= cand.RequiredMilliCPU
 			nodeUsedMem[nodeName] -= cand.RequiredMemory
 			nodePodCount[nodeName]--
+			if networkTracker != nil {
+				networkTracker.PopNode()
+			}
 			if hasSet {
 				nodeVictimSets[nodeName] = existingSet
 			} else {
@@ -595,6 +614,11 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 		topoCounts[tIdx] = make(map[string]int)
 	}
 
+	var networkTracker *NetworkDiameterBoundingTracker
+	if prob.CollectiveCommunicationBounding != nil {
+		networkTracker = NewNetworkDiameterBoundingTracker(prob.CollectiveCommunicationBounding)
+	}
+
 	for podIdx := 0; podIdx < numPods; podIdx++ {
 		bestCandIdx := -1
 		bestIncrementalCost := MaxPreemptionCost()
@@ -613,6 +637,11 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 				continue
 			}
 			if prob.NodeMaxPods != nil && nodePodCount[nodeName]+1 > prob.NodeMaxPods[nodeName] {
+				continue
+			}
+
+			// Network diameter bounding check (Idea 14)
+			if networkTracker != nil && !networkTracker.CanAcceptNode(nodeName) {
 				continue
 			}
 
@@ -647,6 +676,9 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 		nodeUsedCPU[cand.NodeName] += cand.RequiredMilliCPU
 		nodeUsedMem[cand.NodeName] += cand.RequiredMemory
 		nodePodCount[cand.NodeName]++
+		if networkTracker != nil {
+			networkTracker.PushNode(cand.NodeName)
+		}
 		for tIdx, tc := range prob.TopologyConstraints {
 			domain := tc.NodeDomains[cand.NodeName]
 			if domain != "" {
@@ -726,6 +758,22 @@ func evaluatePlacement(prob *GangPlacementProblem, assignments []int) (bool, Pre
 		}
 	}
 
+	// Validate collective communication network diameter bounding constraint (Idea 14)
+	if prob.CollectiveCommunicationBounding != nil && prob.CollectiveCommunicationBounding.MaxDiameter >= 0 {
+		nodes := make([]string, len(assignments))
+		for i, candIdx := range assignments {
+			nodes[i] = prob.PerPodCandidates[i][candIdx].NodeName
+		}
+		diam := ComputePlacementDiameter(
+			nodes,
+			prob.CollectiveCommunicationBounding.DistanceMatrix,
+			prob.CollectiveCommunicationBounding.NodeCoordinates,
+		)
+		if diam > prob.CollectiveCommunicationBounding.MaxDiameter {
+			return false, MaxPreemptionCost()
+		}
+	}
+
 	// Calculate exact total cost
 	totalCost := ZeroPreemptionCost()
 	for nodeName, vPods := range nodeVictimPods {
@@ -743,11 +791,19 @@ func buildPlacementResult(prob *GangPlacementProblem, assignments []int, cost Pr
 	victimSet := sets.New[types.UID]()
 	var victimPods []*v1.Pod
 
+	var assignedNodeNames []string
+	if prob.CollectiveCommunicationBounding != nil {
+		assignedNodeNames = make([]string, 0, len(assignments))
+	}
+
 	for podIdx, candIdx := range assignments {
 		pod := prob.PreemptorPods[podIdx]
 		cand := prob.PerPodCandidates[podIdx][candIdx]
 		podAssignments[pod.UID] = cand.NodeName
 		nodeAssignments[cand.NodeName] = append(nodeAssignments[cand.NodeName], pod)
+		if prob.CollectiveCommunicationBounding != nil {
+			assignedNodeNames = append(assignedNodeNames, cand.NodeName)
+		}
 
 		for _, v := range cand.Victims {
 			if !victimSet.Has(v.UID) {
@@ -757,10 +813,20 @@ func buildPlacementResult(prob *GangPlacementProblem, assignments []int, cost Pr
 		}
 	}
 
+	diameter := HopSameNode
+	if prob.CollectiveCommunicationBounding != nil {
+		diameter = ComputePlacementDiameter(
+			assignedNodeNames,
+			prob.CollectiveCommunicationBounding.DistanceMatrix,
+			prob.CollectiveCommunicationBounding.NodeCoordinates,
+		)
+	}
+
 	return &GangPlacementResult{
 		PodAssignments:     podAssignments,
 		NodeAssignments:    nodeAssignments,
 		TotalCost:          cost,
+		CollectiveDiameter:  diameter,
 		SelectedVictims:    victimPods,
 		SelectedVictimUIDs: victimSet,
 		StatesExplored:     explored,
