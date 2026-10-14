@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
 )
 
 // PreemptionCost encapsulates the multi-metric objective vector used in candidate node selection.
@@ -196,6 +197,7 @@ type GangPlacementProblem struct {
 	PerPodCandidates                 [][]GangPodCandidate // [podIndex][candidateIndex]
 	TopologyConstraints              []TopologySpreadConstraint
 	CollectiveCommunicationBounding  *CollectiveCommunicationBoundingSpec // Idea 14: network fabric diameter bounding
+	AntiAffinityMatrix               *interpodaffinity.InterPodAntiAffinityBitmaskMatrix  // Idea 13 incremental bitmask matrix
 	MinMember                        int
 }
 
@@ -332,6 +334,11 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			SearchDuration:  time.Since(startTime),
 			Status:          fwk.NewStatus(fwk.Success),
 		}
+	}
+
+	if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+		prob.AntiAffinityMatrix.ResetToExisting()
+		defer prob.AntiAffinityMatrix.ResetToExisting()
 	}
 
 	// 1. Precompute per-pod minimum feasible lower-bound costs
@@ -544,6 +551,15 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			cand := prob.PerPodCandidates[podIdx][candIdx]
 			nodeName := cand.NodeName
 
+			// 0. Check Idea 13 Inter-Pod Anti-Affinity Bitmask Matrix
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 && prob.AntiAffinityMatrix.IsViolated(dIdx, podIdx) {
+					branchesPruned++
+					continue
+				}
+			}
+
 			// 1. Check Node Capacity Constraints
 			if prob.NodeAllocatableCPU != nil {
 				if nodeUsedCPU[nodeName]+cand.RequiredMilliCPU > prob.NodeAllocatableCPU[nodeName] {
@@ -645,11 +661,23 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 					topoCounts[tIdx][domain]++
 				}
 			}
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 {
+					prob.AntiAffinityMatrix.ApplyAssignment(dIdx, podIdx)
+				}
+			}
 
 			// Recurse to next pod
 			search(podIdx+1, newCurrentCost)
 
 			// Revert state mutation
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 {
+					prob.AntiAffinityMatrix.RevertAssignment(dIdx, podIdx)
+				}
+			}
 			nodeUsedCPU[nodeName] -= cand.RequiredMilliCPU
 			nodeUsedMem[nodeName] -= cand.RequiredMemory
 			nodePodCount[nodeName]--
@@ -702,6 +730,10 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 
 // computeGreedyPlacement finds an initial feasible placement using greedy best-candidate assignment.
 func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, bool) {
+	if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+		prob.AntiAffinityMatrix.ResetToExisting()
+		defer prob.AntiAffinityMatrix.ResetToExisting()
+	}
 	numPods := len(prob.PreemptorPods)
 	assignments := make([]int, numPods)
 
@@ -760,6 +792,14 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 				continue
 			}
 
+			// Idea 13 Anti-affinity bitmask check
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 && prob.AntiAffinityMatrix.IsViolated(dIdx, podIdx) {
+					continue
+				}
+			}
+
 			if cand.Cost.Less(bestIncrementalCost) {
 				bestIncrementalCost = cand.Cost
 				bestCandIdx = candIdx
@@ -772,6 +812,12 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 
 		assignments[podIdx] = bestCandIdx
 		cand := prob.PerPodCandidates[podIdx][bestCandIdx]
+		if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+			dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(cand.NodeName)
+			if dIdx >= 0 {
+				prob.AntiAffinityMatrix.ApplyAssignment(dIdx, podIdx)
+			}
+		}
 		nodeUsedCPU[cand.NodeName] += cand.RequiredMilliCPU
 		nodeUsedMem[cand.NodeName] += cand.RequiredMemory
 		nodePodCount[cand.NodeName]++
@@ -795,6 +841,10 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 
 // evaluatePlacement computes validity and exact combined preemption cost for a candidate assignment vector.
 func evaluatePlacement(prob *GangPlacementProblem, assignments []int) (bool, PreemptionCost) {
+	if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+		prob.AntiAffinityMatrix.ResetToExisting()
+		defer prob.AntiAffinityMatrix.ResetToExisting()
+	}
 	nodeUsedCPU := make(map[string]int64)
 	nodeUsedMem := make(map[string]int64)
 	nodePodCount := make(map[string]int)
@@ -828,6 +878,17 @@ func evaluatePlacement(prob *GangPlacementProblem, assignments []int) (bool, Pre
 		nodeUsedCPU[nodeName] += cand.RequiredMilliCPU
 		nodeUsedMem[nodeName] += cand.RequiredMemory
 		nodePodCount[nodeName]++
+
+		// Idea 13 Anti-affinity bitmask check & assignment
+		if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+			dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+			if dIdx >= 0 {
+				if prob.AntiAffinityMatrix.IsViolated(dIdx, podIdx) {
+					return false, MaxPreemptionCost()
+				}
+				prob.AntiAffinityMatrix.ApplyAssignment(dIdx, podIdx)
+			}
+		}
 
 		// Topology
 		for tIdx, tc := range prob.TopologyConstraints {
