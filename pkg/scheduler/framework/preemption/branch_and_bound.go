@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/interpodaffinity"
 )
 
 // PreemptionCost encapsulates the multi-metric objective vector used in candidate node selection.
@@ -196,6 +197,7 @@ type GangPlacementProblem struct {
 	PerPodCandidates                 [][]GangPodCandidate // [podIndex][candidateIndex]
 	TopologyConstraints              []TopologySpreadConstraint
 	CollectiveCommunicationBounding  *CollectiveCommunicationBoundingSpec // Idea 14: network fabric diameter bounding
+	AntiAffinityMatrix               *interpodaffinity.InterPodAntiAffinityBitmaskMatrix  // Idea 13 incremental bitmask matrix
 	MinMember                        int
 }
 
@@ -220,15 +222,17 @@ type BranchAndBoundOptions struct {
 	UseGreedyUpperBound      bool
 	UseBestFirstBranchOrder  bool
 	MaxExploredStates        int
+	EnableSuffixQuorumPruning bool
 }
 
 // DefaultBranchAndBoundOptions provides standard optimal configuration.
 func DefaultBranchAndBoundOptions() BranchAndBoundOptions {
 	return BranchAndBoundOptions{
-		EnableEarlyExit:         true,
-		UseGreedyUpperBound:     true,
-		UseBestFirstBranchOrder: true,
-		MaxExploredStates:       50000,
+		EnableEarlyExit:          true,
+		UseGreedyUpperBound:      true,
+		UseBestFirstBranchOrder:  true,
+		MaxExploredStates:        50000,
+		EnableSuffixQuorumPruning: true,
 	}
 }
 
@@ -236,6 +240,12 @@ func DefaultBranchAndBoundOptions() BranchAndBoundOptions {
 // Used as the exact ground-truth baseline oracle for validating BranchAndBound equivalence.
 func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *GangPlacementResult {
 	startTime := time.Now()
+	if err := ctx.Err(); err != nil {
+		return &GangPlacementResult{
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+		}
+	}
 	numPods := len(prob.PreemptorPods)
 	if numPods == 0 {
 		return &GangPlacementResult{
@@ -256,6 +266,9 @@ func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *Gang
 
 	var search func(podIdx int)
 	search = func(podIdx int) {
+		if ctx.Err() != nil {
+			return
+		}
 		if podIdx == numPods {
 			statesExplored++
 			// Validate feasibility and compute total cost of the complete assignment
@@ -282,6 +295,14 @@ func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *Gang
 
 	search(0)
 
+	if ctx.Err() != nil {
+		return &GangPlacementResult{
+			StatesExplored: statesExplored,
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", ctx.Err())),
+		}
+	}
+
 	if bestCost.Equal(MaxPreemptionCost()) {
 		return &GangPlacementResult{
 			StatesExplored: statesExplored,
@@ -298,6 +319,12 @@ func ExhaustiveGangSearch(ctx context.Context, prob *GangPlacementProblem) *Gang
 // Admissible Lower Bound heuristic pruning with greedy initial upper bound.
 func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, opts BranchAndBoundOptions) *GangPlacementResult {
 	startTime := time.Now()
+	if err := ctx.Err(); err != nil {
+		return &GangPlacementResult{
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+		}
+	}
 	numPods := len(prob.PreemptorPods)
 	if numPods == 0 {
 		return &GangPlacementResult{
@@ -307,6 +334,11 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			SearchDuration:  time.Since(startTime),
 			Status:          fwk.NewStatus(fwk.Success),
 		}
+	}
+
+	if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+		prob.AntiAffinityMatrix.ResetToExisting()
+		defer prob.AntiAffinityMatrix.ResetToExisting()
 	}
 
 	// 1. Precompute per-pod minimum feasible lower-bound costs
@@ -328,10 +360,30 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 		minPodCost[i] = minC
 	}
 
+	// 1a. Suffix / Cluster Viable Candidate Quorum Pre-Check (Idea 15):
+	if opts.EnableSuffixQuorumPruning {
+		reqMembers := numPods
+		if prob.MinMember > 0 {
+			reqMembers = prob.MinMember
+		}
+		if len(prob.CandidateNodes) < reqMembers {
+			return &GangPlacementResult{
+				PodAssignments:  nil,
+				NodeAssignments: nil,
+				TotalCost:       MaxPreemptionCost(),
+				SearchDuration:  time.Since(startTime),
+				Status:          fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("insufficient candidate nodes for gang quorum: %d nodes < %d minMember", len(prob.CandidateNodes), reqMembers)),
+				StatesExplored:  0,
+				BranchesPruned:  1,
+			}
+		}
+	}
+
 	// 1b. Topology Spread Analytical Feasibility Pre-Check:
 	// Verify whether the gang size and initial domain distribution can analytically satisfy maxSkew.
-	for _, tc := range prob.TopologyConstraints {
-		if !tc.CheckFeasibility(nil, numPods) {
+	for i := range prob.TopologyConstraints {
+		prob.TopologyConstraints[i].GetDomains()
+		if !prob.TopologyConstraints[i].CheckFeasibility(nil, numPods) {
 			return &GangPlacementResult{
 				PodAssignments:  nil,
 				NodeAssignments: nil,
@@ -357,12 +409,24 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 	bestCost := MaxPreemptionCost()
 	var bestAssignments []int
 	if opts.UseGreedyUpperBound {
+		if err := ctx.Err(); err != nil {
+			return &GangPlacementResult{
+				SearchDuration: time.Since(startTime),
+				Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+			}
+		}
 		greedyAssignments, greedyCost, found := computeGreedyPlacement(prob)
 		if found {
 			bestCost = greedyCost
 			bestAssignments = greedyAssignments
 			// If greedy solution already matches the global theoretical minimum, we can exit early!
 			if opts.EnableEarlyExit && bestCost.Equal(globalTheoreticalLowerBound) {
+				if err := ctx.Err(); err != nil {
+					return &GangPlacementResult{
+						SearchDuration: time.Since(startTime),
+						Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", err)),
+					}
+				}
 				return buildPlacementResult(prob, bestAssignments, bestCost, 1, 0, true, startTime)
 			}
 		}
@@ -437,6 +501,40 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			return
 		}
 
+		// Suffix Quorum Feasibility Pruning (Idea 15):
+		// If remaining unassigned candidate nodes are strictly fewer than remaining pods to place
+		// (when nodes can host at most 1 gang pod or when remaining unassigned nodes cannot meet MinMember),
+		// prune the branch immediately.
+		if opts.EnableSuffixQuorumPruning && prob.MinMember > 0 {
+			remainingPods := numPods - podIdx
+			// If all nodes have NodeMaxPods == 1 (or default 1 pod per node),
+			// remaining available candidate nodes = total candidate nodes - currently occupied nodes.
+			if len(prob.NodeMaxPods) > 0 {
+				isOnePodPerNode := true
+				availableSlots := 0
+				for _, nName := range prob.CandidateNodes {
+					maxP := prob.NodeMaxPods[nName]
+					if maxP <= 0 {
+						isOnePodPerNode = false
+						break
+					}
+					if maxP > 1 {
+						isOnePodPerNode = false
+					}
+					remSlot := maxP - nodePodCount[nName]
+					if remSlot > 0 {
+						availableSlots += remSlot
+					}
+				}
+				if isOnePodPerNode || len(prob.NodeMaxPods) == len(prob.CandidateNodes) {
+					if availableSlots < remainingPods {
+						branchesPruned++
+						return
+					}
+				}
+			}
+		}
+
 		// Admissible Lower Bound Pruning:
 		// Lower bound for complete assignment through this branch:
 		// LB = currentCost + suffixLB[podIdx]
@@ -452,6 +550,15 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			}
 			cand := prob.PerPodCandidates[podIdx][candIdx]
 			nodeName := cand.NodeName
+
+			// 0. Check Idea 13 Inter-Pod Anti-Affinity Bitmask Matrix
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 && prob.AntiAffinityMatrix.IsViolated(dIdx, podIdx) {
+					branchesPruned++
+					continue
+				}
+			}
 
 			// 1. Check Node Capacity Constraints
 			if prob.NodeAllocatableCPU != nil {
@@ -479,7 +586,8 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 			// 2. Check Topology Spread Constraints
 			topoFeasible := true
 			remainingPods := numPods - podIdx
-			for tIdx, tc := range prob.TopologyConstraints {
+			for tIdx := range prob.TopologyConstraints {
+				tc := &prob.TopologyConstraints[tIdx]
 				domain := tc.NodeDomains[nodeName]
 				if domain != "" {
 					if !tc.CanDomainAcceptPod(domain, topoCounts[tIdx], remainingPods) {
@@ -553,11 +661,23 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 					topoCounts[tIdx][domain]++
 				}
 			}
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 {
+					prob.AntiAffinityMatrix.ApplyAssignment(dIdx, podIdx)
+				}
+			}
 
 			// Recurse to next pod
 			search(podIdx+1, newCurrentCost)
 
 			// Revert state mutation
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 {
+					prob.AntiAffinityMatrix.RevertAssignment(dIdx, podIdx)
+				}
+			}
 			nodeUsedCPU[nodeName] -= cand.RequiredMilliCPU
 			nodeUsedMem[nodeName] -= cand.RequiredMemory
 			nodePodCount[nodeName]--
@@ -582,11 +702,18 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 
 	search(0, ZeroPreemptionCost())
 
+	if ctx.Err() != nil {
+		return &GangPlacementResult{
+			StatesExplored: statesExplored,
+			BranchesPruned: branchesPruned,
+			SearchDuration: time.Since(startTime),
+			Status:         fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("search aborted: %v", ctx.Err())),
+		}
+	}
+
 	if bestCost.Equal(MaxPreemptionCost()) {
 		statusMsg := "No feasible gang placement found"
-		if ctx.Err() != nil {
-			statusMsg = fmt.Sprintf("search aborted: %v", ctx.Err())
-		} else if opts.MaxExploredStates > 0 && statesExplored >= opts.MaxExploredStates {
+		if opts.MaxExploredStates > 0 && statesExplored >= opts.MaxExploredStates {
 			statusMsg = fmt.Sprintf("search aborted: state exploration cap (%d) reached", opts.MaxExploredStates)
 		}
 		return &GangPlacementResult{
@@ -603,6 +730,10 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 
 // computeGreedyPlacement finds an initial feasible placement using greedy best-candidate assignment.
 func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, bool) {
+	if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+		prob.AntiAffinityMatrix.ResetToExisting()
+		defer prob.AntiAffinityMatrix.ResetToExisting()
+	}
 	numPods := len(prob.PreemptorPods)
 	assignments := make([]int, numPods)
 
@@ -661,6 +792,14 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 				continue
 			}
 
+			// Idea 13 Anti-affinity bitmask check
+			if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+				dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+				if dIdx >= 0 && prob.AntiAffinityMatrix.IsViolated(dIdx, podIdx) {
+					continue
+				}
+			}
+
 			if cand.Cost.Less(bestIncrementalCost) {
 				bestIncrementalCost = cand.Cost
 				bestCandIdx = candIdx
@@ -673,6 +812,12 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 
 		assignments[podIdx] = bestCandIdx
 		cand := prob.PerPodCandidates[podIdx][bestCandIdx]
+		if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+			dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(cand.NodeName)
+			if dIdx >= 0 {
+				prob.AntiAffinityMatrix.ApplyAssignment(dIdx, podIdx)
+			}
+		}
 		nodeUsedCPU[cand.NodeName] += cand.RequiredMilliCPU
 		nodeUsedMem[cand.NodeName] += cand.RequiredMemory
 		nodePodCount[cand.NodeName]++
@@ -696,6 +841,10 @@ func computeGreedyPlacement(prob *GangPlacementProblem) ([]int, PreemptionCost, 
 
 // evaluatePlacement computes validity and exact combined preemption cost for a candidate assignment vector.
 func evaluatePlacement(prob *GangPlacementProblem, assignments []int) (bool, PreemptionCost) {
+	if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+		prob.AntiAffinityMatrix.ResetToExisting()
+		defer prob.AntiAffinityMatrix.ResetToExisting()
+	}
 	nodeUsedCPU := make(map[string]int64)
 	nodeUsedMem := make(map[string]int64)
 	nodePodCount := make(map[string]int)
@@ -729,6 +878,17 @@ func evaluatePlacement(prob *GangPlacementProblem, assignments []int) (bool, Pre
 		nodeUsedCPU[nodeName] += cand.RequiredMilliCPU
 		nodeUsedMem[nodeName] += cand.RequiredMemory
 		nodePodCount[nodeName]++
+
+		// Idea 13 Anti-affinity bitmask check & assignment
+		if prob.AntiAffinityMatrix != nil && !prob.AntiAffinityMatrix.FallbackToStandard() {
+			dIdx := prob.AntiAffinityMatrix.DomainIndexForNode(nodeName)
+			if dIdx >= 0 {
+				if prob.AntiAffinityMatrix.IsViolated(dIdx, podIdx) {
+					return false, MaxPreemptionCost()
+				}
+				prob.AntiAffinityMatrix.ApplyAssignment(dIdx, podIdx)
+			}
+		}
 
 		// Topology
 		for tIdx, tc := range prob.TopologyConstraints {
