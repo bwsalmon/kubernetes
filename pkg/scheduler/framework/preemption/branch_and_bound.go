@@ -220,15 +220,17 @@ type BranchAndBoundOptions struct {
 	UseGreedyUpperBound      bool
 	UseBestFirstBranchOrder  bool
 	MaxExploredStates        int
+	EnableSuffixQuorumPruning bool
 }
 
 // DefaultBranchAndBoundOptions provides standard optimal configuration.
 func DefaultBranchAndBoundOptions() BranchAndBoundOptions {
 	return BranchAndBoundOptions{
-		EnableEarlyExit:         true,
-		UseGreedyUpperBound:     true,
-		UseBestFirstBranchOrder: true,
-		MaxExploredStates:       50000,
+		EnableEarlyExit:          true,
+		UseGreedyUpperBound:      true,
+		UseBestFirstBranchOrder:  true,
+		MaxExploredStates:        50000,
+		EnableSuffixQuorumPruning: true,
 	}
 }
 
@@ -351,6 +353,25 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 		minPodCost[i] = minC
 	}
 
+	// 1a. Suffix / Cluster Viable Candidate Quorum Pre-Check (Idea 15):
+	if opts.EnableSuffixQuorumPruning {
+		reqMembers := numPods
+		if prob.MinMember > 0 {
+			reqMembers = prob.MinMember
+		}
+		if len(prob.CandidateNodes) < reqMembers {
+			return &GangPlacementResult{
+				PodAssignments:  nil,
+				NodeAssignments: nil,
+				TotalCost:       MaxPreemptionCost(),
+				SearchDuration:  time.Since(startTime),
+				Status:          fwk.NewStatus(fwk.Unschedulable, fmt.Sprintf("insufficient candidate nodes for gang quorum: %d nodes < %d minMember", len(prob.CandidateNodes), reqMembers)),
+				StatesExplored:  0,
+				BranchesPruned:  1,
+			}
+		}
+	}
+
 	// 1b. Topology Spread Analytical Feasibility Pre-Check:
 	// Verify whether the gang size and initial domain distribution can analytically satisfy maxSkew.
 	for i := range prob.TopologyConstraints {
@@ -471,6 +492,40 @@ func BranchAndBoundGangSearch(ctx context.Context, prob *GangPlacementProblem, o
 				}
 			}
 			return
+		}
+
+		// Suffix Quorum Feasibility Pruning (Idea 15):
+		// If remaining unassigned candidate nodes are strictly fewer than remaining pods to place
+		// (when nodes can host at most 1 gang pod or when remaining unassigned nodes cannot meet MinMember),
+		// prune the branch immediately.
+		if opts.EnableSuffixQuorumPruning && prob.MinMember > 0 {
+			remainingPods := numPods - podIdx
+			// If all nodes have NodeMaxPods == 1 (or default 1 pod per node),
+			// remaining available candidate nodes = total candidate nodes - currently occupied nodes.
+			if len(prob.NodeMaxPods) > 0 {
+				isOnePodPerNode := true
+				availableSlots := 0
+				for _, nName := range prob.CandidateNodes {
+					maxP := prob.NodeMaxPods[nName]
+					if maxP <= 0 {
+						isOnePodPerNode = false
+						break
+					}
+					if maxP > 1 {
+						isOnePodPerNode = false
+					}
+					remSlot := maxP - nodePodCount[nName]
+					if remSlot > 0 {
+						availableSlots += remSlot
+					}
+				}
+				if isOnePodPerNode || len(prob.NodeMaxPods) == len(prob.CandidateNodes) {
+					if availableSlots < remainingPods {
+						branchesPruned++
+						return
+					}
+				}
+			}
 		}
 
 		// Admissible Lower Bound Pruning:
